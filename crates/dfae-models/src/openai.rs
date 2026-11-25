@@ -13,6 +13,8 @@ pub struct OpenAiCompat {
     caches: bool,
     /// Cleared the first time the server rejects `response_format: json_schema`: later calls ask for plain JSON.
     schema_ok: std::sync::atomic::AtomicBool,
+    /// When a test request last proved an unlisted model usable: health is polled often, and every ping is a billed request.
+    pinged_ok: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl OpenAiCompat {
@@ -21,7 +23,16 @@ impl OpenAiCompat {
         // OpenAI's own API caches a repeated prompt prefix by itself; other servers say so with `STRONG_PROMPT_CACHE=on`.
         // Self-hosted ones are free anyway, and a request that is billed in full is no loss there.
         let caches = base.contains("api.openai.com");
-        Self { http, base: base.trim_end_matches('/').to_string(), model: model.into(), key, name: format!("openai:{model}"), caches, schema_ok: true.into() }
+        Self {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+            model: model.into(),
+            key,
+            name: format!("openai:{model}"),
+            caches,
+            schema_ok: true.into(),
+            pinged_ok: Default::default(),
+        }
     }
 
     /// Declare whether this server bills a repeated prompt prefix at a fraction.
@@ -133,15 +144,48 @@ impl LanguageModel for OpenAiCompat {
                 let norm = |m: &str| m.strip_suffix(":latest").unwrap_or(m).to_string();
                 let want = norm(&self.model);
                 let ids: Vec<String> = models.iter().filter_map(|m| m["id"].as_str()).map(String::from).collect();
-                if ids.iter().any(|id| norm(id) == want) {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "{} is up but does not list the model '{}' (it lists {})",
-                        self.base,
-                        self.model,
-                        if ids.is_empty() { "none".to_string() } else { ids.iter().take(6).cloned().collect::<Vec<_>>().join(", ") }
-                    ))
+                // gateways list ids with the provider in front (`openai/gpt-x`) and accept the short form too
+                let listed = |id: &String| norm(id) == want || id.rsplit('/').next().map(norm).as_deref() == Some(want.as_str());
+                if ids.iter().any(listed) {
+                    return Ok(());
+                }
+                if self.pinged_ok.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
+                    return Ok(());
+                }
+                // A listing is a hint, not the truth (aliases, models that are routed but not listed): ask the model itself.
+                // One token. A server that really lacks the model (Ollama before the pull) answers 404 at once.
+                let ping = json!({"model": self.model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": false});
+                let mut rb = self.http.post(format!("{}/chat/completions", self.base)).timeout(Duration::from_secs(20)).json(&ping);
+                if let Some(k) = &self.key {
+                    rb = rb.bearer_auth(k);
+                }
+                match rb.send().await {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(mut g) = self.pinged_ok.lock() {
+                            *g = Some(std::time::Instant::now());
+                        }
+                        Ok(())
+                    }
+                    other => {
+                        let why = match other {
+                            Ok(r) => {
+                                let s = r.status();
+                                format!("HTTP {s}: {}", r.text().await.unwrap_or_default().chars().take(160).collect::<String>())
+                            }
+                            Err(e) => e.to_string(),
+                        };
+                        let near: Vec<&String> = ids.iter().filter(|id| id.contains(want.split('-').next().unwrap_or(&want))).take(6).collect();
+                        Err(format!(
+                            "{} does not list the model '{}' and a test request to it failed ({why}); {}",
+                            self.base,
+                            self.model,
+                            if near.is_empty() {
+                                format!("it lists {} models", ids.len())
+                            } else {
+                                format!("similar ids: {}", near.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "))
+                            }
+                        ))
+                    }
                 }
             }
             None => Ok(()), // not a listing we understand: do not guess
