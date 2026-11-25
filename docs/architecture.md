@@ -146,6 +146,9 @@ decision: `(raw·6 + successes) / (6 + n)`. The counters persist in the store (`
 - A step is *ready* when all dependencies succeeded/skipped; a failed/cancelled dependency cancels the step.
 - Each ready wave runs concurrently under a semaphore; `{{sN}}` templates in arguments are resolved from
   dependency outputs just before execution, **then** validated and policy-checked.
+- With `DFAE_APPROVALS=never` (default) the executor never suspends: `RequireApproval` decisions become `Allow` (except an unlisted host
+  when `open_web` is off, which becomes a refusal), the `approval_required` flag on a plan step is ignored, and the policy's `Deny`s
+  stand. The rest of this section describes `ask` mode.
 - Approval-required steps suspend (`waiting_for_approval`) until `y` in the TUI / the approvals endpoint; the
   approval is bound to `sha256(tool|canonical-args)`, expires (`DFAE_APPROVAL_TTL_SECS`) and is re-verified.
 - After a tool returns: `ok` flag, declared checks (`nonempty`, `contains:`, `matches:`, `exists:`), and the

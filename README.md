@@ -86,7 +86,7 @@ read a.txt, b.txt and c.txt and summarize them          Find the latest PostgreS
    ├─ c1 read a.txt   (researcher · direct · 0 tokens)   server is affected, and patch it if necessary
    ├─ c2 read b.txt   (researcher · direct · 0 tokens)      c1 research  (researcher)  ──▶ upstream summary
    ├─ c3 read c.txt   (researcher · direct · 0 tokens)      c2 check     (verifier)    ──▶ upstream summary
-   └─ join            (SLM · one call)                      c3 patch     (operator, approval-gated)
+   └─ join            (SLM · one call)                      c3 patch     (operator)
 ```
 
 **What triggers it.** A deterministic *decomposer* proposes a split (clauses, comma lists, numbered items,
@@ -163,11 +163,11 @@ The policy engine ([`config/policy.toml`](config/policy.toml)) is the boundary �
 the SLM can override it. It runs when a plan is validated **and again on the final, template-resolved
 arguments** immediately before each tool executes (tools re-check too).
 
-- filesystem: read/write roots, secret-name denylist, symlink-escape defence; **writes need approval**
-- shell: argv execution with **no shell**, command allowlist, path-checked arguments, `find -exec` & co. denied, cleared environment, timeout, output cap
-- network: domain allowlist (unlisted → approval), private/loopback/link-local/metadata addresses blocked (checked after DNS resolution, on every redirect hop)
-- approvals bind to `sha256(tool + canonical args)`, expire, and are re-checked before execution
-- tool output is untrusted: secrets redacted, injection patterns flagged → the task is *tainted* and every side-effecting step then requires approval
+- **no human in the loop (default):** `DFAE_APPROVALS=never` — no tool call waits for anyone and the agent never asks "shall I proceed?". The policy still **refuses** what it forbids (a path outside the workspace, a private address…); it just doesn't ask. `DFAE_APPROVALS=ask` brings the approval step back (writes, mutating commands, unlisted hosts and tainted tasks then wait in the TUI; approvals bind to `sha256(tool + canonical args)`, expire, and are re-checked)
+- filesystem: read/write roots (the workspace), secret-name denylist, symlink-escape defence — for every file tool
+- shell: in the container, `shell.mode = "sandbox"` gives a **full bash** in the workspace (pipes, redirects, `&&`, git, build/test tools, timeouts, background jobs) and **the container is the boundary** (read-only root, no capabilities, unprivileged user, memory/pid limits). Outside a container the default `allowlist` mode applies: one allowlisted command, no shell, path-checked arguments, `find -exec` & co. denied
+- network: private/loopback/link-local/metadata addresses blocked (checked after DNS resolution, on every redirect hop); `open_web` lets `http_get` reach any public host. **The shell's own network access (`curl`, `pip`, `git clone`) is the container's, not this policy's**
+- tool output is untrusted: secrets redacted, injection patterns flagged → the task is *tainted* (shown in the audit; with `DFAE_APPROVALS=ask` side-effecting steps then require approval — in `never` mode a successful prompt injection can drive file changes and shell commands inside the sandbox, which is the price of not asking)
 - append-only audit log, hash-chained per task (`GET /v1/tasks/{id}/audit` reports `chain_valid`)
 - runs as an unprivileged user in a read-only container with all capabilities dropped; API published on loopback only
 
@@ -208,8 +208,36 @@ The open web is read-only and bounded: private, loopback, link-local and metadat
 redirect), responses are size- and time-capped, and once any tool output looks like a prompt injection, fetching an unlisted host needs approval
 again (a URL can carry data out). Search results and pages are untrusted data to the model.
 
+### Coding and shell tools
+
+The agent has the tool set of a coding agent. Every tool's description says how to use it (that text is all a model sees of it), error
+messages say how to fix the call, and tools that belong together are offered together (`fs_edit` brings `fs_read`/`fs_search`/`fs_glob`;
+`shell` brings `shell_output`/`shell_kill`).
+
+| Tool | Use |
+|---|---|
+| `fs_read` | read a file; `offset`/`limit` select lines, `numbered=true` adds line numbers |
+| `fs_edit` | exact string replacement (`old_string` must be unique unless `replace_all`); read-back verified |
+| `fs_write` | create / overwrite a file, `append=true` |
+| `fs_glob` | find files by glob (`**/*.rs`, `*.{ts,tsx}`), newest first |
+| `fs_search` | regex search with `glob`, `context`, `files_only`, `case_sensitive` |
+| `fs_list` | directory listing; `depth` shows a tree |
+| `fs_mkdir` · `fs_move` · `fs_copy` · `fs_delete` | tree operations (delete needs `recursive` for directories; never the workspace root) |
+| `shell` | bash in the workspace (or `cwd`) with `timeout_secs`; `background=true` for servers and long jobs |
+| `shell_output` · `shell_kill` | read new output of / stop a background job |
+| `http_get` · `web_search` | the web (see above) |
+
+Simple phrasings of the file operations bind directly and cost no model tokens (`move a.txt to b/a.txt`, `delete notes/old.txt`,
+`replace "foo()" with "bar()" in src/lib.rs`, `find files matching **/*.rs`, ``run `cargo test` ``). The container image ships git, ripgrep, curl, jq, make, gcc, python3 and friends
+(`DEV_TOOLS=0` builds it without them); its root is read-only, so use a virtualenv or project-local installs in the workspace.
+
+### Answers
+
+Answers are terse by design: the final answer gives only the information asked for — no preamble, no recap of steps, no offers of help,
+no questions. Prompts say so, and a deterministic pass removes openers ("Sure!") and trailing offers ("Let me know if…") the model adds anyway.
+
 Things to try: `hi` · `what is a mutex?` · `search the web for rust async book` · `weather in Paris` (found on the web) · `what is 12 * (3 + 4)?` · `list the files in ./ and what time is it` ·
-`write 'hello' to notes/hello.txt` (asks for approval) · `remember that the staging db is db-staging-01`
+`write 'hello' to notes/hello.txt` · `remember that the staging db is db-staging-01`
 then `what do you remember about the staging db?` · with the SLM up:
 `read notes/hello.txt and tell me how many words it contains`.
 
@@ -241,7 +269,8 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `SLM_MODEL` | model pulled into Ollama (`qwen2.5:3b` default; `1.5b` faster, `7b` smarter) |
 | `STRONG_PROVIDER` / `STRONG_API_KEY` / `STRONG_MODEL` | optional escalation model (`anthropic` or `openai`-compatible) |
 | `DFAE_API_TOKEN` | bearer token for the API |
-| `DFAE_ALLOW_AUTO_APPROVE` | allow `auto_approve` requests (benchmarks only) |
+| `DFAE_APPROVALS` | `never` (default): nothing waits for a human. `ask`: risky calls wait for approval |
+| `DFAE_ALLOW_AUTO_APPROVE` | with `ask`: allow `auto_approve` requests (benchmarks only) |
 | `DFAE_MAX_STEPS`, `_MAX_MODEL_CALLS`, `_MAX_TOOL_CALLS`, `_MAX_REPLANS`, `_MAX_SECONDS`, `_MAX_CHILDREN` | per-task budgets |
 | `DFAE_REPAIR` | `off` disables deterministic repair |
 | `DFAE_LAZY_CONTEXT` | `on` enables lazy upstream context (`NEED <step>` expansion); off by default |
@@ -265,7 +294,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 190+ tests, hermetic
+cargo test --workspace                       # 220+ tests, hermetic
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -275,7 +304,7 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 190+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 220+ unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
 | Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |

@@ -349,8 +349,9 @@ impl Inner {
             }
         }
         req.messages.extend(current);
+        req.max_tokens = req.max_tokens.min(400); // conversational replies are short
         let text = self.generate_text(ctx, tier, req).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?;
-        let text = text.trim().to_string();
+        let text = crate::style::compact(&text);
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
         }
@@ -390,6 +391,9 @@ impl Inner {
         }
         if step.approval_required && approval_reason.is_none() {
             approval_reason = Some("the plan marked this step as requiring approval".into());
+        }
+        if self.cfg.approvals == ApprovalMode::Never {
+            approval_reason = None; // nothing in this system waits for a human
         }
         if let Some(reason) = approval_reason {
             self.await_approval(ctx, step, &name, &args, &reason, meta.risk).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;

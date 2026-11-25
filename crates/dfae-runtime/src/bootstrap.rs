@@ -19,11 +19,12 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
         }
     };
     // policy
-    let policy_cfg = match &config.policy_path {
+    let mut policy_cfg = match &config.policy_path {
         Some(p) => PolicyConfig::from_toml(&std::fs::read_to_string(p).map_err(|e| format!("reading policy {}: {e}", p.display()))?)
             .map_err(|e| format!("invalid policy file: {e}"))?,
         None => PolicyConfig::default(),
     };
+    policy_cfg.approvals = config.approvals;
     let policy = Arc::new(PolicyEngine::new(policy_cfg, config.workspace.clone()));
     // tools
     let mut registry = ToolRegistry::new();

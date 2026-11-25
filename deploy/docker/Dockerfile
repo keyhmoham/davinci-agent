@@ -27,7 +27,16 @@ RUN apt-get update \
  && mkdir -p /workspace && chown dfae:dfae /workspace
 
 # --- engine ---------------------------------------------------------------------
+# The agent's shell runs inside this container (see config/policy.toml: shell.mode = "sandbox"), so it gets
+# the tools a developer expects. DEV_TOOLS=0 builds the small image (the shell then has only coreutils).
 FROM runtime-base AS server
+ARG DEV_TOOLS=1
+RUN if [ "$DEV_TOOLS" = "1" ]; then \
+      apt-get update \
+   && apt-get install -y --no-install-recommends bash git curl jq ripgrep patch make gcc g++ libc6-dev python3 python3-venv python3-pip \
+        file less tree unzip zip tar gzip xz-utils sed gawk openssh-client \
+   && rm -rf /var/lib/apt/lists/*; \
+    fi
 COPY --from=build /out/dfae-server /usr/local/bin/dfae-server
 COPY config/policy.toml /etc/dfae/policy.toml
 ENV DFAE_BIND=0.0.0.0:8080 \

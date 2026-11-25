@@ -14,7 +14,14 @@ write_requires_approval = true
 deny_names = [".git", ".env", "id_rsa", "id_ed25519", ".ssh", ".aws"]
 
 [shell]
-# executed without a shell (no pipes, redirects, globbing or substitution)
+# "sandbox": the shell tool is a full bash in the workspace (pipes, redirects, &&, git, build and test
+#   tools; background jobs). The container is the boundary — read-only root filesystem, no capabilities,
+#   unprivileged user, memory and process limits — so use this ONLY inside it.
+# "allowlist": one allowlisted command, no shell (for a machine that matters): the lists below apply.
+mode = "sandbox"
+# longest timeout_secs a command may ask for
+max_timeout_secs = 900
+# (allowlist mode only) executed without a shell (no pipes, redirects, globbing or substitution)
 allowed = ["ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami", "hostname", "stat", "du", "sort", "diff", "cut", "tr", "basename", "dirname", "nproc", "id"]
 # run only after a human approves the exact command
 approval = ["mkdir", "touch", "cp", "mv"]

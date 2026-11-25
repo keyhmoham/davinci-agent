@@ -16,6 +16,7 @@ pub mod planner;
 pub mod prompts;
 mod session;
 pub mod skills;
+mod style;
 pub mod team;
 mod verify;
 

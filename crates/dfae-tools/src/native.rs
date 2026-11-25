@@ -23,22 +23,30 @@ pub fn register_native(reg: &mut ToolRegistry, policy: Arc<PolicyEngine>, memory
     reg.register(Arc::new(FsWrite { policy: policy.clone() }));
     reg.register(Arc::new(FsSearch { policy: policy.clone() }));
     reg.register(Arc::new(Shell { policy: policy.clone() }));
+    reg.register(Arc::new(crate::coding::ShellOutput));
+    reg.register(Arc::new(crate::coding::ShellKill));
+    reg.register(Arc::new(crate::coding::FsGlob { policy: policy.clone() }));
+    reg.register(Arc::new(crate::coding::FsEdit { policy: policy.clone() }));
+    reg.register(Arc::new(crate::coding::FsMkdir { policy: policy.clone() }));
+    reg.register(Arc::new(crate::coding::FsMove { policy: policy.clone() }));
+    reg.register(Arc::new(crate::coding::FsCopy { policy: policy.clone() }));
+    reg.register(Arc::new(crate::coding::FsDelete { policy: policy.clone() }));
     reg.register(Arc::new(HttpGet { policy: policy.clone() }));
     reg.register(Arc::new(crate::web::WebSearch { policy }));
     reg.register(Arc::new(MemorySearch { memory: memory.clone() }));
     reg.register(Arc::new(MemoryStoreTool { memory }));
 }
 
-fn enforce(policy: &PolicyEngine, meta: &ToolMetadata, args: &Value) -> Result<(), ToolError> {
+pub(crate) fn enforce(policy: &PolicyEngine, meta: &ToolMetadata, args: &Value) -> Result<(), ToolError> {
     match policy.check(meta, args, false) {
         PolicyDecision::Deny(m) => Err(ToolError::policy(m)),
         _ => Ok(()),
     }
 }
 
-const FILE_EXT: &str = "txt|md|json|toml|ya?ml|rs|py|js|ts|csv|log|conf|cfg|ini|sh|sql|html|xml|lock|env|c|h|go|java|rb|php|css";
+pub(crate) const FILE_EXT: &str = "txt|md|json|toml|ya?ml|rs|py|js|ts|csv|log|conf|cfg|ini|sh|sql|html|xml|lock|env|c|h|go|java|rb|php|css";
 
-fn meta(name: &str, description: &str, category: &str, params: Vec<ParamSpec>) -> ToolMetadata {
+pub(crate) fn meta(name: &str, description: &str, category: &str, params: Vec<ParamSpec>) -> ToolMetadata {
     ToolMetadata {
         name: name.into(),
         description: description.into(),
@@ -56,11 +64,11 @@ fn meta(name: &str, description: &str, category: &str, params: Vec<ParamSpec>) -
     }
 }
 
-fn pats(m: &mut ToolMetadata, p: &[String]) {
+pub(crate) fn pats(m: &mut ToolMetadata, p: &[String]) {
     m.direct_patterns = p.to_vec();
 }
 
-fn kw(m: &mut ToolMetadata, k: &[&str]) {
+pub(crate) fn kw(m: &mut ToolMetadata, k: &[&str]) {
     m.keywords = k.iter().map(|s| s.to_string()).collect();
 }
 
@@ -180,15 +188,16 @@ impl Tool for FsList {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta(
             "fs_list",
-            "list files and directories in a directory",
+            "list files and directories in a directory; depth=2..4 shows a tree (skips .git, node_modules, target…)",
             "filesystem",
             vec![
                 ParamSpec::new("path", ParamType::String, false, "directory (default: workspace root)").hints(&["file path", "directory"]).default(json!(".")),
+                ParamSpec::new("depth", ParamType::Integer, false, "levels to show (default 1)"),
             ],
         );
         m.cacheable = true;
         m.contract = vec![Check::Contains { value: "entries)".into() }];
-        kw(&mut m, &["files", "directory", "folder", "list", "ls", "contents"]);
+        kw(&mut m, &["files", "directory", "folder", "list", "ls", "contents", "tree", "structure"]);
         let path = r"(?P<path>(?:\.{1,2}|~)?/[\w./\-]*|[\w\-]+/[\w./\-]*|\.)";
         pats(
             &mut m,
@@ -205,25 +214,56 @@ impl Tool for FsList {
     async fn execute(&self, input: Value, _c: ToolContext) -> Result<ToolOutput, ToolError> {
         enforce(&self.policy, &self.metadata(), &input)?;
         let raw = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let depth = input.get("depth").and_then(|v| v.as_u64()).unwrap_or(1).clamp(1, 4) as usize;
         let p = self.policy.guard().read_path(raw)?;
-        let rd = tokio::fs::read_dir(&p).await.map_err(|e| match e.kind() {
+        if !p.is_dir() && p.exists() {
+            return Err(ToolError::args(format!("{raw} is a file: use fs_read")));
+        }
+        let guard = self.policy.guard();
+        let root = p.clone();
+        let (rows, total) = tokio::task::spawn_blocking(move || -> Result<(Vec<String>, usize), std::io::Error> {
+            let mut rows = Vec::new();
+            let mut total = 0usize;
+            // depth-first, directories before files, names sorted
+            fn visit(
+                guard: &PathGuard,
+                dir: &std::path::Path,
+                level: usize,
+                depth: usize,
+                rows: &mut Vec<String>,
+                total: &mut usize,
+            ) -> Result<(), std::io::Error> {
+                let mut entries: Vec<(bool, String, u64, std::path::PathBuf)> = Vec::new();
+                for e in std::fs::read_dir(dir)?.flatten() {
+                    let Ok(md) = e.metadata() else { continue };
+                    entries.push((md.is_dir(), e.file_name().to_string_lossy().into_owned(), md.len(), e.path()));
+                }
+                entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                for (is_dir, name, size, path) in entries {
+                    *total += 1;
+                    if rows.len() < 300 {
+                        let pad = "  ".repeat(level);
+                        rows.push(if is_dir { format!("{pad}d {name}/") } else { format!("{pad}f {name} {size}B") });
+                    }
+                    if is_dir && level + 1 < depth && !crate::coding::skipped_dir(&name) && guard.read_path(&path.to_string_lossy()).is_ok() {
+                        visit(guard, &path, level + 1, depth, rows, total)?;
+                    }
+                }
+                Ok(())
+            }
+            visit(&guard, &root, 0, depth, &mut rows, &mut total)?;
+            Ok((rows, total))
+        })
+        .await
+        .map_err(|e| ToolError::other(e.to_string()))?
+        .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => ToolError::new(ErrorKind::NotFound, format!("no such directory: {raw}")),
             _ => ToolError::io(format!("{raw}: {e}")),
         })?;
-        let mut rd = rd;
-        let mut rows: Vec<(bool, String, u64)> = Vec::new();
-        while let Some(e) = rd.next_entry().await.map_err(|e| ToolError::io(e.to_string()))? {
-            let md = e.metadata().await.map_err(|e| ToolError::io(e.to_string()))?;
-            rows.push((md.is_dir(), e.file_name().to_string_lossy().into_owned(), md.len()));
-        }
-        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        let total = rows.len();
         let mut out = vec![format!("{} ({total} entries)", raw)];
-        for (d, n, sz) in rows.into_iter().take(200) {
-            out.push(if d { format!("d {n}/") } else { format!("f {n} {sz}B") });
-        }
-        if total > 200 {
-            out.push(format!("… {} more", total - 200));
+        out.extend(rows.iter().cloned());
+        if total > rows.len() {
+            out.push(format!("… {} more", total - rows.len()));
         }
         Ok(ToolOutput::ok(out.join("\n")))
     }
@@ -238,11 +278,14 @@ impl Tool for FsRead {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta(
             "fs_read",
-            "read a UTF-8 text file",
+            "read a text file; offset (first line, 1-based) and limit (line count) select a range of a big file, numbered=true prefixes line numbers. Read a file before editing it",
             "filesystem",
             vec![
                 ParamSpec::new("path", ParamType::String, true, "file path").hints(&["file path"]),
                 ParamSpec::new("max_bytes", ParamType::Integer, false, "read at most N bytes (default 20000)"),
+                ParamSpec::new("offset", ParamType::Integer, false, "first line to read (1-based)"),
+                ParamSpec::new("limit", ParamType::Integer, false, "number of lines to read"),
+                ParamSpec::new("numbered", ParamType::Boolean, false, "prefix each line with its number"),
             ],
         );
         m.cacheable = true;
@@ -265,9 +308,35 @@ impl Tool for FsRead {
         if bytes.iter().take(4096).any(|b| *b == 0) {
             return Err(ToolError::args(format!("{raw} looks like a binary file")));
         }
-        let truncated = bytes.len() > max;
-        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(max)]).into_owned();
-        Ok(ToolOutput::ok(if truncated { format!("{text}\n…[truncated at {max} of {} bytes]", bytes.len()) } else { text }))
+        let full = String::from_utf8_lossy(&bytes).into_owned();
+        let (offset, limit) = (input.get("offset").and_then(|v| v.as_u64()), input.get("limit").and_then(|v| v.as_u64()));
+        let numbered = input.get("numbered").and_then(|v| v.as_bool()).unwrap_or(false);
+        let text = if offset.is_some() || limit.is_some() || numbered {
+            let first = offset.unwrap_or(1).max(1) as usize;
+            let total = full.lines().count();
+            if first > total.max(1) {
+                return Err(ToolError::args(format!("{raw} has {total} line(s); offset {first} is past the end")));
+            }
+            let take = limit.map(|l| l as usize).unwrap_or(usize::MAX);
+            let body: Vec<String> =
+                full.lines().enumerate().skip(first - 1).take(take).map(|(i, l)| if numbered { format!("{:>5}\t{l}", i + 1) } else { l.to_string() }).collect();
+            let shown_to = first - 1 + body.len();
+            let note =
+                if shown_to < total { format!("\n…[lines {first}-{shown_to} of {total}; use offset={} for more]", shown_to + 1) } else { String::new() };
+            format!("{}{note}", body.join("\n"))
+        } else {
+            full
+        };
+        let truncated = text.len() > max;
+        let mut cut = text.len().min(max);
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        Ok(ToolOutput::ok(if truncated {
+            format!("{}\n…[truncated at {max} of {} bytes: read a range with offset/limit]", &text[..cut], text.len())
+        } else {
+            text
+        }))
     }
 }
 
@@ -284,7 +353,7 @@ impl Tool for FsWrite {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta(
             "fs_write",
-            "write (or append) text to a file in the workspace; requires approval",
+            "create a file or overwrite it entirely (missing directories are created); append=true adds to the end. To change part of an existing file use fs_edit",
             "filesystem",
             vec![
                 ParamSpec::new("path", ParamType::String, true, "file path").hints(&["file path"]),
@@ -354,47 +423,58 @@ pub struct FsSearch {
     policy: Arc<PolicyEngine>,
 }
 
-fn walk_search(guard: &PathGuard, root: &Path, re: &Regex, max_results: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    let mut scanned = 0usize;
-    while let Some((dir, depth)) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        let mut entries: Vec<_> = rd.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for e in entries {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if matches!(name.as_str(), ".git" | "target" | "node_modules" | ".env") {
-                continue;
-            }
-            let path = e.path();
-            if guard.read_path(&path.to_string_lossy()).is_err() {
-                continue;
-            }
-            let Ok(md) = e.metadata() else { continue };
-            if md.is_dir() {
-                if depth < 8 {
-                    stack.push((path, depth + 1));
-                }
-            } else if md.is_file() && md.len() < 1_000_000 {
-                scanned += 1;
-                if scanned > 5000 {
-                    return out;
-                }
-                let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                for (i, line) in text.lines().enumerate() {
-                    if re.is_match(line) {
-                        let rel = path.strip_prefix(&guard.workspace).unwrap_or(&path).to_string_lossy().into_owned();
-                        out.push(format!("{rel}:{}: {}", i + 1, line.trim().chars().take(160).collect::<String>()));
-                        if out.len() >= max_results {
-                            return out;
-                        }
-                    }
-                }
+/// Matches as `path:line: text` (context lines as `path-line- text`), at most `max` matching lines.
+fn search_files(guard: &PathGuard, root: &Path, re: &Regex, glob: Option<&Regex>, context: usize, files_only: bool, max: usize) -> (Vec<String>, usize) {
+    let mut out: Vec<String> = Vec::new();
+    let (mut matches, mut files, mut scanned) = (0usize, 0usize, 0usize);
+    let ws = guard.workspace.clone();
+    crate::coding::walk_files(guard, root, 12, 50_000, |path, md| {
+        if md.len() > 1_000_000 {
+            return true;
+        }
+        if let Some(g) = glob {
+            let r = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+            if !g.is_match(&r) {
+                return true;
             }
         }
-    }
-    out
+        scanned += 1;
+        if scanned > 8000 {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else { return true };
+        let lines: Vec<&str> = text.lines().collect();
+        let hits: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| re.is_match(l)).map(|(i, _)| i).collect();
+        if hits.is_empty() {
+            return true;
+        }
+        let rel = path.strip_prefix(&ws).unwrap_or(path).to_string_lossy().into_owned();
+        files += 1;
+        if files_only {
+            out.push(rel);
+            matches += hits.len();
+            return out.len() < max;
+        }
+        let mut last_end: Option<usize> = None;
+        for h in hits {
+            if matches >= max {
+                return false;
+            }
+            matches += 1;
+            let (from, to) = (h.saturating_sub(context), (h + context).min(lines.len() - 1));
+            let from = last_end.map(|e| from.max(e + 1)).unwrap_or(from);
+            if context > 0 && last_end.map(|e| from > e + 1).unwrap_or(!out.is_empty()) {
+                out.push("--".into());
+            }
+            for (i, line) in lines.iter().enumerate().take(to + 1).skip(from) {
+                let text: String = line.trim_end().chars().take(200).collect();
+                out.push(if i == h { format!("{rel}:{}: {text}", i + 1) } else { format!("{rel}-{}- {text}", i + 1) });
+            }
+            last_end = Some(to);
+        }
+        true
+    });
+    (out, matches)
 }
 
 #[async_trait]
@@ -402,18 +482,22 @@ impl Tool for FsSearch {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta(
             "fs_search",
-            "search text files for a regex (grep -rn)",
+            "search file contents with a regex (like grep -rn): `path:line: text`. glob limits the files (e.g. **/*.rs), context=N adds N lines around each match, files_only=true lists matching paths only. Skips .git, node_modules, target",
             "filesystem",
             vec![
                 ParamSpec::new("pattern", ParamType::String, true, "regular expression"),
                 ParamSpec::new("path", ParamType::String, false, "directory to search (default: workspace)")
                     .hints(&["file path", "directory"])
                     .default(json!(".")),
+                ParamSpec::new("glob", ParamType::String, false, "only files matching this glob"),
+                ParamSpec::new("context", ParamType::Integer, false, "lines of context around matches (0-5)"),
+                ParamSpec::new("files_only", ParamType::Boolean, false, "list matching file paths only"),
+                ParamSpec::new("case_sensitive", ParamType::Boolean, false, "default: ignore case"),
                 ParamSpec::new("max_results", ParamType::Integer, false, "default 50"),
             ],
         );
         m.cacheable = true;
-        kw(&mut m, &["search", "grep", "find", "text", "occurrences", "match"]);
+        kw(&mut m, &["search", "grep", "find", "text", "occurrences", "match", "contains", "usages", "references", "where"]);
         pats(
             &mut m,
             &[
@@ -423,20 +507,30 @@ impl Tool for FsSearch {
         );
         m
     }
-    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, input: Value, _ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         enforce(&self.policy, &self.metadata(), &input)?;
         let pat = arg_str(&input, "pattern")?;
-        let re = Regex::new(&format!("(?i){pat}")).map_err(|e| ToolError::args(format!("bad pattern: {e}")))?;
+        let case = input.get("case_sensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+        let re =
+            Regex::new(&format!("{}{pat}", if case { "" } else { "(?i)" })).map_err(|e| ToolError::args(format!("bad pattern (Rust regex syntax): {e}")))?;
+        let glob = match input.get("glob").and_then(|v| v.as_str()).filter(|g| !g.is_empty()) {
+            Some(g) => Some(crate::coding::glob_to_regex(g).map_err(ToolError::args)?),
+            None => None,
+        };
         let raw = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let max = input.get("max_results").and_then(|v| v.as_u64()).unwrap_or(50).min(500) as usize;
+        let max = input.get("max_results").and_then(|v| v.as_u64()).unwrap_or(50).clamp(1, 500) as usize;
+        let context = input.get("context").and_then(|v| v.as_u64()).unwrap_or(0).min(5) as usize;
+        let files_only = input.get("files_only").and_then(|v| v.as_bool()).unwrap_or(false);
         let guard = self.policy.guard();
         let root = guard.read_path(raw)?;
-        let hits = tokio::task::spawn_blocking(move || walk_search(&guard, &root, &re, max)).await.map_err(|e| ToolError::other(e.to_string()))?;
-        let _ = ctx;
-        if hits.is_empty() {
+        let (lines, matches) = tokio::task::spawn_blocking(move || search_files(&guard, &root, &re, glob.as_ref(), context, files_only, max))
+            .await
+            .map_err(|e| ToolError::other(e.to_string()))?;
+        if lines.is_empty() {
             return Ok(ToolOutput::ok(format!("no matches for '{pat}' in {raw}")));
         }
-        Ok(ToolOutput::ok(format!("{} match(es)\n{}", hits.len(), hits.join("\n"))))
+        let head = if files_only { format!("{} file(s)", lines.len()) } else { format!("{matches} match(es)") };
+        Ok(ToolOutput::ok(format!("{head}\n{}", lines.join("\n"))))
     }
 }
 
@@ -449,14 +543,35 @@ pub struct Shell {
 #[async_trait]
 impl Tool for Shell {
     fn metadata(&self) -> ToolMetadata {
-        let mut m = meta(
-            "shell",
-            "run one allowlisted command (no shell, no pipes), e.g. `df -h`, `ls -la`, `grep -n x file`",
-            "system",
-            vec![ParamSpec::new("command", ParamType::String, true, "command line, e.g. 'df -h'")],
-        );
+        let sandbox = crate::coding::sandboxed(&self.policy);
+        let mut m = if sandbox {
+            meta(
+                "shell",
+                "run a bash command in the workspace (or `cwd`): pipes, &&, redirects, git, build and test tools all work; output ends with [exit code N] on failure. timeout_secs (default 120) for slow commands; background=true for servers and long jobs, then shell_output / shell_kill. For file work prefer fs_* tools",
+                "system",
+                vec![
+                    ParamSpec::new("command", ParamType::String, true, "bash command line"),
+                    ParamSpec::new("cwd", ParamType::String, false, "working directory inside the workspace"),
+                    ParamSpec::new("timeout_secs", ParamType::Integer, false, "default 120"),
+                    ParamSpec::new("background", ParamType::Boolean, false, "start it and return a job id"),
+                ],
+            )
+        } else {
+            meta(
+                "shell",
+                "run one allowlisted command (no shell, no pipes), e.g. `df -h`, `ls -la`, `grep -n x file`",
+                "system",
+                vec![ParamSpec::new("command", ParamType::String, true, "command line, e.g. 'df -h'")],
+            )
+        };
         m.risk = Risk::Moderate;
-        kw(&mut m, &["run", "command", "shell", "execute", "terminal", "bash"]);
+        kw(
+            &mut m,
+            &[
+                "run", "command", "shell", "execute", "terminal", "bash", "git", "test", "build", "compile", "install", "script", "make", "npm", "cargo",
+                "python", "pip",
+            ],
+        );
         pats(
             &mut m,
             &[
@@ -470,18 +585,19 @@ impl Tool for Shell {
         let meta = self.metadata();
         enforce(&self.policy, &meta, &input)?;
         let cmd = arg_str(&input, "command")?;
-        let argv = shlex::split(cmd).ok_or_else(|| ToolError::args("unparseable command"))?;
         let cfg = &self.policy.config().shell;
+        if crate::coding::sandboxed(&self.policy) {
+            let cwd = crate::coding::resolve_cwd(&self.policy, &input)?;
+            if input.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let id = crate::coding::spawn_job(cmd, &cwd)?;
+                return Ok(ToolOutput::ok(format!("started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it")));
+            }
+            let secs = input.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(120).clamp(1, cfg.max_timeout_secs.max(1));
+            return crate::coding::run_script(cmd, &cwd, Duration::from_secs(secs), cfg.max_output_bytes.max(65_536), &ctx).await;
+        }
+        let argv = shlex::split(cmd).ok_or_else(|| ToolError::args("unparseable command"))?;
         let r = sandbox::run_argv(&argv, self.policy.workspace(), Duration::from_secs(cfg.timeout_secs), cfg.max_output_bytes, &ctx.cancel).await?;
-        let mut out = r.stdout;
-        if !r.stderr.trim().is_empty() {
-            out.push_str(&format!("\n[stderr] {}", r.stderr.trim()));
-        }
-        if r.truncated {
-            out.push_str("\n…[output truncated]");
-        }
-        let code = r.code.unwrap_or(-1);
-        Ok(ToolOutput { content: out.trim().to_string(), ok: code == 0, exit_code: Some(code), evidence: vec![format!("exit code {code}")] })
+        Ok(crate::coding::format_exec(r))
     }
 }
 

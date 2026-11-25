@@ -23,9 +23,25 @@ pub struct FilesystemPolicy {
     pub deny_names: Vec<String>,
 }
 
+/// How much of a shell the agent gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellMode {
+    /// One allowlisted command, no shell (no pipes, redirects, `&&`): for running on a machine that matters.
+    #[default]
+    Allowlist,
+    /// A full bash in the workspace — pipes, redirects, git, build and test tools. The container
+    /// (read-only root, no capabilities, unprivileged user, memory/pid limits) is the boundary, so
+    /// use it only inside one.
+    Sandbox,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShellPolicy {
+    pub mode: ShellMode,
+    /// Longest `timeout_secs` a sandbox command may ask for.
+    pub max_timeout_secs: u64,
     /// Read-only commands that run without approval.
     pub allowed: Vec<String>,
     /// Commands that run only after explicit approval.
@@ -61,6 +77,9 @@ pub struct PolicyConfig {
     pub filesystem: FilesystemPolicy,
     pub shell: ShellPolicy,
     pub network: NetworkPolicy,
+    /// Set from `DFAE_APPROVALS` at start-up (not read from the policy file).
+    #[serde(skip)]
+    pub approvals: ApprovalMode,
 }
 
 impl Default for FilesystemPolicy {
@@ -78,6 +97,8 @@ impl Default for ShellPolicy {
     fn default() -> Self {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         Self {
+            mode: ShellMode::Allowlist,
+            max_timeout_secs: 900,
             allowed: v(&[
                 "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami", "hostname", "stat",
                 "du", "sort", "diff", "cut", "tr", "basename", "dirname", "nproc", "id",
@@ -198,12 +219,36 @@ impl PolicyEngine {
                 Ok(_) => PolicyDecision::Allow,
                 Err(e) => PolicyDecision::Deny(e.message),
             },
-            "shell" => self.check_shell(&guard, args.get("command").and_then(|v| v.as_str()).unwrap_or("")),
+            "shell" => {
+                let cwd_ok = match args.get("cwd").and_then(|v| v.as_str()).filter(|c| !c.is_empty()) {
+                    Some(c) => guard.read_path(c).map(|_| ()),
+                    None => Ok(()),
+                };
+                match cwd_ok {
+                    Ok(()) => self.check_shell(&guard, args.get("command").and_then(|v| v.as_str()).unwrap_or("")),
+                    Err(e) => PolicyDecision::Deny(e.message),
+                }
+            }
+            "fs_glob" => match guard.read_path(args.get("path").and_then(|v| v.as_str()).unwrap_or(".")) {
+                Ok(_) => PolicyDecision::Allow,
+                Err(e) => PolicyDecision::Deny(e.message),
+            },
+            // changes to existing files and the tree: every path involved must be writable
+            "fs_edit" | "fs_mkdir" | "fs_delete" | "fs_move" | "fs_copy" => {
+                let paths: Vec<&str> = ["path", "from", "to"].iter().filter_map(|k| args.get(*k).and_then(|v| v.as_str())).collect();
+                match paths.iter().find_map(|p| guard.write_path(p).err()) {
+                    Some(e) => PolicyDecision::Deny(e.message),
+                    None if self.cfg.filesystem.write_requires_approval => PolicyDecision::RequireApproval("changes files".into()),
+                    None => PolicyDecision::Allow,
+                }
+            }
             "http_get" => self.check_url(args.get("url").and_then(|v| v.as_str()).unwrap_or(""), tainted),
             _ => PolicyDecision::Allow,
         };
         if decision == PolicyDecision::Allow {
-            if meta.requires_approval {
+            if self.cfg.approvals == ApprovalMode::Never {
+                // nothing waits for a human: only what the rules above refused is refused
+            } else if meta.requires_approval {
                 decision = PolicyDecision::RequireApproval(format!("tool '{}' always requires approval", meta.name));
             } else if meta.risk == Risk::High {
                 decision = PolicyDecision::RequireApproval("high-risk tool".into());
@@ -211,11 +256,18 @@ impl PolicyEngine {
                 decision = PolicyDecision::RequireApproval("context contains suspected prompt injection".into());
             }
         }
+        // without approvals, "needs a human" means "go ahead"
+        if self.cfg.approvals == ApprovalMode::Never && matches!(decision, PolicyDecision::RequireApproval(_)) {
+            decision = PolicyDecision::Allow;
+        }
         decision
     }
 
     fn check_shell(&self, guard: &PathGuard, command: &str) -> PolicyDecision {
         let sh = &self.cfg.shell;
+        if sh.mode == ShellMode::Sandbox {
+            return if command.trim().is_empty() { PolicyDecision::Deny("empty command".into()) } else { PolicyDecision::Allow };
+        }
         let Some(argv) = shlex::split(command) else {
             return PolicyDecision::Deny("unparseable command line".into());
         };
@@ -308,12 +360,12 @@ impl PolicyEngine {
         if self.cfg.network.allowed_domains.iter().any(|d| domain_matches(d, &host)) {
             PolicyDecision::Allow
         } else if self.cfg.network.open_web {
-            if tainted {
+            if tainted && self.cfg.approvals == ApprovalMode::Ask {
                 PolicyDecision::RequireApproval(format!("'{host}' is not on the allowlist and the context contains suspected prompt injection"))
             } else {
                 PolicyDecision::Allow
             }
-        } else if self.cfg.network.unlisted_requires_approval {
+        } else if self.cfg.network.unlisted_requires_approval && self.cfg.approvals == ApprovalMode::Ask {
             PolicyDecision::RequireApproval(format!("'{host}' is not on the network allowlist"))
         } else {
             PolicyDecision::Deny(format!("'{host}' is not on the network allowlist"))
@@ -448,6 +500,9 @@ mod tests {
         let mut expected = PolicyConfig::default();
         assert!(!expected.network.open_web, "the built-in default must stay closed");
         expected.network.open_web = true;
+        // ...and, since the shipped file is only used inside the container, it gives the agent a full shell
+        assert_eq!(expected.shell.mode, ShellMode::Allowlist, "the built-in default must stay restricted");
+        expected.shell.mode = ShellMode::Sandbox;
         assert_eq!(serde_json::to_value(&shipped).unwrap(), serde_json::to_value(expected).unwrap());
     }
 
