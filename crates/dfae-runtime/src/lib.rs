@@ -14,6 +14,7 @@ mod executor;
 mod pipeline;
 pub mod planner;
 pub mod prompts;
+mod session;
 pub mod skills;
 pub mod team;
 mod verify;

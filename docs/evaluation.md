@@ -5,11 +5,11 @@ how to benchmark it properly.
 
 ## The token ledger
 
-Every model call is recorded (`slm`, `strong`, `jev`) with provider-reported token usage, falling back to an
+Every model call is recorded (`slm`, `strong`, `decision`) with provider-reported token usage, falling back to an
 estimator (`max(chars/4, words·4/3)`, deliberately slightly high). GLiNER calls are counted but cost no LLM tokens.
 
 * **generative tokens** = SLM + strong-model tokens — what an LLM bill is made of.
-* **decision tokens** = Jev input+output tokens (billed separately, usually far cheaper).
+* **decision tokens** = decision-model input+output tokens (a local model: compute, not a bill).
 
 ## The baseline (an estimate, not a measurement)
 
@@ -48,7 +48,7 @@ Compare, on *your* task distribution:
 
 1. a plain SLM agent (no tools);
 2. the same SLM with native tool calling;
-3. DFAE (Jev + GLiNER + SLM);
+3. DFAE (decision model + GLiNER + SLM);
 4. DFAE with a stronger model enabled for escalation (or a stronger model alone).
 
 `scripts/bench.sh [file]` runs a list of requests and prints mode, verification and tokens per request;

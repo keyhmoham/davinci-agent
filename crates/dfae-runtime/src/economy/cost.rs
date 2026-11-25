@@ -5,8 +5,16 @@ use std::collections::HashMap;
 
 /// Typical total tokens (prompt + completion) per call purpose, used until the
 /// ledger has taught the model better. Measured on the shipped prompts.
-const PRIORS: &[(&str, f64)] =
-    &[("plan", 330.0), ("plan_repair", 380.0), ("plan_escalated", 330.0), ("replan", 420.0), ("step", 150.0), ("step_expand", 170.0), ("answer", 160.0)];
+const PRIORS: &[(&str, f64)] = &[
+    ("plan", 330.0),
+    ("plan_repair", 380.0),
+    ("plan_escalated", 330.0),
+    ("replan", 420.0),
+    ("step", 150.0),
+    ("step_expand", 170.0),
+    ("answer", 160.0),
+    ("chat", 140.0),
+];
 const PRIOR_WEIGHT: f64 = 3.0;
 const MAX_SAMPLES: f64 = 50.0;
 
@@ -71,6 +79,9 @@ impl CostModel {
 
     /// Expected *remaining* cost of finishing `plan` (planning calls already made are not included).
     pub fn estimate_plan(&self, plan: &Plan) -> CostEstimate {
+        if plan.source == PlanSource::Chat {
+            return CostEstimate { model_calls: 1, tokens: self.tokens("chat") };
+        }
         let own = plan_model_calls(&plan.steps);
         let reasoning = plan.steps.iter().filter(|s| s.kind == StepKind::Reasoning && !s.status.is_done()).count() as u64;
         let answer_call = u64::from(own as u64 > reasoning);

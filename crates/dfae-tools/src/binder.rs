@@ -38,7 +38,7 @@ static SPLIT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static REASONING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(explain|why|summari[sz]e|analy[sz]e|compare|describe|recommend|fix|improve|review|translate|rewrite|interpret|decide|should|suggest|investigate|diagnose|debug|optimi[sz]e|plan|tell|which|identify|extract|count|determine|whether|figure|find out|how many|what's wrong)\b").unwrap()
+    Regex::new(r"(?i)\b(explain|why|summari[sz]e|analy[sz]e|compare|describe|recommend|fix|improve|review|translate|rewrite|interpret|decide|should|suggest|tell\s+me\s+(?:what|why|how|about|whether|if|which|who|when)|investigate|diagnose|debug|optimi[sz]e|plan|which|identify|extract|count|determine|whether|figure|find out|how many|what's wrong)\b").unwrap()
 });
 
 fn split_clauses(req: &str) -> Vec<(String, bool)> {
@@ -95,12 +95,17 @@ fn bind_clause(metas: &[ToolMetadata], clause: &str, entities: &[Entity]) -> Opt
             let Some(caps) = re.captures(clause) else { continue };
             let mut args = Map::new();
             let (mut explicit, mut defaulted, mut ok) = (0u32, 0u32, true);
+            // texts already bound to a parameter are not offered to another one (a quoted file name is not the content)
+            let mut used: Vec<String> = Vec::new();
             for p in &m.params {
-                let from_group = caps.name(&p.name).map(|g| clean(g.as_str())).filter(|s| !s.is_empty());
+                // file content is a literal: only whitespace is trimmed
+                let from_group =
+                    caps.name(&p.name).map(|g| if p.name == "content" { g.as_str().trim().to_string() } else { clean(g.as_str()) }).filter(|s| !s.is_empty());
                 if let Some(raw) = from_group {
                     match coerce(p, &raw) {
                         Some(v) => {
                             args.insert(p.name.clone(), v);
+                            used.push(raw);
                             explicit += 1;
                             continue;
                         }
@@ -110,10 +115,14 @@ fn bind_clause(metas: &[ToolMetadata], clause: &str, entities: &[Entity]) -> Opt
                         }
                     }
                 }
-                let from_entity =
-                    p.entity_hints.iter().find_map(|h| entities.iter().find(|e| &e.label == h && clause.contains(&e.text))).and_then(|e| coerce(p, &e.text));
-                if let Some(v) = from_entity {
+                let from_entity = p
+                    .entity_hints
+                    .iter()
+                    .find_map(|h| entities.iter().find(|e| &e.label == h && clause.contains(&e.text) && !used.contains(&e.text)))
+                    .and_then(|e| coerce(p, &e.text).map(|v| (v, e.text.clone())));
+                if let Some((v, text)) = from_entity {
                     args.insert(p.name.clone(), v);
+                    used.push(text);
                     explicit += 1;
                 } else if let Some(d) = &p.default {
                     args.insert(p.name.clone(), d.clone());
@@ -180,6 +189,35 @@ mod tests {
         let c = bind(req).unwrap_or_else(|| panic!("no binding for {req:?}"));
         assert_eq!(c.len(), 1, "{c:?}");
         (c[0].tool.clone(), c[0].args.clone())
+    }
+
+    fn ent(label: &str, text: &str) -> Entity {
+        Entity { label: label.into(), text: text.into(), start: None, end: None, score: 1.0, source: "t".into() }
+    }
+
+    #[test]
+    fn binds_file_creation_phrasings_without_a_model() {
+        let ents = [ent("file path", "test.txt"), ent("quoted", "hello keyhan !")];
+        let c = bind_direct(&metas(), r#"create a file named test.txt with content "hello keyhan !" in ./ path"#, &ents).expect("bound");
+        assert_eq!((c[0].tool.as_str(), &c[0].args), ("fs_write", &json!({"path": "test.txt", "content": "hello keyhan !"})), "the content is kept verbatim");
+        // the quoted file name is not mistaken for the content
+        let ents = [ent("file path", "test.txt"), ent("quoted", "test.txt"), ent("quoted", "hello world !")];
+        let c = bind_direct(&metas(), r#"hi. create a file named "test.txt" with content 'hello world !'"#, &ents).expect("bound");
+        assert_eq!(c[0].args, json!({"path": "test.txt", "content": "hello world !"}));
+        let c = bind_direct(&metas(), "save a new file notes/a.md containing `# Title`", &[ent("file path", "notes/a.md"), ent("quoted", "# Title")])
+            .expect("bound");
+        assert_eq!(c[0].args, json!({"path": "notes/a.md", "content": "# Title"}));
+        // no content given: not bindable, so a model gets it
+        assert!(bind_direct(&metas(), "create a file named test.txt", &[ent("file path", "test.txt")]).is_none());
+    }
+
+    #[test]
+    fn binds_web_search() {
+        assert_eq!(one("search the web for rust async book").1["query"], "rust async book");
+        assert_eq!(one("google tokio runtime tuning").1["query"], "tokio runtime tuning");
+        assert_eq!(one("search for rust async book online").1["query"], "rust async book");
+        // a bare "search for" may mean the files: not decided by a regex
+        assert!(bind("search for the config").is_none());
     }
 
     #[test]

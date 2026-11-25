@@ -66,6 +66,11 @@ impl Decider {
         self.primary.as_ref().map(|p| p.name()).unwrap_or("local")
     }
 
+    /// Whether the decision model is reachable (`None` when only the local rules are in use).
+    pub async fn health(&self) -> Option<bool> {
+        self.primary.as_ref()?.health().await
+    }
+
     /// Run a decision request with cache + fallback and produce its record.
     pub async fn decide(&self, req: DecisionRequest) -> (DecisionResponse, DecisionRecord, Option<LedgerEntry>) {
         let key = sha256_hex(&format!("{}|{}", req.kind.as_str(), serde_json::to_string(&(&req.state, &req.questions)).unwrap_or_default()));
@@ -104,10 +109,10 @@ impl Decider {
             tokens_out: if from_cache { 0 } else { resp.output_tokens },
             note,
         };
-        let entry = (resp.provider == "jev").then(|| LedgerEntry {
+        let entry = (resp.provider == "open-model").then(|| LedgerEntry {
             ts: Utc::now(),
-            component: Component::Jev,
-            model: "jev".into(),
+            component: Component::Decision,
+            model: resp.model.clone(),
             purpose: req.kind.as_str().into(),
             prompt_tokens: if from_cache { 0 } else { resp.input_tokens },
             completion_tokens: if from_cache { 0 } else { resp.output_tokens },
@@ -330,7 +335,7 @@ mod tests {
     #[async_trait]
     impl DecisionProvider for Failing {
         fn name(&self) -> &str {
-            "jev"
+            "open-model"
         }
         async fn decide(&self, _r: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
             Err(DecisionError::Unavailable("down".into()))

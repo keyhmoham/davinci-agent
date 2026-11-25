@@ -133,6 +133,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let [tabs, content] = Layout::vertical([Constraint::Length(2), Constraint::Min(3)]).areas(right);
     draw_tabs(f, tabs, app);
     match app.tab {
+        Tab::Chat => draw_chat(f, content, app),
         Tab::Timeline => draw_timeline(f, content, app),
         Tab::Plan => draw_plan(f, content, app),
         Tab::Team => draw_team(f, content, app),
@@ -540,13 +541,66 @@ fn welcome() -> Vec<Line<'static>> {
         Line::from(vec![Span::styled("  A ", Style::new().fg(WARN).bold()), ds("assisted  small language model plans / reasons / writes.")]),
         Line::from(vec![Span::styled("  E ", Style::new().fg(VIOLET).bold()), ds("escalated stronger model, only when needed.")]),
         Line::from(""),
-        d("  Try:  what is 12 * (3 + 4)?"),
+        d("  Talk to it, or give it a job. Try:  hi · what is a mutex? · weather in Paris (searches the web)"),
+        d("        what is 12 * (3 + 4)?"),
+        d("        search the web for rust async book"),
         d("        list the files in ./  and what time is it"),
         d("        write 'hello' to notes/hello.txt        (asks for approval)"),
         d("        remember that the staging db is db-staging-01"),
         d("        read a.txt, b.txt and c.txt and summarize them   (forms a team)"),
         d("  F1 for help · Tab switches views · F2 cycles execution mode"),
     ]
+}
+
+/// The conversation of the current session: what you asked and what came back, oldest first.
+fn chat_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<&crate::api::TaskRow> = app.tasks.iter().filter(|t| t.session_id == app.session_id && t.parent_id.is_none()).collect();
+    rows.sort_by_key(|t| t.created_at);
+    let mut lines: Vec<Line> = Vec::new();
+    if rows.is_empty() {
+        lines = welcome();
+    }
+    for t in rows {
+        let asked = if t.asked.is_empty() { &t.goal } else { &t.asked };
+        for (i, l) in wrap_text(asked, width.saturating_sub(6)).into_iter().enumerate() {
+            let lead = if i == 0 { Span::styled(" you ▸ ", Style::new().fg(ACCENT).bold()) } else { Span::raw("       ") };
+            lines.push(Line::from(vec![lead, Span::styled(l, Style::new().bold())]));
+        }
+        let (text, color) = match (&t.answer, t.status) {
+            (Some(a), _) if !a.is_empty() => (a.clone(), if t.status == TaskStatus::Failed { WARN } else { Color::Reset }),
+            (_, TaskStatus::WaitingForApproval) => ("waiting for your approval (a to approve, d to deny)".to_string(), WARN),
+            (_, s) if s.is_terminal() => (t.error.clone().unwrap_or_else(|| format!("{s:?}")), BAD),
+            _ => (format!("{} working…", spinner(app)), DIM),
+        };
+        for (i, l) in wrap_text(&text, width.saturating_sub(6)).into_iter().enumerate() {
+            let lead = if i == 0 { Span::styled("   ◆ ", Style::new().fg(OK).bold()) } else { Span::raw("     ") };
+            lines.push(Line::from(vec![lead, Span::styled(l, Style::new().fg(color))]));
+        }
+        if t.status.is_terminal() {
+            let (m, mc) = mode_badge(t.mode);
+            lines.push(Line::from(vec![
+                Span::raw("     "),
+                Span::styled(m, Style::new().fg(mc)),
+                Span::styled(format!(" · {} tok", t.ledger.generative_tokens), Style::new().fg(DIM)),
+            ]));
+        }
+        lines.push(Line::raw(""));
+    }
+    lines
+}
+
+fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let lines = chat_lines(app, area.width.saturating_sub(2) as usize);
+    let total = lines.len();
+    let scroll = app.scroll.min(total.saturating_sub(inner_h));
+    let start = total.saturating_sub(inner_h + scroll);
+    let visible: Vec<Line> = lines.into_iter().skip(start).take(inner_h).collect();
+    let mut title = vec![Span::styled(" Chat ", Style::new().fg(ACCENT).bold())];
+    if scroll > 0 {
+        title.push(Span::styled(format!("↑{scroll} (End to follow) "), Style::new().fg(WARN)));
+    }
+    f.render_widget(Paragraph::new(visible).block(block(Line::from(title))), area);
 }
 
 fn draw_timeline(f: &mut Frame, area: Rect, app: &App) {
@@ -745,7 +799,7 @@ fn draw_cognition(f: &mut Frame, area: Rect, app: &App) {
         .map(|r| {
             Row::new(vec![
                 Cell::from(r.kind.clone()),
-                Cell::from(Span::styled(r.provider.clone(), Style::new().fg(if r.provider.starts_with("jev") { VIOLET } else { DIM }))),
+                Cell::from(Span::styled(r.provider.clone(), Style::new().fg(if r.provider.starts_with("open-model") { VIOLET } else { DIM }))),
                 Cell::from(trunc(&kv_brief(&r.answers), 70)),
                 Cell::from(format!("{}ms", r.latency_ms)),
                 Cell::from(if r.tokens_in > 0 { format!("{}→{}", r.tokens_in, r.tokens_out) } else { "-".into() }),
@@ -950,12 +1004,12 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
         bar("naive LLM agent (est.)", s.baseline_tokens, max, w, BAD),
         bar("generative: SLM", s.slm_tokens, max, w, WARN),
         bar("generative: strong model", s.strong_tokens, max, w, VIOLET),
-        bar("decision model (Jev)", s.decision_tokens, max, w, ACCENT),
+        bar("decision model", s.decision_tokens, max, w, ACCENT),
         Line::from(vec![
             label(" calls   "),
             Span::raw(format!(
-                "slm {} · strong {} · jev {} · extractor {} · cache hits {}",
-                s.slm_calls, s.strong_calls, s.jev_calls, s.gliner_calls, s.cache_hits
+                "slm {} · strong {} · decision {} · extractor {} · cache hits {}",
+                s.slm_calls, s.strong_calls, s.decision_calls, s.gliner_calls, s.cache_hits
             )),
         ]),
         Line::from(vec![
@@ -993,7 +1047,7 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
                             Style::new().fg(match e.component {
                                 Component::Slm => WARN,
                                 Component::Strong => VIOLET,
-                                Component::Jev => ACCENT,
+                                Component::Decision => ACCENT,
                                 Component::Gliner => OK,
                             }),
                         )),
@@ -1309,6 +1363,9 @@ mod tests {
             role: None,
             parent_id: None,
             agents: 0,
+            asked: String::new(),
+            answer: None,
+            error: None,
         }];
         app.events = vec![Event {
             task_id: rec.task_id.clone(),
@@ -1325,6 +1382,39 @@ mod tests {
         );
         app.connected = true;
         app
+    }
+
+    #[test]
+    fn chat_shows_the_conversation_of_this_session_only_oldest_first() {
+        let mut app = sample();
+        let mk = |id: &str, asked: &str, answer: Option<&str>, status, secs: i64, sid: &str| TaskRow {
+            task_id: id.into(),
+            goal: format!("resolved {asked}"),
+            asked: asked.into(),
+            answer: answer.map(String::from),
+            error: None,
+            status,
+            mode: Some(ExecMode::Direct),
+            verification: None,
+            pending_approvals: 0,
+            ledger: Default::default(),
+            session_id: sid.into(),
+            created_at: Some(chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()),
+            role: None,
+            parent_id: None,
+            agents: 0,
+        };
+        let sid = app.session_id.clone();
+        app.tasks = vec![
+            mk("b", "read it", None, TaskStatus::Running, 20, &sid),
+            mk("a", "hi", Some("Hi! I'm DFAE."), TaskStatus::Completed, 10, &sid),
+            mk("x", "someone else's", Some("secret"), TaskStatus::Completed, 5, "other"),
+        ];
+        let text: Vec<String> = chat_lines(&app, 60).iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>()).collect();
+        let joined = text.join("\n");
+        assert!(joined.find("hi").unwrap() < joined.find("read it").unwrap(), "{joined}");
+        assert!(joined.contains("Hi! I'm DFAE.") && joined.contains("working…"), "{joined}");
+        assert!(!joined.contains("secret") && !joined.contains("resolved"), "the user's own words are shown, not the rewritten request: {joined}");
     }
 
     #[test]

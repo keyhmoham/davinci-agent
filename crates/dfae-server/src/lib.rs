@@ -88,8 +88,8 @@ async fn info(State(s): State<AppState>) -> Json<Value> {
         "name": "dfae",
         "version": env!("CARGO_PKG_VERSION"),
         "config": {
-            "decision": if cfg.jev.api_key.is_some() { "jev" } else { "local" },
-            "jev_model": cfg.jev.model,
+            "decision": if cfg.decision.base_url.is_some() { "open-model" } else { "local" },
+            "decision_model": cfg.decision.model,
             "slm": { "provider": cfg.slm.provider, "model": cfg.slm.model },
             "strong": { "provider": cfg.strong.provider, "model": cfg.strong.model },
             "gliner": cfg.gliner_url.is_some(),
@@ -135,6 +135,11 @@ struct TaskSummary {
     task_id: String,
     session_id: String,
     goal: String,
+    /// What the user typed (`goal` may have been made self-contained by the conversation resolver).
+    asked: String,
+    /// The reply (bounded: the task view has the full text).
+    answer: Option<String>,
+    error: Option<String>,
     status: TaskStatus,
     mode: Option<ExecMode>,
     verification: Option<VerificationStatus>,
@@ -164,6 +169,9 @@ async fn list_tasks(State(s): State<AppState>, Query(q): Query<ListQ>) -> Json<V
                 parent_id: t.team.as_ref().and_then(|i| i.link.as_ref()).map(|l| l.parent_id.clone()),
                 agents: t.team.as_ref().map(|i| i.children.len()).unwrap_or(0),
                 verification: t.verification.as_ref().map(|v| v.status),
+                asked: t.request.goal.clone(),
+                answer: t.final_answer.as_deref().map(|a| a.chars().take(2000).collect()),
+                error: t.error.as_deref().map(|a| a.chars().take(400).collect()),
                 task_id: t.task_id,
                 session_id: t.session_id,
                 goal: t.goal,
@@ -284,7 +292,7 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
          dfae_tokens{{kind=\"slm\"}} {}\ndfae_tokens{{kind=\"strong\"}} {}\ndfae_tokens{{kind=\"decision\"}} {}\n\
          dfae_teams {}\ndfae_agents {}\ndfae_team_cache_hits {}\n\
          dfae_dispatch_tasks{{state=\"running\"}} {}\ndfae_dispatch_tasks{{state=\"queued\"}} {}\ndfae_dispatch_agents{{state=\"running\"}} {}\ndfae_dispatch_agents_spawned {}\n\
-         dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"slm\"}} {}\ndfae_model_calls{{kind=\"strong\"}} {}\ndfae_model_calls{{kind=\"jev\"}} {}\n",
+         dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"slm\"}} {}\ndfae_model_calls{{kind=\"strong\"}} {}\ndfae_model_calls{{kind=\"decision\"}} {}\n",
         st.tasks,
         st.completed,
         st.failed,
@@ -306,7 +314,7 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
         t.saved_tokens,
         t.slm_calls,
         t.strong_calls,
-        t.jev_calls
+        t.decision_calls
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

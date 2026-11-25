@@ -2,7 +2,7 @@
 
 use crate::engine::{Engine, EngineDeps};
 use dfae_core::*;
-use dfae_decision::{Calibrator, Decider, JevProvider};
+use dfae_decision::{Calibrator, Decider, OpenModelProvider};
 use dfae_extract::{GlinerClient, HybridExtractor};
 use dfae_memory::{InMemoryStore, PgStore};
 use dfae_models::{ModelGateway, build_model};
@@ -36,7 +36,7 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     if let Ok(Some(v)) = store.kv_get("calibration").await {
         calibrator.load(&v);
     }
-    let primary: Option<Arc<dyn DecisionProvider>> = JevProvider::new(&config.jev).map(|p| Arc::new(p) as Arc<dyn DecisionProvider>);
+    let primary: Option<Arc<dyn DecisionProvider>> = OpenModelProvider::new(&config.decision).map(|p| Arc::new(p) as Arc<dyn DecisionProvider>);
     let decider = Arc::new(Decider::new(primary, calibrator, config.thresholds.clone()));
     // models
     let models = ModelGateway::new(build_model(&config.slm), build_model(&config.strong));
