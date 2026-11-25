@@ -176,12 +176,16 @@ The self-hosted provider turns each question into a single-token multiple choice
 model and reads the **probability mass of the answer tokens** from the first token's log-probabilities
 (`noul` = P(yes)/(P(yes)+P(no)); `choice` = lettered options; `score` = expected level), so answers are real
 probabilities and always schema-valid — one prompt and one generated token per question; all questions of a
-decision share the same state prefix, so prompt caching helps. The engine asks bounded questions
-(`route_task`, `select_mode`, `select_tools`, `assess_plan`, `assess_recovery`,
-`assess_completion`) over a compact typed state. Provider answers are **validated** (right type,
-choice within the offered options), then **hard rules** apply: a provider can never pick *direct*
-mode without a deterministic binding, *escalated* without a configured stronger model, or retry a
-policy denial. On any provider error the same questions are answered by the local decider
+decision share the same state prefix, so prompt caching helps. **The decision model makes the decisions; code supplies facts and
+enforces limits.** The engine asks bounded questions (`route_task` — task type, complexity, tools needed, risk, *does it change something*,
+*is that change only conditional*, *is it just small talk (and which kind)*, *which kind of agent fits* — plus `resolve_reference`
+("does the request lean on something said earlier — the file, the link, the place, the code?"), `select_mode`, `select_tools`,
+`assess_plan`, `assess_recovery`, `assess_completion` and a step-level judge) over a compact typed state that includes the recent
+conversation and the policy ("medium and complex work goes to the external model"). Provider answers are **validated** (right type,
+choice within the offered options), then only **capability limits** apply: a provider can never pick *direct* mode without a
+deterministic binding, *escalated* without a configured stronger model, or retry a policy denial. The phrase lists and regexes that used
+to decide these things now live only in the local fallback decider, which answers the same questions when no model is configured or it
+is down; the runtime reads the answers (`Routing.changes`, `.conditional`, `.smalltalk`, `.role`), never the sentence. On any provider error the same questions are answered by the local decider
 (`local-fallback` in the decision log).
 
 ### Security model
@@ -321,7 +325,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 230+ tests, hermetic
+cargo test --workspace                       # 240+ tests, hermetic
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -331,7 +335,7 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 230+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 240+ unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
 | Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |

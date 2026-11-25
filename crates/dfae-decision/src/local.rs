@@ -178,6 +178,76 @@ const REASONING_VERBS: &[&str] = &[
     "review",
 ];
 
+/// "create a landing page", "build an API", "write a script": a deliverable, which lives in the workspace.
+static CREATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:create|build|make|generate|write|design|develop|implement|code|scaffold|set\s+up)\b[^.?!\n]{0,60}\b(?:page|website|web\s*site|site|app|application|script|program|api|server|component|dashboard|game|project|tool|bot|module|service|landing|html|css|backend|frontend|library|cli|file|files)\b",
+    )
+    .unwrap()
+});
+/// "serve it", "run that", "persist it": an action on something made earlier.
+static ACT_ON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:serve|host|run|start|launch|deploy|persist|save|store|put)\b[^.?!\n]{0,30}\b(?:it|that|this|them|these|the\s+(?:code|page|site|app|file|files|server|script))\b").unwrap()
+});
+
+// ---- the fallback's judgement of the extra routing questions (a decision model answers these itself) ----
+
+static CHANGE_VERBS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:replace|substitute|swap|change|edit|modify|update|fix|correct|rewrite|refactor|rename|insert|append|prepend|create|make|write|save|add|remove|delete|erase|move|copy|mkdir|install|deploy|patch|restart|commit|overwrite|serve|start|launch)\b",
+    )
+    .unwrap()
+});
+static CONDITIONAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:if\s+(?:necessary|needed|required|any|appropriate|possible|applicable)|when\s+(?:necessary|needed)|as\s+needed|propose|suggest|draft|recommend|should\s+i)\b").unwrap()
+});
+static GREETING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(?:hi|hello|hey|hiya|howdy|yo|greetings|good\s+(?:morning|afternoon|evening|day)|sup)\b[\s,.!-]*").unwrap());
+static HOW_ARE_YOU: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:so[,\s]+|and\s+)?(?:tell\s+me\s+|can\s+you\s+tell\s+me\s+)?(?:how\s+are\s+(?:you|u)(?:\s+(?:doing|today|going))*|how\s+do\s+you\s+do|how(?:'s|\s+is)\s+it\s+going|how\s+have\s+you\s+been|what'?s\s+up|how(?:'re|\s+are)\s+things)\s*[?!.]*$").unwrap()
+});
+static THANKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:thanks|thank\s+you|thx|ty|cheers|much\s+appreciated|great,?\s+thanks)(?:\s+(?:a\s+lot|so\s+much|very\s+much|again))?\s*[.!]*$")
+        .unwrap()
+});
+static BYE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:bye|goodbye|see\s+you|see\s+ya|good\s*night|cya)(?:\s+\w+)?\s*[.!]*$").unwrap());
+static ABOUT_YOU: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:who\s+are\s+you|what\s+are\s+you|what\s+can\s+you\s+do|what\s+do\s+you\s+do|help|what\s+are\s+your\s+(?:capabilities|abilities))\s*[?!.]*$",
+    )
+    .unwrap()
+});
+static VERIFY_VERB: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*(?:please\s+)?(?:verify|check|confirm|validate|ensure|test|inspect)\b").unwrap());
+static REF_PLACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:my|our)\s+(?:current\s+)?(?:city|town|location|area|place|neighbou?rhood)\b|\bwhere\s+i\s+(?:live|am)\b").unwrap());
+static REF_HERE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:here|outside)\b").unwrap());
+static WEATHERISH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:weather|temperature|forecast|rain\w*|snow\w*|hot|cold|warm)\b").unwrap());
+static REF_FILE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:that|this|the\s+same|the\s+above|the\s+previous|the\s+last)\s+file\b|\b(?:read|open|show|cat|print|display|view|delete|remove|edit|update|summari[sz]e|check|list|append\s+to|write\s+to)\s+(?:me\s+)?it\b").unwrap()
+});
+static REF_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:that|this|the\s+same)\s+(?:url|link|page|site|website)\b").unwrap());
+static REF_CODE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:that|this|these|those|the)\s+(?:code|snippet|script|page|html|program|function)\b|\b(?:save|persist|store|put|write|serve|run|host|deploy)\s+(?:it|that|this|them)\b").unwrap()
+});
+
+fn smalltalk_kind(req: &str) -> &'static str {
+    let rest = GREETING.find(req).map(|m| &req[m.end()..]).unwrap_or(req).trim_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
+    if rest.is_empty() {
+        return if GREETING.is_match(req) { "greeting" } else { "none" };
+    }
+    if HOW_ARE_YOU.is_match(rest) {
+        "how_are_you"
+    } else if THANKS.is_match(rest) {
+        "thanks"
+    } else if BYE.is_match(rest) {
+        "farewell"
+    } else if ABOUT_YOU.is_match(rest) {
+        "about_you"
+    } else {
+        "none"
+    }
+}
+
 static ARITH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*[-+*/^%x×÷]\s*\d+").unwrap());
 static CONJ: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(and then|then|after that|afterwards|and|also|but|unless|if|before|after|while|otherwise)\b|[;,]").unwrap());
@@ -312,7 +382,10 @@ impl LocalDecider {
                 let best_tool = self.tool_scores(s).iter().map(|(_, p)| *p).fold(0.0, f64::max);
                 let tool_type =
                     matches!(tt.as_str(), "file_operations" | "system_diagnostics" | "calculation" | "maintenance" | "memory" | "research" | "coding");
-                let needs = if tool_type { best_tool.max(0.7) } else { best_tool * 0.9 };
+                let mut needs = if tool_type { best_tool.max(0.7) } else { best_tool * 0.9 };
+                if CREATE.is_match(&s.request) || ACT_ON.is_match(&s.request) {
+                    needs = needs.max(0.8);
+                }
                 out.insert("needs_tools".into(), Answer::noul(needs));
                 let (r, rc) = self.risk(s);
                 let key = match r {
@@ -321,6 +394,37 @@ impl LocalDecider {
                     Risk::High => "high",
                 };
                 out.insert("risk".into(), Answer::choice(key, rc, &[(key, rc)]));
+                out.insert("changes_state".into(), Answer::noul(if CHANGE_VERBS.is_match(&s.request) { 0.85 } else { 0.1 }));
+                out.insert("conditional_change".into(), Answer::noul(if CONDITIONAL.is_match(&s.request) { 0.85 } else { 0.1 }));
+                let kind = smalltalk_kind(&s.request);
+                out.insert("smalltalk".into(), Answer::choice(kind, 0.9, &[(kind, 0.9)]));
+                let role = if r >= Risk::Moderate || tt == "maintenance" {
+                    "operator"
+                } else if needs < 0.5 {
+                    "analyst"
+                } else if VERIFY_VERB.is_match(&s.request) {
+                    "verifier"
+                } else {
+                    "researcher"
+                };
+                out.insert("role".into(), Answer::choice(role, 0.7, &[(role, 0.7)]));
+            }
+            DecisionKind::ResolveReference => {
+                // which of the known things does the request lean on? (a model reads the sentence; this fallback reads phrases)
+                let has = |k: &str| s.known.iter().any(|x| x.starts_with(&format!("{k}:")));
+                let req = &s.request;
+                let pick = if has("place") && (REF_PLACE.is_match(req) || (WEATHERISH.is_match(req) && REF_HERE.is_match(req))) {
+                    "place"
+                } else if has("file") && REF_FILE.is_match(req) {
+                    "file"
+                } else if has("url") && REF_URL.is_match(req) {
+                    "url"
+                } else if has("code") && REF_CODE.is_match(req) {
+                    "code"
+                } else {
+                    "none"
+                };
+                out.insert("refers_to".into(), Answer::choice(pick, 0.8, &[(pick, 0.8)]));
             }
             DecisionKind::SelectTools => {
                 for (name, p) in self.tool_scores(s) {
@@ -331,6 +435,10 @@ impl LocalDecider {
                 let f = s.mode_facts.clone().unwrap_or_default();
                 let (choice, conf) = if f.direct_bindable {
                     ("direct", if f.skill_score.unwrap_or(0.0) > 0.0 { 0.92 } else { 0.88 })
+                } else if f.strong_available && f.skill_score.is_none() && f.complexity >= f.external_min_complexity.max(0.0) && f.external_min_complexity > 0.0
+                {
+                    // the policy: medium and complex work is planned by the external model
+                    ("escalated", 0.9)
                 } else if f.complexity >= 0.85 && f.strong_available {
                     ("escalated", 0.6)
                 } else {
@@ -619,5 +727,26 @@ mod tests {
         };
         assert!(p("tool:http_get") > 0.5, "{}", p("tool:http_get"));
         assert!(p("tool:fs_list") < 0.3 && p("tool:calc") < 0.3);
+    }
+
+    #[test]
+    fn building_and_serving_things_needs_tools_but_asking_about_them_does_not() {
+        let d = dec();
+        let needs = |req: &str| match d.answer(&route_request(state(req)))["needs_tools"] {
+            Answer::Noul { noul } => noul >= 0.5,
+            _ => panic!(),
+        };
+        for req in [
+            "create a landing page for my coffee shop",
+            "build a REST API for todos",
+            "write a python script that renames files",
+            "persist it to file and serve it",
+            "save that code to index.html",
+        ] {
+            assert!(needs(req), "{req}");
+        }
+        for req in ["what is a landing page?", "why do people prefer REST over SOAP", "hi"] {
+            assert!(!needs(req), "{req}");
+        }
     }
 }

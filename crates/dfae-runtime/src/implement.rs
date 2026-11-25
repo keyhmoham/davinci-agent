@@ -104,6 +104,7 @@ impl Inner {
         prebound: &Map<String, Value>,
         deps: &[Dep],
         problem: Option<&str>,
+        rejected: bool,
     ) -> Result<Map<String, Value>, String> {
         let paid = tier == Tier::Strong;
         let ents = entities
@@ -115,7 +116,8 @@ impl Inner {
             .join(" | ");
         let sig = if paid { meta.signature() } else { meta.signature_detailed() };
         let inputs = Self::inputs_text(deps, if paid { 120 } else { 900 });
-        let user = prompts::bind_user(&sig, &step.description, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, problem);
+        let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
+        let user = prompts::bind_user(&sig, &step.description, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
         let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
         req.json = true;
         if paid {
@@ -196,7 +198,7 @@ impl Inner {
             meta.validate_args(&Value::Object(a.clone()))?;
             // a `{{id}}` template may only name a step this one depends on
             for r in planner::template_refs(&Value::Object(a.clone())) {
-                if !step.depends_on.contains(&r) {
+                if !step.depends_on.contains(&r) && !crate::session::ARTIFACT_NAMES.contains(&r.as_str()) {
                     return Err(format!("{{{{{r}}}}} is not one of this step's inputs ({})", step.depends_on.join(", ")));
                 }
             }
@@ -223,8 +225,9 @@ impl Inner {
                 ));
             }
             let mut satisfied = false;
+            let mut rejected = false; // the first ask says what is missing; later ones say what was wrong with the answer
             for tier in ladder {
-                match self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref()).await {
+                match self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected).await {
                     Ok(got) => {
                         let mut merged = args.clone();
                         // the model's values replace rule guesses only where the rules had nothing valid
@@ -246,6 +249,7 @@ impl Inner {
                     }
                     Err(e) => problem = Some(e),
                 }
+                rejected = true;
             }
             if !satisfied {
                 return Err(fail(
@@ -277,7 +281,7 @@ impl Inner {
     pub(crate) async fn judge_step(&self, ctx: &Arc<TaskCtx>, step: &Step, output: &str) -> Option<String> {
         let expect = step.expect.as_deref()?;
         let entities = ctx.rec.lock().await.entities.clone();
-        let mut st = self.decision_state(&format!("Step: {}\nThe result must show: {expect}", step.description), &entities);
+        let mut st = self.decision_state(&format!("STEP: {}\nEXPECTATION: {expect}", step.description), &entities);
         st.completion_facts = Some(CompletionFacts {
             steps_ok: 1,
             steps_failed: 0,
@@ -286,7 +290,7 @@ impl Inner {
             checks_failed: 0,
             evidence: tokens::truncate_tokens(output, 600),
         });
-        let p = self.note(ctx, self.decider.assess_completion(st).await).await;
+        let p = self.note(ctx, self.decider.judge_step(st).await).await;
         (p < 0.35).then(|| format!("the result does not meet the expectation \"{expect}\" (decision model: {p:.2})"))
     }
 }

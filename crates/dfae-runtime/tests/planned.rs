@@ -32,7 +32,7 @@ impl DecisionProvider for Picky {
     async fn decide(&self, req: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
         let mut r = self.0.decide(req.clone()).await?;
         if req.kind == DecisionKind::AssessCompletion
-            && req.state.request.starts_with("Step:")
+            && req.state.request.starts_with("STEP:")
             && req.state.completion_facts.as_ref().map(|f| f.evidence.contains("BAD")).unwrap_or(false)
         {
             r.answers.insert("complete".into(), Answer::noul(0.05));
@@ -189,7 +189,9 @@ async fn a_result_that_misses_the_planners_expectation_goes_back_to_the_external
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     let replan = r.strong.requests.lock().iter().find(|q| q.purpose == "replan").cloned().expect("the planner was asked to re-plan");
     assert_eq!(replan.system, prompts::BRIEF_REPLAN_SYSTEM);
-    assert!(replan.messages[0].content.contains("does not meet the expectation"), "{}", replan.messages[0].content);
+    let problem = &replan.messages[0].content;
+    assert!(problem.contains("does not meet what was expected") && problem.contains("status = BAD"), "the planner is told what was actually found: {problem}");
+    assert_eq!(t.plan.as_ref().unwrap().step("s1").unwrap().status, StepStatus::Succeeded, "the result is kept, not thrown away");
     assert!(t.final_answer.as_deref().unwrap().contains("status = fine"), "{:?}", t.final_answer);
 }
 
@@ -221,4 +223,145 @@ async fn a_conversation_of_medium_complexity_is_answered_by_the_external_model_a
     assert_eq!(t.mode, Some(ExecMode::Escalated), "{:?}", t.route);
     assert_eq!((r.strong.calls(), r.slm.calls()), (1, 0));
     assert!(t.final_answer.as_deref().unwrap().contains("semaphore admits N"));
+}
+
+async fn say(r: &Rig, session: &str, goal: &str) -> TaskRecord {
+    let id = r.engine.submit(TaskRequest { goal: goal.into(), session_id: Some(session.into()), delegate: Some(false), ..Default::default() }).await.unwrap();
+    r.engine.wait(&id, Duration::from_secs(30)).await.unwrap()
+}
+
+/// A page too big to be copied into a prompt (and certainly not through a small model's output).
+fn page() -> String {
+    let words: Vec<String> = (0..90).map(|i| format!("word{i}")).collect();
+    let body: String = (1..=120)
+        .map(|i| format!("<p>Section {i}: {} {} {} {}</p>\n", words[i % 90], words[(i * 7) % 90], words[(i * 13) % 90], words[(i * 29) % 90]))
+        .collect();
+    format!("<!doctype html>\n<html><body><h1>Brew & Co</h1>\n{body}</body></html>\n")
+}
+
+#[tokio::test]
+async fn code_shown_in_the_chat_can_be_saved_to_a_file_by_name_without_copying_it() {
+    // the page was written into the chat; "save that code to index.html" must not need it re-typed
+    let r = rig(false, |c| c.thresholds.external_min_complexity = 2.0);
+    r.slm.push(&format!("Here is a page:\n```html\n{}```", page()));
+    let t = say(&r, "lp", "what does a minimal html page look like").await;
+    assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Chat, "{:?}", t.route);
+
+    r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "index.html", "content": "{{prev_code}}"}}]}).to_string());
+    let t = say(&r, "lp", "save that code to index.html").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("index.html")).unwrap(), page(), "the code block itself, verbatim");
+    let prompt = r.slm.requests.lock().iter().find(|q| q.purpose == "plan").unwrap().messages[0].content.clone();
+    assert!(
+        prompt.contains("VALUES from the conversation") && prompt.contains("prev_code = html code block"),
+        "the planner knows it can name the code: {prompt}"
+    );
+    assert!(!prompt.contains("Section 119"), "and the page itself is not in the prompt to be copied: {prompt}");
+}
+
+#[tokio::test]
+async fn the_external_planner_and_the_local_binder_use_earlier_code_by_name_too() {
+    let r = rig(false, |_| {});
+    r.slm.push(&format!("Here is a page:\n```html\n{}```", page()));
+    say(&r, "lp2", "what does a minimal html page look like").await;
+    r.strong.push(&json!({"steps": [{"id": "s1", "do": "write {{prev_code}} to index.html", "tool": "fs_write"}]}).to_string());
+    r.slm.push(&json!({"content": "{{prev_code}}"}).to_string()); // the local binder names the value, it does not copy it
+    r.strong.push("Saved to index.html.");
+    let t = say(&r, "lp2", "Save that html code into index.html so the site has a real front page, and check it is there").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("index.html")).unwrap(), page());
+    let bind = r.slm.requests.lock().iter().find(|q| q.purpose == "bind").unwrap().messages[0].content.clone();
+    assert!(bind.contains("{{prev_code}} = html code block") && bind.contains("STILL MISSING") && !bind.contains("REJECTED"), "{bind}");
+    let plan_prompt = r.strong.requests.lock()[0].messages[0].content.clone();
+    assert!(plan_prompt.contains("VALUES from the conversation"), "{plan_prompt}");
+}
+
+/// A decision model that understands what the fallback rules cannot: answers given for requests containing a phrase.
+struct Oracle {
+    local: LocalDecider,
+    answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>,
+}
+
+#[async_trait]
+impl DecisionProvider for Oracle {
+    fn name(&self) -> &str {
+        "open-model"
+    }
+    async fn decide(&self, req: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
+        let mut r = self.local.decide(req.clone()).await?;
+        for (kind, key, answer, phrase) in &self.answers {
+            if *kind == req.kind && req.state.request.contains(phrase) {
+                r.answers.insert((*key).into(), answer.clone());
+            }
+        }
+        Ok(r)
+    }
+}
+
+fn oracle_rig(answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>) -> Rig {
+    let mut r = rig(false, |c| c.thresholds.external_min_complexity = 2.0);
+    let local = LocalDecider::new(Config::default().thresholds);
+    let decider = Decider::new(Some(Arc::new(Oracle { local, answers })), Arc::new(Calibrator::new()), Config::default().thresholds);
+    // same engine, different decision model
+    let ws = r.ws.path().to_path_buf();
+    let mut cfg = Config::default();
+    cfg.workspace = ws.clone();
+    cfg.approvals = ApprovalMode::Never;
+    cfg.thresholds.external_min_complexity = 2.0;
+    let store = Arc::new(InMemoryStore::new());
+    let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws));
+    let mut reg = ToolRegistry::new();
+    register_native(&mut reg, policy.clone(), store.clone());
+    r.engine = Engine::new(EngineDeps {
+        decider: Arc::new(decider),
+        extractor: Arc::new(HybridExtractor::new(None)),
+        config: cfg,
+        store,
+        models: ModelGateway::new(Some(Arc::new(r.slm.clone())), Some(Arc::new(r.strong.clone()))),
+        tools: Arc::new(reg),
+        policy,
+    });
+    r
+}
+
+#[tokio::test]
+async fn the_decision_model_not_a_phrase_list_decides_what_a_request_refers_to() {
+    let r = oracle_rig(vec![(DecisionKind::ResolveReference, "refers_to", Answer::choice("file", 0.95, &[("file", 0.95)]), "the thing we just made")]);
+    std::fs::write(r.ws.path().join("test.txt"), "hello world !").unwrap();
+    say(&r, "ref", "create a file named test.txt with content \"hello world !\"").await;
+    // no "it", no "that file": only a model can tell that "the thing we just made" is the file
+    let t = say(&r, "ref", "show me what is inside the thing we just made").await;
+    assert_eq!(t.goal, "show me what is inside the thing we just made (test.txt)");
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(t.final_answer.as_deref().unwrap().contains("hello world !"));
+    let decisions: Vec<String> = t.decisions.iter().map(|d| d.kind.clone()).collect();
+    assert!(decisions.contains(&"resolve_reference".to_string()), "{decisions:?}");
+    // with nothing earlier to refer to the model is not even asked
+    let fresh = say(&r, "other", "show me what is inside the thing we just made").await;
+    assert!(!fresh.decisions.iter().any(|d| d.kind == "resolve_reference"));
+}
+
+#[tokio::test]
+async fn the_decision_model_recognises_small_talk_in_words_no_list_contains() {
+    let r = oracle_rig(vec![(DecisionKind::RouteTask, "smalltalk", Answer::choice("greeting", 0.95, &[("greeting", 0.95)]), "howdy partner")]);
+    let t = say(&r, "talk", "howdy partner, lovely day isn't it").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert!(t.final_answer.as_deref().unwrap().starts_with("Hi!"), "{:?}", t.final_answer);
+    assert_eq!((r.slm.calls(), r.strong.calls()), (0, 0));
+}
+
+#[tokio::test]
+async fn the_decision_model_says_a_request_changes_something_even_when_it_uses_no_change_verb() {
+    let r = oracle_rig(vec![(DecisionKind::RouteTask, "changes_state", Answer::noul(0.95), "turn every occurrence")]);
+    std::fs::write(r.ws.path().join("test.txt"), "hello world !").unwrap();
+    // the planner only reads; the routing says the request changes something, so the plan is sent back naming the tool
+    r.slm.push(
+        &json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {"path": "test.txt"}}, {"id": "s2", "tool": null, "do": "confirm", "after": ["s1"]}]})
+            .to_string(),
+    );
+    r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_edit", "args": {"path": "test.txt", "old_string": "world", "new_string": "keyhan"}}]}).to_string());
+    let t = say(&r, "chg", "turn every occurrence of world in test.txt into keyhan").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("test.txt")).unwrap(), "hello keyhan !");
+    assert!(t.route.as_ref().unwrap().changes);
 }

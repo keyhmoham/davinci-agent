@@ -547,7 +547,7 @@ impl Tool for Shell {
         let mut m = if sandbox {
             meta(
                 "shell",
-                "run a bash command in the workspace (or `cwd`): pipes, &&, redirects, git, build and test tools all work; output ends with [exit code N] on failure. timeout_secs (default 120) for slow commands; background=true for servers and long jobs, then shell_output / shell_kill. For file work prefer fs_* tools",
+                "run a bash command in the workspace (or `cwd`): pipes, &&, redirects, git, build and test tools all work; output ends with [exit code N] on failure. timeout_secs (default 120) for slow commands; background=true for servers and long jobs, then shell_output / shell_kill. To serve something the user can open (a page, an app) start it with background=true listening on 0.0.0.0 on a port from 8000 to 8010, e.g. `python3 -m http.server 8000 --bind 0.0.0.0`; it is then at http://localhost:<port> on the user's machine. For file work prefer fs_* tools",
                 "system",
                 vec![
                     ParamSpec::new("command", ParamType::String, true, "bash command line"),

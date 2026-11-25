@@ -112,7 +112,7 @@ pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, regis
             .map(|a| a.iter().filter_map(|x| x.as_str()).map(&rename).collect())
             .unwrap_or_default();
         // template references imply dependencies
-        for r in template_refs(&step.args) {
+        for r in template_refs(&step.args).into_iter().filter(|r| !crate::session::ARTIFACT_NAMES.contains(&r.as_str())) {
             let r = rename(&r);
             if !deps.contains(&r) {
                 deps.push(r);
@@ -164,26 +164,6 @@ pub fn prune_unknown_deps(steps: &mut [Step]) -> Vec<String> {
         });
     }
     dropped
-}
-
-/// Does the request ask for something to be changed (a file written, edited, moved, deleted…)? Independent of the
-/// decision layer's risk estimate, which is a different question.
-pub fn asks_for_change(goal: &str) -> bool {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?i)\b(?:replace|substitute|swap|change|edit|modify|update|fix|correct|rewrite|refactor|rename|insert|append|prepend|create|make|write|save|add|remove|delete|erase|move|copy|mkdir|install|deploy|patch|restart|commit|overwrite)\b",
-        )
-        .unwrap()
-    });
-    RE.is_match(goal)
-}
-
-/// "patch it if necessary", "propose a fix": a change that may not happen is not a change that is missing.
-pub fn is_conditional(goal: &str) -> bool {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(?:if\s+(?:necessary|needed|required|any|appropriate|possible|applicable)|when\s+(?:necessary|needed)|as\s+needed|propose|suggest|draft|recommend|should\s+i)\b").unwrap()
-    });
-    RE.is_match(goal)
 }
 
 /// A request that changes something (create, write, delete…) must be planned with a tool that does.
@@ -372,21 +352,6 @@ mod tests {
         assert_eq!(prune_unknown_deps(&mut steps), vec!["r1_2 -> r1_9"]);
         assert_eq!(steps[1].depends_on, vec!["r1_1"]);
         validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
-    }
-
-    #[test]
-    fn change_verbs_are_recognised_whatever_the_risk_estimate_says() {
-        for g in ["now replace the word \"world\" with \"keyhan\" in test.txt.", "rename foo to bar", "delete a.txt", "add a line to notes.md"] {
-            assert!(asks_for_change(g), "{g}");
-        }
-        for g in ["read test.txt", "what is 2 + 2?", "list the files"] {
-            assert!(!asks_for_change(g), "{g}");
-        }
-    }
-
-    #[test]
-    fn conditional_changes_are_not_required() {
-        assert!(is_conditional("patch it if necessary") && is_conditional("propose a fix for the bug") && !is_conditional("create a file named a.txt"));
     }
 
     #[test]

@@ -167,8 +167,7 @@ impl Inner {
             }
         }
         // a model must not tell the user something was changed when no step that changes anything finished
-        let asked_to_change =
-            snapshot.route.as_ref().map(|r| r.needs_tools && (r.risk != Risk::Low || crate::planner::asks_for_change(&goal))).unwrap_or(false);
+        let asked_to_change = snapshot.route.as_ref().map(|r| r.needs_tools && r.changes && !r.conditional).unwrap_or(false);
         let did_change = plan.steps.iter().any(|s| {
             s.status == StepStatus::Succeeded
                 && (s.kind == StepKind::Agent || s.tool.as_deref().and_then(|t| self.tools.meta(t)).map(|m| m.side_effects).unwrap_or(false))

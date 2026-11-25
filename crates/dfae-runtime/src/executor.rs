@@ -134,6 +134,15 @@ impl Inner {
             }
             self.persist(ctx).await;
 
+            // ---- checkpoint: a result did not meet the planner's expectation ---------------
+            if failures.is_empty() {
+                let problems: Vec<String> = std::mem::take(&mut *ctx.checkpoints.lock());
+                if !problems.is_empty() {
+                    self.revisit_plan(ctx, &problems.join(" ")).await;
+                    self.set_status(ctx, TaskStatus::Running).await;
+                }
+            }
+
             // ---- recovery -------------------------------------------------------
             let mut fatal: Option<String> = None;
             for (id, f) in failures {
@@ -162,6 +171,39 @@ impl Inner {
             return Err(format!("step {} failed: {}", s.id, s.error.clone().unwrap_or_default()));
         }
         Ok(())
+    }
+
+    /// Ask the planner to revise the rest of the plan in the light of what a step found. A best effort: with no replans
+    /// left, or no model, the plan simply goes on.
+    async fn revisit_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>, problem: &str) {
+        let (goal, mode, spent, max) = {
+            let r = ctx.rec.lock().await;
+            (r.goal.clone(), r.mode.unwrap_or(ExecMode::Assisted), r.usage.replans, r.budget.max_replans)
+        };
+        if spent >= max {
+            return;
+        }
+        let Some(tier) = self.pick_tier(mode) else { return };
+        if let Err(e) = self.replan(ctx, tier, &goal, problem, None).await {
+            self.emit(ctx, EventKind::Warning { message: format!("the plan was not revised ({e}); continuing as planned") }).await;
+        }
+    }
+
+    /// Replace `{{prev_code}}`-style references to the conversation in step arguments by their values.
+    async fn with_artifacts(&self, ctx: &Arc<TaskCtx>, args: &Value) -> Value {
+        let wanted: Vec<String> = planner::template_refs(args).into_iter().filter(|r| crate::session::ARTIFACT_NAMES.contains(&r.as_str())).collect();
+        if wanted.is_empty() {
+            return args.clone();
+        }
+        let mut have: Vec<(String, String)> = ctx.base_ctx.lock().artifacts.iter().map(|(n, v, _)| (n.clone(), v.clone())).collect();
+        if have.is_empty() {
+            // a task resumed after a restart has no context yet: rebuild it from the session
+            let history = self.session_history(ctx).await;
+            let found = crate::session::artifacts_from(&history);
+            have = found.iter().map(|(n, v, _)| (n.clone(), v.clone())).collect();
+            ctx.base_ctx.lock().artifacts = found;
+        }
+        crate::session::substitute_artifacts(args, &have)
     }
 
     /// Which model writes a reasoning step of a brief plan: the SLM, unless the planner wants the external one.
@@ -244,12 +286,24 @@ impl Inner {
                 StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
             },
         };
-        // the planner said what success looks like: the decision model checks the result against it
+        // the planner said what success looks like: the decision model checks the result against it. A result that
+        // misses it is not thrown away (it is real information: "the workspace is empty"); it makes the planner
+        // look at the plan again, now knowing what was found.
         let result = match result {
-            Ok(out) if step.how.is_some() && step.expect.is_some() => match self.judge_step(ctx, &step, &out.content).await {
-                Some(why) => Err(StepFailure::new(ErrorKind::Other, why)),
-                None => Ok(out),
-            },
+            Ok(mut out) if step.how.is_some() && step.expect.is_some() => {
+                if let Some(why) = self.judge_step(ctx, &step, &out.content).await {
+                    let problem = format!(
+                        "step {id} ({}) finished, but its result does not meet what was expected: \"{}\" ({why}). Its result was: {}. Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
+                        tokens::truncate_tokens(&step.description, 30),
+                        step.expect.as_deref().unwrap_or(""),
+                        tokens::truncate_tokens(&out.content, 150)
+                    );
+                    ctx.checkpoints.lock().push(problem);
+                    out.evidence.push(format!("expectation not met: {why}"));
+                    self.emit(ctx, EventKind::Warning { message: format!("step {id}: {why}; the plan will be revisited") }).await;
+                }
+                Ok(out)
+            }
             other => other,
         };
 
@@ -384,7 +438,9 @@ impl Inner {
     async fn run_chat_reply(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, mode: ExecMode) -> Result<StepOutput, StepFailure> {
         let goal = ctx.rec.lock().await.goal.clone();
         let can = self.capabilities(ctx);
-        if let Some(t) = crate::session::small_talk(&goal, &can) {
+        // the decision model recognised a purely social message (see `route_task`): no model call to answer it
+        let social = ctx.rec.lock().await.route.as_ref().and_then(|r| r.smalltalk.clone());
+        if let Some(t) = social.and_then(|k| crate::session::small_talk_reply(&k, &can)) {
             return Ok(StepOutput { content: t, evidence: vec!["answered without a model".into()] });
         }
         let tier = self.pick_tier(mode).ok_or_else(|| {
@@ -437,9 +493,11 @@ impl Inner {
         if !ctx.in_scope(&name) {
             return Err(StepFailure::new(ErrorKind::Policy, format!("tool '{name}' is outside this agent's role scope")));
         }
+        // things said earlier in the conversation (`{{prev_code}}`) go in verbatim, whatever their size
+        let step_args = self.with_artifacts(ctx, &step.args).await;
         // resolve {{sN}} templates against dependency outputs
         let outputs: HashMap<&str, &str> = deps.iter().map(|(id, _, _, out)| (id.as_str(), out.as_str())).collect();
-        let args = economy::contracts::resolve_templates(&step.args, &outputs, &|o| {
+        let args = economy::contracts::resolve_templates(&step_args, &outputs, &|o| {
             tokens::compress_text(o, 800).chars().take(4000).collect::<String>().trim().to_string()
         })
         .map_err(|e| StepFailure::new(ErrorKind::InvalidArgs, e))?;
