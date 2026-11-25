@@ -131,7 +131,10 @@ impl Inner {
     }
 
     /// Decide what a brief step becomes and bind its arguments. Returns the concrete step.
-    pub(crate) async fn implement_step(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, deps: &[Dep]) -> Result<Step, StepFailure> {
+    ///
+    /// `feedback` is set when a previous implementation of this step ran and its result was unusable (the file it wrote
+    /// does not parse): the generated parts are produced again by a model, told what was wrong.
+    pub(crate) async fn implement_step(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, deps: &[Dep], feedback: Option<&str>) -> Result<Step, StepFailure> {
         let fail = |kind: ErrorKind, m: String| StepFailure { kind, message: m };
         let allowed = ctx.allowed.lock().clone();
         let scoped: Vec<ToolMetadata> = self.scoped_metas(ctx).into_iter().filter(|m| allowed.contains(&m.name)).collect();
@@ -165,6 +168,11 @@ impl Inner {
 
         // ---- arguments: the planner's, then rules, then entities --------------------
         let mut args = object(&step.args);
+        if feedback.is_some() {
+            for k in ["content", "new_string", "text", "body"] {
+                args.remove(k);
+            }
+        }
         let planned = !args.is_empty();
         if let Some(d) = &direct_args {
             fill(&mut args, d);
@@ -218,7 +226,7 @@ impl Inner {
             }
         } else {
             // ---- the models: the SLM first, the external model only if the SLM cannot ----
-            let mut problem = valid(&args).err();
+            let mut problem = feedback.map(str::to_string).or_else(|| valid(&args).err());
             let mut ladder: Vec<Tier> = Vec::new();
             if self.models.has(Tier::Slm) {
                 ladder.extend([Tier::Slm, Tier::Slm]);
@@ -233,7 +241,7 @@ impl Inner {
                 ));
             }
             let mut satisfied = false;
-            let mut rejected = false; // the first ask says what is missing; later ones say what was wrong with the answer
+            let mut rejected = feedback.is_some(); // the first ask says what is missing; later ones say what was wrong with the answer
             for tier in ladder {
                 match self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected).await {
                     Ok(got) => {
@@ -285,9 +293,40 @@ impl Inner {
         Ok(done)
     }
 
+    /// A planner says "index.html exists" for a step that wrote `site/index.html`: the file it named exists under the
+    /// path the step used, so the expectation holds.
+    fn satisfied_by_arguments(&self, c: &Check, step: &Step) -> bool {
+        let Check::FileExists { path } = c else { return false };
+        let want = path.trim_start_matches("./").trim_end_matches('/');
+        let mut texts = Vec::new();
+        if let Some(m) = step.args.as_object() {
+            texts.extend(m.values().filter_map(|v| v.as_str()));
+        }
+        texts.iter().any(|t| {
+            let t = t.trim_start_matches("./").trim_end_matches('/');
+            (t.ends_with(&format!("/{want}")) || want.ends_with(&format!("/{t}")) || t == want)
+                && self.policy.guard().read_path(t).map(|p| p.exists()).unwrap_or(false)
+        })
+    }
+
     /// Did a step's result meet what the planner expected of it? `Some(reason)` if the decision model says no.
     pub(crate) async fn judge_step(&self, ctx: &Arc<TaskCtx>, step: &Step, output: &str) -> Option<String> {
         let expect = step.expect.as_deref()?;
+        // what code can check, code checks: facts about files and output need no model, and a model must not overrule them
+        let (checks, understood) = crate::planner::expect_checks(expect);
+        let mut missed: Vec<String> = Vec::new();
+        for c in &checks {
+            let (pass, ev) = self.eval_check(c, output);
+            if !pass && !self.satisfied_by_arguments(c, step) {
+                missed.push(format!("{} ({ev})", c.describe()));
+            }
+        }
+        if !missed.is_empty() {
+            return Some(format!("not met: {}", missed.join("; ")));
+        }
+        if understood {
+            return None;
+        }
         let entities = ctx.rec.lock().await.entities.clone();
         let mut st = self.decision_state(&format!("STEP: {}\nEXPECTATION: {expect}", step.description), &entities);
         st.completion_facts = Some(CompletionFacts {

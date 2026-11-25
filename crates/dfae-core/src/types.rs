@@ -180,11 +180,24 @@ impl Default for RetryPolicy {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Check {
     NonEmpty,
-    Contains { value: String },
-    NotContains { value: String },
-    Matches { pattern: String },
+    Contains {
+        value: String,
+    },
+    NotContains {
+        value: String,
+    },
+    Matches {
+        pattern: String,
+    },
     ExitOk,
-    FileExists { path: String },
+    FileExists {
+        path: String,
+    },
+    /// A file (not the step's output) contains a text: what an edit leaves behind.
+    FileContains {
+        path: String,
+        value: String,
+    },
 }
 
 impl Check {
@@ -215,6 +228,7 @@ impl Check {
             Check::Matches { pattern } => format!("output matches /{pattern}/"),
             Check::ExitOk => "tool reported success".into(),
             Check::FileExists { path } => format!("file exists: {path}"),
+            Check::FileContains { path, value } => format!("{path} contains '{value}'"),
         }
     }
 }

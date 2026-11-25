@@ -260,7 +260,7 @@ impl Inner {
         // ---- acting phase: a planner's intent becomes an action, now, with the results of earlier steps in hand ----
         let mut step = step;
         let prepared: Result<(), StepFailure> = if step.brief {
-            match self.implement_step(ctx, &step, &deps).await {
+            match self.implement_step(ctx, &step, &deps, None).await {
                 Ok(done) => {
                     if let Some(s) = ctx.rec.lock().await.plan.as_mut().and_then(|p| p.step_mut(id)) {
                         s.kind = done.kind;
@@ -286,6 +286,32 @@ impl Inner {
                 StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
             },
         };
+        // What the local model wrote does not parse (cut off, unbalanced): it writes it again, told why, before anyone
+        // else hears of it. Only the self-hosted model gets this second try; the planner is not asked.
+        let mut result = result;
+        for _ in 0..2 {
+            let Err(f) = &result else { break };
+            if !(f.message.contains("is malformed") && step.how.as_deref().is_some_and(|h| h.contains("slm")) && self.models.has(Tier::Slm)) {
+                break;
+            }
+            self.emit(ctx, EventKind::Warning { message: format!("step {id}: {}; the local model writes it again", f.message) }).await;
+            let mut again = step.clone();
+            again.brief = true;
+            match self.implement_step(ctx, &again, &deps, Some(&f.message)).await {
+                Ok(done) => {
+                    if let Some(s) = ctx.rec.lock().await.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                        s.args = done.args.clone();
+                        s.how = done.how.clone();
+                    }
+                    step = done;
+                    result = self.run_tool(ctx, &step, tainted, &deps).await;
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
         // the planner said what success looks like: the decision model checks the result against it. A result that
         // misses it is not thrown away (it is real information: "the workspace is empty"); it makes the planner
         // look at the plan again, now knowing what was found.
@@ -577,6 +603,16 @@ impl Inner {
             if !pass {
                 return Err(StepFailure::new(ErrorKind::Other, format!("check failed: {} ({ev})", c.describe())));
             }
+        }
+        // a file a model just wrote must still parse (a reply cut off by the token limit is the usual culprit)
+        if matches!(name.as_str(), "fs_write" | "fs_edit")
+            && args.get("append").and_then(|a| a.as_bool()) != Some(true)
+            && let Some(path) = args.get("path").and_then(|p| p.as_str())
+            && let Ok(full) = self.policy.guard().read_path(path)
+            && let Ok(text) = std::fs::read_to_string(&full)
+            && let Some(problem) = crate::syntax::problem(&full, &text).await
+        {
+            return Err(StepFailure::new(ErrorKind::Other, format!("{path} was written but is malformed: {problem}")));
         }
         let mut evidence = out.evidence.clone();
         if let Some(v) = tool.verify(&args, &out, &tctx).await {

@@ -369,3 +369,40 @@ async fn the_decision_model_says_a_request_changes_something_even_when_it_uses_n
     assert_eq!(std::fs::read_to_string(r.ws.path().join("test.txt")).unwrap(), "hello keyhan !");
     assert!(t.route.as_ref().unwrap().changes);
 }
+
+#[tokio::test]
+async fn an_expectation_about_files_is_checked_by_code_and_a_miss_goes_back_to_the_planner() {
+    let r = rig(false, |_| {});
+    // the planner expects b.txt, the step writes a.txt: no model is needed to see that
+    r.strong.push(&json!({"steps": [{"id": "s1", "do": "write hello into a.txt", "tool": "fs_write", "expect": "b.txt exists"}]}).to_string());
+    r.strong.push(
+        &json!({"steps": [{"id": "r1_1", "do": "write hello into b.txt", "tool": "fs_write", "expect": "b.txt exists and the output is not empty"}]})
+            .to_string(),
+    );
+    r.slm.push(&json!({"path": "a.txt", "content": "hello"}).to_string());
+    r.slm.push(&json!({"path": "b.txt", "content": "hello"}).to_string());
+    r.slm.push("Wrote hello into b.txt.");
+    let t = run(&r, "Write hello into a file and make sure it is called b.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let replan = r.strong.requests.lock().iter().find(|q| q.purpose == "replan").cloned().expect("the miss sent the planner back to the plan");
+    assert!(replan.messages[0].content.contains("b.txt exists") || replan.messages[0].content.contains("file exists: b.txt"), "{}", replan.messages[0].content);
+    assert!(r.ws.path().join("b.txt").exists());
+    // no decision model, and the SLM was not asked to judge anything
+    assert!(r.slm.requests.lock().iter().all(|q| q.purpose != "judge"));
+}
+
+#[tokio::test]
+async fn a_file_cut_off_by_the_token_limit_is_caught_by_a_parser_and_rewritten_locally() {
+    let r = rig(false, |_| {});
+    r.strong.push(&json!({"steps": [{"id": "s1", "do": "write data.json with the settings", "tool": "fs_write"}]}).to_string());
+    r.slm.push(&json!({"path": "data.json", "content": "{\"settings\": {\"port\": 80"}).to_string());
+    // asked again with the parser's complaint, the local model gets it right
+    r.slm.push(&json!({"path": "data.json", "content": "{\"settings\": {\"port\": 80}}"}).to_string());
+    let t = run(&r, "Write the settings into data.json").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("data.json")).unwrap(), "{\"settings\": {\"port\": 80}}");
+    // the second bind request carried the complaint; the external model was asked for the plan only
+    let binds: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "bind").map(|q| q.messages[0].content.clone()).collect();
+    assert!(binds.len() >= 2 && binds[1].contains("malformed") && binds[1].contains("invalid JSON"), "{binds:?}");
+    assert_eq!(r.strong.calls(), 1, "no re-plan: a parser error is the local model's to fix");
+}

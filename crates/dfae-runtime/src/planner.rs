@@ -268,6 +268,75 @@ pub fn plan_report(v: &Value, steps: &[Step]) -> Option<String> {
     TEMPLATE.captures_iter(r).all(|c| ids.contains(&c[1])).then(|| r.to_string())
 }
 
+static EXPECT_EXISTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the |a )?(?:(?:file|directory|dir|folder) )?[`"']?([\w./~\-]*[\w/])[`"']?(?: (?:file|directory|dir|folder))? (?:now |newly )?(?:exists?|is created|was created|is written|is present)$"#).unwrap()
+});
+static EXPECT_CONTAINS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the |a )?(?:(?:file|directory) )?[`"']?([\w./~\-]*[\w/])[`"']? (?:file )?(?:now |then )?contains? (?:the (?:text|line|string|word) )?(?:`([^`]+)`|"([^"]+)"|'([^']+)'|(.+))$"#).unwrap()
+});
+static EXPECT_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the )?(?:output|result|response|listing) (?:also |now )?(?:contains?|shows?|lists?|includes?|mentions?|has) (?:the (?:text|line|word|entries?|string) )?(?:`([^`]+)`|"([^"]+)"|'([^']+)'|(.+))$"#).unwrap()
+});
+static EXPECT_OK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:the )?(?:command|step|tool|script|build|tests?|process|server|job)?\s*(?:exits?|exited|returns?|finish(?:es|ed)?)(?: with)?(?: (?:exit )?(?:code|status))? 0$|^(?:the )?(?:command |step |tool |script |build |tests? |process |server |job )?(?:succeeds|succeeded|runs successfully|ran successfully|starts|started|starts successfully|is running|runs)$").unwrap()
+});
+
+/// Turn what a planner expects of a step into checks code can run, when it is a condition code understands
+/// ("site/index.html exists", "config.toml now contains port = 9090", "the command exits 0", "the output lists X").
+/// The bool says whether *every* clause of the expectation was understood: if so the checks are the whole judgement and
+/// no model has to be asked; otherwise the decision model still judges what code could not.
+pub fn expect_checks(expect: &str) -> (Vec<Check>, bool) {
+    let mut checks = Vec::new();
+    let mut all = true;
+    let text = expect.trim().trim_end_matches('.');
+    // clauses: split on ";" and " and " but not inside quotes (a quoted value may contain either)
+    let mut clauses: Vec<String> = Vec::new();
+    let (mut cur, mut quote) = (String::new(), None::<char>);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            None if matches!(c, '"' | '`') => quote = Some(c),
+            _ => {}
+        }
+        let rest: String = chars[i..].iter().take(5).collect();
+        if quote.is_none() && (c == ';' || rest.eq_ignore_ascii_case(" and ")) {
+            clauses.push(std::mem::take(&mut cur));
+            i += if c == ';' { 1 } else { 5 };
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    clauses.push(cur);
+    for clause in clauses.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+        let pick =
+            |c: &regex::Captures, from: usize| (from..c.len()).find_map(|i| c.get(i)).map(|m| m.as_str().trim().trim_matches(['"', '`', '\'']).to_string());
+        if let Some(c) = EXPECT_EXISTS.captures(clause) {
+            checks.push(Check::FileExists { path: c[1].to_string() });
+        } else if let Some(c) = EXPECT_CONTAINS.captures(clause)
+            && let Some(v) = pick(&c, 2).filter(|v| !v.is_empty())
+            && (c[1].contains('.') || c[1].contains('/'))
+        {
+            checks.push(Check::FileContains { path: c[1].to_string(), value: v });
+        } else if let Some(c) = EXPECT_OUTPUT.captures(clause)
+            && let Some(v) = pick(&c, 1).filter(|v| !v.is_empty())
+        {
+            checks.push(Check::Contains { value: v });
+        } else if EXPECT_OK.is_match(clause) {
+            checks.push(Check::ExitOk);
+        } else if clause.eq_ignore_ascii_case("the output is not empty") || clause.eq_ignore_ascii_case("non-empty output") {
+            checks.push(Check::NonEmpty);
+        } else {
+            all = false;
+        }
+    }
+    let understood = all && !checks.is_empty();
+    (checks, understood)
+}
+
 /// Does every `{{id}}` in a report name a step of the plan?
 pub fn report_refs_exist(report: &str, steps: &[Step]) -> bool {
     let ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
@@ -736,5 +805,40 @@ mod line_format_tests {
         let v = parse_line_plan("s1 fs_read: read a.txt\nreport: it says {{s9}}").unwrap();
         let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
         assert!(plan_report(&v, &steps).is_none());
+    }
+}
+
+#[cfg(test)]
+mod expect_tests {
+    use super::*;
+
+    #[test]
+    fn conditions_code_understands_become_checks() {
+        let (c, all) = expect_checks("site/index.html exists");
+        assert_eq!((c, all), (vec![Check::FileExists { path: "site/index.html".into() }], true));
+        let (c, all) = expect_checks("the file config.toml now contains \"port = 9090\"");
+        assert_eq!((c, all), (vec![Check::FileContains { path: "config.toml".into(), value: "port = 9090".into() }], true));
+        let (c, all) = expect_checks("the command exits 0");
+        assert_eq!((c, all), (vec![Check::ExitOk], true));
+        let (c, all) = expect_checks("the output lists `index.html`");
+        assert_eq!((c, all), (vec![Check::Contains { value: "index.html".into() }], true));
+        let (c, all) = expect_checks("backup/config.toml exists and the command exits 0");
+        assert_eq!(c.len(), 2);
+        assert!(all);
+    }
+
+    #[test]
+    fn what_code_cannot_read_is_left_to_the_decision_model() {
+        let (c, all) = expect_checks("shows the server port");
+        assert!(c.is_empty() && !all);
+        let (c, all) = expect_checks("site/index.html exists and the page looks professional");
+        assert_eq!(c.len(), 1);
+        assert!(!all, "one clause was not understood, so the model still judges");
+    }
+
+    #[test]
+    fn a_quoted_value_may_contain_and() {
+        let (c, all) = expect_checks("notes.txt contains \"salt and pepper\"");
+        assert_eq!((c, all), (vec![Check::FileContains { path: "notes.txt".into(), value: "salt and pepper".into() }], true));
     }
 }

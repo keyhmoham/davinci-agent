@@ -18,6 +18,7 @@ pub mod prompts;
 mod session;
 pub mod skills;
 mod style;
+mod syntax;
 pub mod team;
 mod verify;
 mod workspace;
