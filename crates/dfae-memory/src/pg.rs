@@ -1,11 +1,11 @@
-use crate::{chain_hash, cosine, HashEmbedder, GENESIS};
+use crate::{GENESIS, HashEmbedder, chain_hash, cosine};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use dfae_core::*;
 use serde_json::Value;
 use std::time::Duration;
-use tokio_postgres::{types::Json, NoTls};
+use tokio_postgres::{NoTls, types::Json};
 
 /// PostgreSQL-backed store. Uses pgvector for similarity search when the
 /// extension is available and falls back to `real[]` + in-process cosine
@@ -150,10 +150,8 @@ impl MemoryStore for PgStore {
 
     async fn unfinished_tasks(&self) -> Result<Vec<TaskRecord>, MemoryError> {
         let c = self.pool.get().await.map_err(be)?;
-        let rows = c
-            .query("SELECT record FROM dfae_tasks WHERE status NOT IN ('completed','failed','cancelled') ORDER BY created_at", &[])
-            .await
-            .map_err(be)?;
+        let rows =
+            c.query("SELECT record FROM dfae_tasks WHERE status NOT IN ('completed','failed','cancelled') ORDER BY created_at", &[]).await.map_err(be)?;
         Ok(rows.iter().map(|r| r.get::<_, Json<TaskRecord>>(0).0).collect())
     }
 
@@ -168,7 +166,17 @@ impl MemoryStore for PgStore {
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text::vector)
                  ON CONFLICT (id) DO UPDATE SET text=EXCLUDED.text, entities=EXCLUDED.entities, importance=EXCLUDED.importance,
                    metadata=EXCLUDED.metadata, embedding=EXCLUDED.embedding",
-                &[&item.id, &kind, &item.text, &Json(&item.entities), &item.importance, &Json(&item.metadata), &item.session_id, &item.created_at, &vector_literal(&emb)],
+                &[
+                    &item.id,
+                    &kind,
+                    &item.text,
+                    &Json(&item.entities),
+                    &item.importance,
+                    &Json(&item.metadata),
+                    &item.session_id,
+                    &item.created_at,
+                    &vector_literal(&emb),
+                ],
             )
             .await
             .map_err(be)?;
@@ -208,9 +216,7 @@ impl MemoryStore for PgStore {
                 )
                 .await
                 .map_err(be)?;
-            rows.iter()
-                .map(|r| Ok(ScoredMemory { item: Self::row_to_item(r)?, similarity: r.get::<_, f64>("sim") as f32 }))
-                .collect()
+            rows.iter().map(|r| Ok(ScoredMemory { item: Self::row_to_item(r)?, similarity: r.get::<_, f64>("sim") as f32 })).collect()
         } else {
             let rows = c
                 .query(

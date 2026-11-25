@@ -9,7 +9,7 @@
 use dfae_core::*;
 use parking_lot::Mutex;
 use regex::Regex;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
@@ -110,11 +110,8 @@ fn bind_clause(metas: &[ToolMetadata], clause: &str, entities: &[Entity]) -> Opt
                         }
                     }
                 }
-                let from_entity = p
-                    .entity_hints
-                    .iter()
-                    .find_map(|h| entities.iter().find(|e| &e.label == h && clause.contains(&e.text)))
-                    .and_then(|e| coerce(p, &e.text));
+                let from_entity =
+                    p.entity_hints.iter().find_map(|h| entities.iter().find(|e| &e.label == h && clause.contains(&e.text))).and_then(|e| coerce(p, &e.text));
                 if let Some(v) = from_entity {
                     args.insert(p.name.clone(), v);
                     explicit += 1;
@@ -164,7 +161,7 @@ pub fn bind_direct(metas: &[ToolMetadata], request: &str, entities: &[Entity]) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{register_native, PolicyConfig, PolicyEngine, ToolRegistry};
+    use crate::{PolicyConfig, PolicyEngine, ToolRegistry, register_native};
     use dfae_memory::InMemoryStore;
 
     fn metas() -> Vec<ToolMetadata> {

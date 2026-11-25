@@ -29,7 +29,7 @@ pub fn build_model(cfg: &ModelConfig) -> Option<Arc<dyn LanguageModel>> {
     match cfg.provider.as_str() {
         "openai" => Some(Arc::new(OpenAiCompat::new(&cfg.base_url, &cfg.model, cfg.api_key.clone(), timeout))),
         "anthropic" => cfg.api_key.clone().map(|k| Arc::new(AnthropicModel::new(&cfg.base_url, &cfg.model, k, timeout)) as Arc<dyn LanguageModel>),
-        "mock" => Some(Arc::new(OfflineStub::default())),
+        "mock" => Some(Arc::new(OfflineStub)),
         _ => None,
     }
 }

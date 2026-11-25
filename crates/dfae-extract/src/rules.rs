@@ -53,12 +53,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             1,
             0.6,
         ),
-        r(
-            "location",
-            r"\b(Frankfurt|London|Paris|Berlin|Tokyo|Singapore|Sydney|Dublin|Amsterdam|Virginia|Oregon|Mumbai|Toronto|Madrid|Stockholm)\b",
-            1,
-            0.7,
-        ),
+        r("location", r"\b(Frankfurt|London|Paris|Berlin|Tokyo|Singapore|Sydney|Dublin|Amsterdam|Virginia|Oregon|Mumbai|Toronto|Madrid|Stockholm)\b", 1, 0.7),
     ]
 });
 

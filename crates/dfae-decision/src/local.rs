@@ -14,23 +14,133 @@ use std::sync::LazyLock;
 use std::time::Instant;
 
 const TYPE_LEXICON: &[(&str, &[&str])] = &[
-    ("research", &["research", "search", "latest", "news", "web", "internet", "lookup", "documentation", "vulnerability", "cve", "article", "source", "wiki", "summarize", "papers"]),
-    ("coding", &["code", "function", "script", "program", "implement", "bug", "compile", "refactor", "test", "rust", "python", "javascript", "git", "commit", "debug", "class", "module"]),
-    ("system_diagnostics", &["system", "disk", "memory", "cpu", "load", "uptime", "process", "diagnostic", "health", "server", "log", "network", "port", "service", "usage", "resource", "time", "clock", "date", "hostname"]),
-    ("file_operations", &["file", "directory", "folder", "path", "read", "list", "cat", "ls", "write", "save", "grep", "open", "workspace", "content", "contents", "text"]),
-    ("calculation", &["calculate", "compute", "sum", "multiply", "divide", "plus", "minus", "times", "percent", "math", "evaluate", "equation", "square", "root", "product"]),
+    (
+        "research",
+        &[
+            "research",
+            "search",
+            "latest",
+            "news",
+            "web",
+            "internet",
+            "lookup",
+            "documentation",
+            "vulnerability",
+            "cve",
+            "article",
+            "source",
+            "wiki",
+            "summarize",
+            "papers",
+        ],
+    ),
+    (
+        "coding",
+        &[
+            "code",
+            "function",
+            "script",
+            "program",
+            "implement",
+            "bug",
+            "compile",
+            "refactor",
+            "test",
+            "rust",
+            "python",
+            "javascript",
+            "git",
+            "commit",
+            "debug",
+            "class",
+            "module",
+        ],
+    ),
+    (
+        "system_diagnostics",
+        &[
+            "system",
+            "disk",
+            "memory",
+            "cpu",
+            "load",
+            "uptime",
+            "process",
+            "diagnostic",
+            "health",
+            "server",
+            "log",
+            "network",
+            "port",
+            "service",
+            "usage",
+            "resource",
+            "time",
+            "clock",
+            "date",
+            "hostname",
+        ],
+    ),
+    (
+        "file_operations",
+        &["file", "directory", "folder", "path", "read", "list", "cat", "ls", "write", "save", "grep", "open", "workspace", "content", "contents", "text"],
+    ),
+    (
+        "calculation",
+        &[
+            "calculate",
+            "compute",
+            "sum",
+            "multiply",
+            "divide",
+            "plus",
+            "minus",
+            "times",
+            "percent",
+            "math",
+            "evaluate",
+            "equation",
+            "square",
+            "root",
+            "product",
+        ],
+    ),
     ("data_analysis", &["analyze", "analyse", "statistic", "csv", "dataset", "trend", "correlation", "chart", "aggregate", "metric", "average", "compare"]),
     ("maintenance", &["patch", "deploy", "restart", "install", "upgrade", "update", "fix", "migrate", "rollback", "configure", "delete", "remove", "reboot"]),
     ("memory", &["remember", "recall", "memory", "forget", "store", "note", "know", "learned"]),
     ("conversation", &["hello", "hi", "thanks", "thank", "explain", "tell", "joke", "opinion", "chat", "meaning"]),
 ];
 
-const HIGH_RISK: &[&str] = &["delete", "remove", "drop", "rm", "format", "shutdown", "truncate", "overwrite", "kill", "reboot", "destroy", "wipe", "erase", "purge"];
-const MODERATE_RISK: &[&str] = &["write", "create", "save", "deploy", "patch", "install", "restart", "update", "edit", "modify", "upgrade", "migrate", "remember", "append", "rename", "move", "chmod"];
-const REASONING_VERBS: &[&str] = &["analyze", "analyse", "investigate", "explain", "why", "compare", "design", "implement", "write", "summarize", "diagnose", "debug", "refactor", "evaluate", "recommend", "decide", "plan", "review"];
+const HIGH_RISK: &[&str] =
+    &["delete", "remove", "drop", "rm", "format", "shutdown", "truncate", "overwrite", "kill", "reboot", "destroy", "wipe", "erase", "purge"];
+const MODERATE_RISK: &[&str] = &[
+    "write", "create", "save", "deploy", "patch", "install", "restart", "update", "edit", "modify", "upgrade", "migrate", "remember", "append", "rename",
+    "move", "chmod",
+];
+const REASONING_VERBS: &[&str] = &[
+    "analyze",
+    "analyse",
+    "investigate",
+    "explain",
+    "why",
+    "compare",
+    "design",
+    "implement",
+    "write",
+    "summarize",
+    "diagnose",
+    "debug",
+    "refactor",
+    "evaluate",
+    "recommend",
+    "decide",
+    "plan",
+    "review",
+];
 
 static ARITH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*[-+*/^%x×÷]\s*\d+").unwrap());
-static CONJ: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(and then|then|after that|afterwards|and|also|but|unless|if|before|after|while|otherwise)\b|[;,]").unwrap());
+static CONJ: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(and then|then|after that|afterwards|and|also|but|unless|if|before|after|while|otherwise)\b|[;,]").unwrap());
 
 fn stems(words: &[&str]) -> HashSet<String> {
     words.iter().map(|w| stem(w)).collect()
@@ -54,10 +164,10 @@ impl LocalDecider {
                 (t.to_string(), hits)
             })
             .collect();
-        if ARITH.is_match(&s.request) {
-            if let Some(e) = scores.iter_mut().find(|(t, _)| t == "calculation") {
-                e.1 += 2.0;
-            }
+        if ARITH.is_match(&s.request)
+            && let Some(e) = scores.iter_mut().find(|(t, _)| t == "calculation")
+        {
+            e.1 += 2.0;
         }
         for e in &s.entities {
             let boost = match e.label.as_str() {
@@ -67,10 +177,10 @@ impl LocalDecider {
                 "repository" => Some("coding"),
                 _ => None,
             };
-            if let Some(b) = boost {
-                if let Some(x) = scores.iter_mut().find(|(t, _)| t == b) {
-                    x.1 += 0.75;
-                }
+            if let Some(b) = boost
+                && let Some(x) = scores.iter_mut().find(|(t, _)| t == b)
+            {
+                x.1 += 0.75;
             }
         }
         let total: f64 = scores.iter().map(|(_, v)| v).sum();
@@ -112,7 +222,8 @@ impl LocalDecider {
         if s.tools.is_empty() {
             return vec![];
         }
-        let docs: Vec<String> = s.tools.iter().map(|t| format!("{} {} {} {}", t.name.replace('_', " "), t.description, t.category, t.keywords.join(" "))).collect();
+        let docs: Vec<String> =
+            s.tools.iter().map(|t| format!("{} {} {} {}", t.name.replace('_', " "), t.description, t.category, t.keywords.join(" "))).collect();
         let bm = bm25_scores(&s.request, &docs);
         s.tools
             .iter()
@@ -236,13 +347,7 @@ impl DecisionProvider for LocalDecider {
     async fn decide(&self, request: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
         let started = Instant::now();
         let answers = self.answer(&request);
-        Ok(DecisionResponse {
-            answers,
-            provider: "local".into(),
-            input_tokens: 0,
-            output_tokens: 0,
-            latency_ms: started.elapsed().as_millis() as u64,
-        })
+        Ok(DecisionResponse { answers, provider: "local".into(), input_tokens: 0, output_tokens: 0, latency_ms: started.elapsed().as_millis() as u64 })
     }
 }
 
@@ -291,8 +396,22 @@ mod tests {
         let d = dec();
         let mut st = state("what files are in the folder");
         st.tools = vec![
-            ToolBrief { name: "fs_list".into(), description: "list files in a directory folder".into(), category: "filesystem".into(), risk: Risk::Low, side_effects: false, keywords: vec![] },
-            ToolBrief { name: "calc".into(), description: "evaluate arithmetic expression".into(), category: "math".into(), risk: Risk::Low, side_effects: false, keywords: vec![] },
+            ToolBrief {
+                name: "fs_list".into(),
+                description: "list files in a directory folder".into(),
+                category: "filesystem".into(),
+                risk: Risk::Low,
+                side_effects: false,
+                keywords: vec![],
+            },
+            ToolBrief {
+                name: "calc".into(),
+                description: "evaluate arithmetic expression".into(),
+                category: "math".into(),
+                risk: Risk::Low,
+                side_effects: false,
+                keywords: vec![],
+            },
         ];
         let r = d.answer(&tools_request(st));
         let (a, b) = (r["tool:fs_list"].clone(), r["tool:calc"].clone());

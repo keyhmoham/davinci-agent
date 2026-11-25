@@ -3,18 +3,8 @@
 use dfae_core::*;
 use std::collections::BTreeMap;
 
-pub const TASK_TYPES: [&str; 10] = [
-    "research",
-    "coding",
-    "system_diagnostics",
-    "file_operations",
-    "calculation",
-    "data_analysis",
-    "maintenance",
-    "memory",
-    "conversation",
-    "other",
-];
+pub const TASK_TYPES: [&str; 10] =
+    ["research", "coding", "system_diagnostics", "file_operations", "calculation", "data_analysis", "maintenance", "memory", "conversation", "other"];
 
 pub fn route_request(state: DecisionState) -> DecisionRequest {
     let mut q = BTreeMap::new();
@@ -77,10 +67,7 @@ pub fn tool_key(name: &str) -> String {
 pub fn tools_request(state: DecisionState) -> DecisionRequest {
     let mut q = BTreeMap::new();
     for t in &state.tools {
-        q.insert(
-            tool_key(&t.name),
-            Question::noul(format!("Is the tool `{}` ({}) needed for the request?", t.name, t.description)),
-        );
+        q.insert(tool_key(&t.name), Question::noul(format!("Is the tool `{}` ({}) needed for the request?", t.name, t.description)));
     }
     DecisionRequest { kind: DecisionKind::SelectTools, state, questions: q }
 }

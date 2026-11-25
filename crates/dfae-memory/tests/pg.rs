@@ -1,7 +1,7 @@
 //! Runs only when `DFAE_TEST_DATABASE_URL` points at a disposable database.
 
 use dfae_core::*;
-use dfae_memory::{verify_audit_chain, PgStore};
+use dfae_memory::{PgStore, verify_audit_chain};
 
 fn url() -> Option<String> {
     std::env::var("DFAE_TEST_DATABASE_URL").ok()

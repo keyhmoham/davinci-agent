@@ -1,8 +1,8 @@
 //! Verification engine: judge completion on *evidence*, not on what a model
 //! says it did.
 
-use crate::engine::{Inner, TaskCtx};
 use crate::answer;
+use crate::engine::{Inner, TaskCtx};
 use dfae_core::*;
 use regex::Regex;
 use std::sync::Arc;
@@ -49,19 +49,39 @@ impl Inner {
                         let out = s.output.as_deref().unwrap_or("");
                         for c in s.checks.iter().filter(|c| **c != Check::ExitOk) {
                             let (pass, ev) = self.eval_check(c, out);
-                            checks.push(CheckResult { check_id: format!("{}:check", s.id), description: c.describe(), status: if pass { CheckStatus::Passed } else { CheckStatus::Failed }, evidence: ev });
+                            checks.push(CheckResult {
+                                check_id: format!("{}:check", s.id),
+                                description: c.describe(),
+                                status: if pass { CheckStatus::Passed } else { CheckStatus::Failed },
+                                evidence: ev,
+                            });
                         }
                         for ev in &s.evidence {
-                            checks.push(CheckResult { check_id: format!("{}:post", s.id), description: "independent post-condition".into(), status: CheckStatus::Passed, evidence: ev.clone() });
+                            checks.push(CheckResult {
+                                check_id: format!("{}:post", s.id),
+                                description: "independent post-condition".into(),
+                                status: CheckStatus::Passed,
+                                evidence: ev.clone(),
+                            });
                         }
                     }
                     StepStatus::Failed => {
                         failed += 1;
-                        checks.push(CheckResult { check_id: format!("{}:{}", s.id, label), description: "step completed".into(), status: CheckStatus::Failed, evidence: s.error.clone().unwrap_or_default() });
+                        checks.push(CheckResult {
+                            check_id: format!("{}:{}", s.id, label),
+                            description: "step completed".into(),
+                            status: CheckStatus::Failed,
+                            evidence: s.error.clone().unwrap_or_default(),
+                        });
                     }
                     StepStatus::Skipped | StepStatus::Cancelled => {
                         skipped += 1;
-                        checks.push(CheckResult { check_id: format!("{}:{}", s.id, label), description: "step ran".into(), status: CheckStatus::Skipped, evidence: s.error.clone().unwrap_or_default() });
+                        checks.push(CheckResult {
+                            check_id: format!("{}:{}", s.id, label),
+                            description: "step ran".into(),
+                            status: CheckStatus::Skipped,
+                            evidence: s.error.clone().unwrap_or_default(),
+                        });
                     }
                     _ => {}
                 }
@@ -77,7 +97,14 @@ impl Inner {
         let needs_judgement = rec.plan.as_ref().map(|p| p.has_reasoning()).unwrap_or(false) || failed > 0 || skipped > 0;
         let completion = if needs_judgement && total > 0 {
             let mut st = self.decision_state(&rec.goal, &rec.entities);
-            st.completion_facts = Some(CompletionFacts { steps_ok: ok, steps_failed: failed, steps_total: total, checks_passed, checks_failed, evidence: answer::evidence_block(&rec, 60) });
+            st.completion_facts = Some(CompletionFacts {
+                steps_ok: ok,
+                steps_failed: failed,
+                steps_total: total,
+                checks_passed,
+                checks_failed,
+                evidence: answer::evidence_block(&rec, 60),
+            });
             Some(self.note(ctx, self.decider.assess_completion(st).await).await)
         } else {
             None

@@ -1,5 +1,5 @@
-use dfae_core::text::content_tokens;
 use dfae_core::Embedder;
+use dfae_core::text::content_tokens;
 
 /// Deterministic feature-hashing embedder (unigrams + bigrams, signed hashing,
 /// L2-normalised). No model download, no network, stable across processes —

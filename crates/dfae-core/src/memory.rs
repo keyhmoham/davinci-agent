@@ -53,16 +53,7 @@ pub struct MemoryItem {
 
 impl MemoryItem {
     pub fn new(kind: MemoryKind, text: impl Into<String>, importance: f32) -> Self {
-        Self {
-            id: crate::new_id(),
-            kind,
-            text: text.into(),
-            entities: vec![],
-            importance,
-            metadata: Value::Null,
-            session_id: None,
-            created_at: Utc::now(),
-        }
+        Self { id: crate::new_id(), kind, text: text.into(), entities: vec![], importance, metadata: Value::Null, session_id: None, created_at: Utc::now() }
     }
 }
 

@@ -9,10 +9,10 @@ use dfae_decision::{Decided, Decider};
 use dfae_models::{Generated, ModelGateway, Tier};
 use dfae_tools::{PolicyEngine, ToolRegistry};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -195,7 +195,7 @@ impl Engine {
                 None => out.insert(0, r),
             }
         }
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        out.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         out.truncate(limit);
         out
     }
@@ -255,10 +255,11 @@ impl Engine {
     pub async fn wait(&self, id: &str, timeout: Duration) -> Option<TaskRecord> {
         let start = std::time::Instant::now();
         loop {
-            if let Some(t) = self.get_task(id).await {
-                if t.status.is_terminal() && !self.inner.live.lock().contains_key(id) {
-                    return Some(t);
-                }
+            if let Some(t) = self.get_task(id).await
+                && t.status.is_terminal()
+                && !self.inner.live.lock().contains_key(id)
+            {
+                return Some(t);
             }
             if start.elapsed() > timeout {
                 return self.get_task(id).await;
@@ -341,10 +342,10 @@ impl Inner {
         let seq = ctx.seq.fetch_add(1, Ordering::SeqCst);
         let audit = audit_worthy(&kind);
         let event = Event { task_id: ctx.id.clone(), seq, ts: Utc::now(), kind };
-        if let Some((k, payload)) = audit {
-            if let Err(e) = self.store.audit_append(&ctx.id, k, payload).await {
-                tracing::warn!(error = %e, "audit append failed");
-            }
+        if let Some((k, payload)) = audit
+            && let Err(e) = self.store.audit_append(&ctx.id, k, payload).await
+        {
+            tracing::warn!(error = %e, "audit append failed");
         }
         self.bus.publish(event);
     }
@@ -464,7 +465,14 @@ impl Inner {
 
     pub(crate) fn gen_request(&self, tier: Tier, system: &str, user: String, purpose: &str) -> GenerationRequest {
         let max = if tier == Tier::Slm { self.cfg.slm.max_tokens } else { self.cfg.strong.max_tokens };
-        GenerationRequest { system: system.into(), messages: vec![Message::user(user)], max_tokens: max, temperature: 0.1, json: false, purpose: purpose.into() }
+        GenerationRequest {
+            system: system.into(),
+            messages: vec![Message::user(user)],
+            max_tokens: max,
+            temperature: 0.1,
+            json: false,
+            purpose: purpose.into(),
+        }
     }
 
     pub(crate) async fn is_cancelled(&self, ctx: &Arc<TaskCtx>) -> bool {
@@ -486,14 +494,21 @@ fn audit_worthy(kind: &EventKind) -> Option<(&'static str, Value)> {
     match kind {
         EventKind::TaskCreated { goal } => Some(("task_created", json!({"goal": goal}))),
         EventKind::Mode { mode, reason, skill_id } => Some(("mode", json!({"mode": mode, "reason": reason, "skill_id": skill_id}))),
-        EventKind::PlanCreated { plan } => Some(("plan_created", json!({"source": plan.source, "steps": plan.steps.iter().map(|s| json!({"id": s.id, "tool": s.tool, "args": s.args, "after": s.depends_on})).collect::<Vec<_>>()}))),
+        EventKind::PlanCreated { plan } => Some((
+            "plan_created",
+            json!({"source": plan.source, "steps": plan.steps.iter().map(|s| json!({"id": s.id, "tool": s.tool, "args": s.args, "after": s.depends_on})).collect::<Vec<_>>()}),
+        )),
         EventKind::PlanRevised { plan, reason } => Some(("plan_revised", json!({"reason": reason, "revision": plan.revision, "steps": plan.steps.len()}))),
         EventKind::StepUpdate { step_id, status, tool, error, attempts, .. } if status.is_done() => {
             Some(("step", json!({"step": step_id, "status": status, "tool": tool, "error": error, "attempts": attempts})))
         }
-        EventKind::ApprovalRequested { approval } => Some(("approval_requested", json!({"id": approval.id, "tool": approval.tool, "args_hash": approval.args_hash, "reason": approval.reason}))),
+        EventKind::ApprovalRequested { approval } => {
+            Some(("approval_requested", json!({"id": approval.id, "tool": approval.tool, "args_hash": approval.args_hash, "reason": approval.reason})))
+        }
         EventKind::ApprovalResolved { approval_id, status } => Some(("approval_resolved", json!({"id": approval_id, "status": status}))),
-        EventKind::Verification { result } => Some(("verification", json!({"status": result.status, "failed": result.failed_checks, "unverified": result.unverified_claims}))),
+        EventKind::Verification { result } => {
+            Some(("verification", json!({"status": result.status, "failed": result.failed_checks, "unverified": result.unverified_claims})))
+        }
         EventKind::Final { status, .. } => Some(("final", json!({"status": status}))),
         EventKind::Warning { message } => Some(("warning", json!({"message": message}))),
         _ => None,

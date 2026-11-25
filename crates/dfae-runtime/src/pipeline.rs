@@ -11,9 +11,9 @@ use crate::{answer, planner, prompts, skills};
 use chrono::Utc;
 use dfae_core::*;
 use dfae_decision::Decided;
-use dfae_memory::{build_context, dedupe_memories, rank_memories, ContextInput};
+use dfae_memory::{ContextInput, build_context, dedupe_memories, rank_memories};
 use dfae_models::Tier;
-use dfae_tools::{bind_direct, DirectCall};
+use dfae_tools::{DirectCall, bind_direct};
 use futures_util::FutureExt;
 use serde_json::json;
 use std::panic::AssertUnwindSafe;
@@ -62,7 +62,8 @@ impl Inner {
 
         // ---- 4. deterministic candidates -----------------------------------
         let metas = self.tools.metas();
-        let calls: Option<Vec<DirectCall>> = if req.mode == ModeRequest::Assisted || req.mode == ModeRequest::Escalated { None } else { bind_direct(&metas, &goal, &entities) };
+        let calls: Option<Vec<DirectCall>> =
+            if req.mode == ModeRequest::Assisted || req.mode == ModeRequest::Escalated { None } else { bind_direct(&metas, &goal, &entities) };
         let skill = if matches!(req.mode, ModeRequest::Auto | ModeRequest::Direct) { self.find_skill(&goal, &entities).await } else { None };
         let skill_direct = skill.as_ref().map(|s| !s.plan.has_reasoning()).unwrap_or(false);
 
@@ -145,13 +146,14 @@ impl Inner {
         }
         self.set_status(ctx, TaskStatus::Verifying).await;
         let mut verification = self.stage_verify(ctx).await;
-        if exec_err.is_none() && verification.completion_confidence.map(|p| p < 0.35).unwrap_or(false) {
-            if let Ok(true) = self.continue_plan(ctx, goal).await {
-                self.set_status(ctx, TaskStatus::Running).await;
-                exec_err = self.execute_plan(ctx).await.err();
-                self.set_status(ctx, TaskStatus::Verifying).await;
-                verification = self.stage_verify(ctx).await;
-            }
+        if exec_err.is_none()
+            && verification.completion_confidence.map(|p| p < 0.35).unwrap_or(false)
+            && let Ok(true) = self.continue_plan(ctx, goal).await
+        {
+            self.set_status(ctx, TaskStatus::Running).await;
+            exec_err = self.execute_plan(ctx).await.err();
+            self.set_status(ctx, TaskStatus::Verifying).await;
+            verification = self.stage_verify(ctx).await;
         }
         ctx.rec.lock().await.verification = Some(verification);
         let mode = ctx.rec.lock().await.mode.unwrap_or(mode);
@@ -232,7 +234,16 @@ impl Inner {
         if backend.contains("gliner") {
             self.add_ledger(
                 ctx,
-                LedgerEntry { ts: Utc::now(), component: Component::Gliner, model: backend.clone(), purpose: "extract".into(), prompt_tokens: 0, completion_tokens: 0, latency_ms: latency, cached },
+                LedgerEntry {
+                    ts: Utc::now(),
+                    component: Component::Gliner,
+                    model: backend.clone(),
+                    purpose: "extract".into(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    latency_ms: latency,
+                    cached,
+                },
             )
             .await;
         }
@@ -245,13 +256,23 @@ impl Inner {
         let session = ctx.rec.lock().await.session_id.clone();
         let cands = self
             .store
-            .retrieve(MemoryQuery { text: goal.to_string(), kinds: vec![MemoryKind::Episodic, MemoryKind::Semantic], limit: 12, session_id: Some(session.clone()) })
+            .retrieve(MemoryQuery {
+                text: goal.to_string(),
+                kinds: vec![MemoryKind::Episodic, MemoryKind::Semantic],
+                limit: 12,
+                session_id: Some(session.clone()),
+            })
             .await
             .unwrap_or_default();
         let ranked: Vec<_> = dedupe_memories(rank_memories(cands, entities)).into_iter().filter(|m| m.similarity >= 0.2).take(6).collect();
         let refs: Vec<RetrievedRef> = ranked
             .iter()
-            .map(|m| RetrievedRef { id: m.item.id.clone(), kind: m.item.kind.as_str().into(), score: m.score, preview: tokens::truncate_tokens(&m.item.text, 24) })
+            .map(|m| RetrievedRef {
+                id: m.item.id.clone(),
+                kind: m.item.kind.as_str().into(),
+                score: m.score,
+                preview: tokens::truncate_tokens(&m.item.text, 24),
+            })
             .collect();
         // earlier turns of the same session (cheap conversational continuity)
         let mut prior: Vec<String> = Vec::new();
@@ -274,7 +295,16 @@ impl Inner {
         let base = ctx.base_ctx.lock().clone();
         let r = ctx.rec.lock().await;
         let obs: Vec<(String, String)> = if include_observations {
-            r.plan.as_ref().map(|p| p.steps.iter().filter(|s| s.status == StepStatus::Succeeded).map(|s| (format!("{} {}", s.id, s.tool.as_deref().unwrap_or("reasoning")), s.summary.clone().unwrap_or_default())).collect()).unwrap_or_default()
+            r.plan
+                .as_ref()
+                .map(|p| {
+                    p.steps
+                        .iter()
+                        .filter(|s| s.status == StepStatus::Succeeded)
+                        .map(|s| (format!("{} {}", s.id, s.tool.as_deref().unwrap_or("reasoning")), s.summary.clone().unwrap_or_default()))
+                        .collect()
+                })
+                .unwrap_or_default()
         } else {
             vec![]
         };
@@ -283,7 +313,14 @@ impl Inner {
             c if c < 0.25 => ContextProfile::Minimal,
             _ => ContextProfile::Standard,
         });
-        let pkg = build_context(&ContextInput { goal: &r.goal, entities: &r.entities, memories: &base.memories, prior_turns: &base.prior_turns, observations: &obs, profile });
+        let pkg = build_context(&ContextInput {
+            goal: &r.goal,
+            entities: &r.entities,
+            memories: &base.memories,
+            prior_turns: &base.prior_turns,
+            observations: &obs,
+            profile,
+        });
         pkg.render()
     }
 
@@ -327,7 +364,9 @@ impl Inner {
         *ctx.allowed.lock() = allowed.clone();
 
         let budget = ctx.rec.lock().await.budget.clone();
-        let mut tier = self.pick_tier(mode).ok_or("no language model is configured (set SLM_BASE_URL or STRONG_API_KEY) and this request cannot be handled deterministically")?;
+        let mut tier = self
+            .pick_tier(mode)
+            .ok_or("no language model is configured (set SLM_BASE_URL or STRONG_API_KEY) and this request cannot be handled deterministically")?;
         let mut used_mode = if tier == Tier::Strong { ExecMode::Escalated } else { mode };
         let mut last_err = String::new();
         for attempt in 0..2 {
@@ -345,7 +384,8 @@ impl Inner {
                     last_err = e;
                     // one escalation to the stronger model, if there is one
                     if tier == Tier::Slm && self.models.has(Tier::Strong) {
-                        self.emit(ctx, EventKind::Warning { message: format!("SLM plan failed ({last_err}); escalating the plan to the stronger model") }).await;
+                        self.emit(ctx, EventKind::Warning { message: format!("SLM plan failed ({last_err}); escalating the plan to the stronger model") })
+                            .await;
                         tier = Tier::Strong;
                         used_mode = ExecMode::Escalated;
                     } else {
@@ -358,7 +398,17 @@ impl Inner {
     }
 
     /// Generate → parse → validate, with a single repair round naming the problems.
-    async fn try_plan(&self, ctx: &Arc<TaskCtx>, tier: Tier, mut req: GenerationRequest, goal: &str, source: PlanSource, allowed: &[String], budget: &Budget) -> Result<Vec<Step>, String> {
+    #[allow(clippy::too_many_arguments)]
+    async fn try_plan(
+        &self,
+        ctx: &Arc<TaskCtx>,
+        tier: Tier,
+        mut req: GenerationRequest,
+        goal: &str,
+        source: PlanSource,
+        allowed: &[String],
+        budget: &Budget,
+    ) -> Result<Vec<Step>, String> {
         let v = self.gen_json(ctx, tier, req.clone()).await?;
         let problems = match planner::parse_plan(&v, goal, source, "", &self.tools) {
             Ok(steps) => match planner::validate_plan(&steps, &self.tools, allowed, budget) {
@@ -387,7 +437,8 @@ impl Inner {
         }
         let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
         let Some(tier) = self.pick_tier(mode) else { return Ok(false) };
-        let added = self.replan(ctx, tier, goal, "the evidence collected so far does not show the request is fully accomplished; add the missing steps", None).await?;
+        let added =
+            self.replan(ctx, tier, goal, "the evidence collected so far does not show the request is fully accomplished; add the missing steps", None).await?;
         Ok(added)
     }
 
@@ -426,8 +477,20 @@ impl Inner {
         // token ledger: baseline for a naive tool-calling LLM agent
         {
             let mut r = ctx.rec.lock().await;
-            let raw: Vec<u64> = r.plan.as_ref().map(|p| p.steps.iter().filter(|s| s.status.is_done()).map(|s| tokens::estimate_tokens(s.output.as_deref().unwrap_or("")).min(4000) as u64).collect()).unwrap_or_default();
-            let b = naive_baseline_tokens(350, self.tools.full_schema_tokens() as u64, tokens::estimate_tokens(&r.goal) as u64, &raw, tokens::estimate_tokens(r.final_answer.as_deref().unwrap_or("")) as u64);
+            let raw: Vec<u64> = r
+                .plan
+                .as_ref()
+                .map(|p| {
+                    p.steps.iter().filter(|s| s.status.is_done()).map(|s| tokens::estimate_tokens(s.output.as_deref().unwrap_or("")).min(4000) as u64).collect()
+                })
+                .unwrap_or_default();
+            let b = naive_baseline_tokens(
+                350,
+                self.tools.full_schema_tokens() as u64,
+                tokens::estimate_tokens(&r.goal) as u64,
+                &raw,
+                tokens::estimate_tokens(r.final_answer.as_deref().unwrap_or("")) as u64,
+            );
             r.ledger.baseline_tokens = b;
         }
         // status transition (running → terminal)
@@ -474,11 +537,22 @@ impl Inner {
         //    becomes semantic memory if the task was verified, the label is on
         //    the allowlist and the value was corroborated by tool evidence.
         if verified {
-            let evidence: String = rec.plan.as_ref().map(|p| p.steps.iter().filter(|s| s.kind == StepKind::Tool).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let evidence: String = rec
+                .plan
+                .as_ref()
+                .map(|p| p.steps.iter().filter(|s| s.kind == StepKind::Tool).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default();
             for e in rec.entities.iter().filter(|e| matches!(e.label.as_str(), "server" | "database" | "repository") && e.score >= 0.6) {
                 if evidence.contains(&e.text) {
                     let fact = format!("{}: {}", e.label, e.text);
-                    let dup = self.store.retrieve(MemoryQuery { text: fact.clone(), kinds: vec![MemoryKind::Semantic], limit: 1, session_id: None }).await.ok().and_then(|r| r.into_iter().next()).map(|r| r.similarity > 0.95).unwrap_or(false);
+                    let dup = self
+                        .store
+                        .retrieve(MemoryQuery { text: fact.clone(), kinds: vec![MemoryKind::Semantic], limit: 1, session_id: None })
+                        .await
+                        .ok()
+                        .and_then(|r| r.into_iter().next())
+                        .map(|r| r.similarity > 0.95)
+                        .unwrap_or(false);
                     if !dup {
                         let mut it = MemoryItem::new(MemoryKind::Semantic, fact, 0.6);
                         it.entities = vec![e.clone()];
@@ -492,26 +566,30 @@ impl Inner {
         // 4. skills: replay bookkeeping, or crystallise a new one
         if let Some(sid) = &rec.skill_id {
             let masked = skills::mask_request(&rec.goal, &skills::slot_values(&rec.goal, &rec.entities));
-            if let Ok(found) = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 5, session_id: None }).await {
-                if let Some(m) = found.into_iter().find(|m| &m.item.id == sid) {
-                    if let Some(mut skill) = m.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) {
-                        if success { skill.successes += 1 } else { skill.failures += 1 }
-                        if skill.failures >= 2 && skill.failures > skill.successes {
-                            let _ = self.store.delete(sid).await;
-                        } else {
-                            let _ = self.store.update_metadata(sid, json!({"skill": skill})).await;
-                        }
-                    }
+            if let Ok(found) = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 5, session_id: None }).await
+                && let Some(m) = found.into_iter().find(|m| &m.item.id == sid)
+                && let Some(mut skill) = m.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok())
+            {
+                if success {
+                    skill.successes += 1
+                } else {
+                    skill.failures += 1
+                }
+                if skill.failures >= 2 && skill.failures > skill.successes {
+                    let _ = self.store.delete(sid).await;
+                } else {
+                    let _ = self.store.update_metadata(sid, json!({"skill": skill})).await;
                 }
             }
-        } else if verified && matches!(rec.mode, Some(ExecMode::Assisted) | Some(ExecMode::Escalated)) && rec.usage.replans == 0 {
-            if let Some(plan) = &rec.plan {
-                if let Some(skill) = skills::crystallize(&rec.goal, &rec.entities, plan) {
-                    let mut it = MemoryItem::new(MemoryKind::Procedural, skill.masked_request.clone(), 0.8);
-                    it.metadata = json!({"skill": skill});
-                    let _ = self.store.store(it).await;
-                }
-            }
+        } else if verified
+            && matches!(rec.mode, Some(ExecMode::Assisted) | Some(ExecMode::Escalated))
+            && rec.usage.replans == 0
+            && let Some(plan) = &rec.plan
+            && let Some(skill) = skills::crystallize(&rec.goal, &rec.entities, plan)
+        {
+            let mut it = MemoryItem::new(MemoryKind::Procedural, skill.masked_request.clone(), 0.8);
+            it.metadata = json!({"skill": skill});
+            let _ = self.store.store(it).await;
         }
     }
 }

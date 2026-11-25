@@ -7,8 +7,10 @@ use tokio::sync::broadcast;
 /// UI that attaches mid-task can replay what it missed.
 pub struct EventBus {
     tx: broadcast::Sender<Event>,
-    backlog: Mutex<(HashMap<String, Vec<Event>>, VecDeque<String>)>,
+    backlog: Mutex<Backlog>,
 }
+
+type Backlog = (HashMap<String, Vec<Event>>, VecDeque<String>);
 
 const MAX_TASKS: usize = 200;
 const MAX_EVENTS_PER_TASK: usize = 3000;
@@ -24,10 +26,10 @@ impl EventBus {
             let mut g = self.backlog.lock();
             if !g.0.contains_key(&e.task_id) {
                 g.1.push_back(e.task_id.clone());
-                if g.1.len() > MAX_TASKS {
-                    if let Some(old) = g.1.pop_front() {
-                        g.0.remove(&old);
-                    }
+                if g.1.len() > MAX_TASKS
+                    && let Some(old) = g.1.pop_front()
+                {
+                    g.0.remove(&old);
                 }
             }
             let v = g.0.entry(e.task_id.clone()).or_default();

@@ -5,7 +5,7 @@
 use dfae_core::*;
 use dfae_tools::{DirectCall, ToolRegistry};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
@@ -58,11 +58,8 @@ pub fn plan_from_calls(goal: &str, calls: &[DirectCall]) -> Plan {
 /// (replans); dependencies on ids outside the new set are kept verbatim.
 pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, registry: &ToolRegistry) -> Result<Vec<Step>, String> {
     let arr = v.get("steps").and_then(|s| s.as_array()).ok_or("missing 'steps' array")?;
-    let raw_ids: Vec<String> = arr
-        .iter()
-        .enumerate()
-        .map(|(i, s)| s.get("id").and_then(|x| x.as_str()).map(String::from).unwrap_or_else(|| format!("s{}", i + 1)))
-        .collect();
+    let raw_ids: Vec<String> =
+        arr.iter().enumerate().map(|(i, s)| s.get("id").and_then(|x| x.as_str()).map(String::from).unwrap_or_else(|| format!("s{}", i + 1))).collect();
     let new_ids: HashSet<&String> = raw_ids.iter().collect();
     let rename = |id: &str| -> String { if new_ids.contains(&id.to_string()) { format!("{prefix}{id}") } else { id.to_string() } };
     let mut steps = Vec::new();
@@ -155,10 +152,8 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
                     }
                     // arguments that contain templates are validated at run time
                     let has_template = !template_refs(&s.args).is_empty();
-                    if !has_template {
-                        if let Err(e) = m.validate_args(&s.args) {
-                            errs.push(format!("step {} ({name}): {e}", s.id));
-                        }
+                    if !has_template && let Err(e) = m.validate_args(&s.args) {
+                        errs.push(format!("step {} ({name}): {e}", s.id));
                     }
                 }
             }
@@ -201,7 +196,7 @@ fn find_cycle(steps: &[Step]) -> Option<String> {
 mod tests {
     use super::*;
     use dfae_memory::InMemoryStore;
-    use dfae_tools::{register_native, PolicyConfig, PolicyEngine};
+    use dfae_tools::{PolicyConfig, PolicyEngine, register_native};
     use std::sync::Arc;
 
     fn registry() -> ToolRegistry {
@@ -241,7 +236,11 @@ mod tests {
         assert!(bad(json!({"steps": [{"id": "s1", "tool": "rm_rf", "args": {}}]})).iter().any(|e| e.contains("unknown tool")));
         assert!(bad(json!({"steps": [{"id": "s1", "tool": "calc", "args": {"expression": "1"}}]})).iter().any(|e| e.contains("not available")));
         assert!(bad(json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {}}]})).iter().any(|e| e.contains("missing required")));
-        assert!(bad(json!({"steps": [{"id": "s1", "tool": null, "after": ["s2"]}, {"id": "s2", "tool": null, "after": ["s1"]}]})).iter().any(|e| e.contains("cycle")));
+        assert!(
+            bad(json!({"steps": [{"id": "s1", "tool": null, "after": ["s2"]}, {"id": "s2", "tool": null, "after": ["s1"]}]}))
+                .iter()
+                .any(|e| e.contains("cycle"))
+        );
         assert!(bad(json!({"steps": [{"id": "s1", "tool": null, "after": ["zzz"]}]})).iter().any(|e| e.contains("unknown step")));
     }
 

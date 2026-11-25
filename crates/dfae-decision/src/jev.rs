@@ -69,14 +69,7 @@ impl DecisionProvider for JevProvider {
             "state": request.state,
             "questions": request.questions,
         });
-        let resp = self
-            .http
-            .post(&self.url)
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| DecisionError::Unavailable(e.to_string()))?;
+        let resp = self.http.post(&self.url).bearer_auth(&self.key).json(&body).send().await.map_err(|e| DecisionError::Unavailable(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();

@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(evaluate("-3 + 5").unwrap(), 2.0);
         assert_eq!(evaluate("sqrt(81) + 10 % 4").unwrap(), 11.0);
         assert_eq!(evaluate("12 x 3").unwrap(), 36.0);
-        assert!((evaluate("pi * 2").unwrap() - 6.283185307).abs() < 1e-6);
+        assert!((evaluate("pi * 2").unwrap() - std::f64::consts::TAU).abs() < 1e-9);
     }
 
     #[test]

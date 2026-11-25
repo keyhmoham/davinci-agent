@@ -403,6 +403,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "futures-core",
  "mio",
  "parking_lot",
  "rustix",
@@ -581,6 +582,7 @@ name = "dfae-decision"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "dfae-core",
  "parking_lot",
@@ -597,6 +599,7 @@ name = "dfae-extract"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "dfae-core",
  "parking_lot",
@@ -633,6 +636,7 @@ name = "dfae-models"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "chrono",
  "dfae-core",
  "parking_lot",
@@ -676,19 +680,12 @@ name = "dfae-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "axum",
  "chrono",
  "dfae-core",
- "dfae-decision",
- "dfae-extract",
  "dfae-memory",
- "dfae-models",
  "dfae-runtime",
- "dfae-tools",
  "futures-util",
- "parking_lot",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -698,7 +695,6 @@ dependencies = [
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -2274,6 +2270,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

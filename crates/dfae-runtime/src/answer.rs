@@ -20,7 +20,9 @@ pub fn evidence_block(rec: &TaskRecord, per_step_tokens: usize) -> String {
                 s.tool.as_deref().unwrap_or("reasoning"),
                 tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), per_step_tokens)
             )),
-            StepStatus::Failed => lines.push(format!("{} {} FAILED: {}", s.id, s.tool.as_deref().unwrap_or("reasoning"), s.error.as_deref().unwrap_or("error"))),
+            StepStatus::Failed => {
+                lines.push(format!("{} {} FAILED: {}", s.id, s.tool.as_deref().unwrap_or("reasoning"), s.error.as_deref().unwrap_or("error")))
+            }
             StepStatus::Skipped => lines.push(format!("{} SKIPPED", s.id)),
             _ => {}
         }
@@ -46,7 +48,12 @@ pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
     } else {
         for s in &ok {
             let body = tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), 350);
-            out.push_str(&format!("▸ {}{}\n{}\n", s.tool.as_deref().unwrap_or("reasoning"), if s.args.is_null() || s.args == serde_json::json!({}) { String::new() } else { format!(" {}", compact_args(&s.args)) }, body));
+            out.push_str(&format!(
+                "▸ {}{}\n{}\n",
+                s.tool.as_deref().unwrap_or("reasoning"),
+                if s.args.is_null() || s.args == serde_json::json!({}) { String::new() } else { format!(" {}", compact_args(&s.args)) },
+                body
+            ));
         }
     }
     let failed: Vec<&Step> = plan.steps.iter().filter(|s| s.status == StepStatus::Failed).collect();
@@ -58,7 +65,9 @@ pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
 
 fn compact_args(v: &serde_json::Value) -> String {
     match v {
-        serde_json::Value::Object(m) => m.iter().map(|(k, x)| format!("{k}={}", x.as_str().map(String::from).unwrap_or_else(|| x.to_string()))).collect::<Vec<_>>().join(" "),
+        serde_json::Value::Object(m) => {
+            m.iter().map(|(k, x)| format!("{k}={}", x.as_str().map(String::from).unwrap_or_else(|| x.to_string()))).collect::<Vec<_>>().join(" ")
+        }
         other => other.to_string(),
     }
 }
@@ -105,7 +114,11 @@ impl Inner {
         };
         // a lone reasoning leaf *is* the answer: no extra model call
         let leaves: Vec<&Step> = plan.steps.iter().filter(|s| !plan.steps.iter().any(|o| o.depends_on.contains(&s.id))).collect();
-        let single_leaf = if leaves.len() == 1 && leaves[0].kind == StepKind::Reasoning && leaves[0].status == StepStatus::Succeeded { leaves[0].output.clone() } else { None };
+        let single_leaf = if leaves.len() == 1 && leaves[0].kind == StepKind::Reasoning && leaves[0].status == StepStatus::Succeeded {
+            leaves[0].output.clone()
+        } else {
+            None
+        };
 
         // only tool output is ground truth: a model's own prose must never vouch for itself
         let evidence_full: String = plan.steps.iter().filter(|s| s.kind == StepKind::Tool).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");

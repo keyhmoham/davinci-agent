@@ -1,0 +1,7 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+gliner==0.2.13
+# gliner 0.2.13 is not compatible with transformers 5.x; torch 2.5.1 is the last
+# PyTorch these transformers versions support without warnings.
+transformers>=4.45,<4.53
+huggingface_hub<1.0

@@ -1,4 +1,4 @@
-use crate::{chain_hash, cosine, HashEmbedder, GENESIS};
+use crate::{GENESIS, HashEmbedder, chain_hash, cosine};
 use async_trait::async_trait;
 use chrono::Utc;
 use dfae_core::*;
@@ -50,7 +50,7 @@ impl MemoryStore for InMemoryStore {
     }
     async fn list_tasks(&self, limit: usize) -> Result<Vec<TaskRecord>, MemoryError> {
         let mut v: Vec<TaskRecord> = self.inner.lock().tasks.values().cloned().collect();
-        v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        v.sort_by_key(|t| std::cmp::Reverse(t.created_at));
         v.truncate(limit);
         Ok(v)
     }

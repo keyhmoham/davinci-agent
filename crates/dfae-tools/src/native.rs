@@ -1,13 +1,13 @@
 //! Native tools. Each tool re-checks the policy at execution time (defence in
 //! depth) and returns compact, deterministic output.
 
-use crate::policy::{is_private_ip, PathGuard, PolicyDecision, PolicyEngine};
+use crate::policy::{PathGuard, PolicyDecision, PolicyEngine, is_private_ip};
 use crate::registry::ToolRegistry;
 use crate::sandbox;
 use async_trait::async_trait;
 use dfae_core::*;
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -97,7 +97,9 @@ impl Tool for Calc {
         pats(
             &mut m,
             &[
-                format!(r"(?i)\b(?:calculate|compute|evaluate|solve|what(?:'s|\s+is)|how\s+much\s+is)\s*:?\s*(?P<expression>(?:\d|\(|{f})(?:[\d\s.+\-*/^%x×÷()]|{f})*)\s*[?.!]?\s*$"),
+                format!(
+                    r"(?i)\b(?:calculate|compute|evaluate|solve|what(?:'s|\s+is)|how\s+much\s+is)\s*:?\s*(?P<expression>(?:\d|\(|{f})(?:[\d\s.+\-*/^%x×÷()]|{f})*)\s*[?.!]?\s*$"
+                ),
                 r"^\s*(?P<expression>[\d.(][\d\s.()]*[+\-*/^%x×÷][\d\s.+\-*/^%()x×÷]*[\d)])\s*=?\s*\??\s*$".to_string(),
             ],
         );
@@ -151,10 +153,10 @@ impl Tool for SystemInfo {
             lines.push(format!("uptime: {}d {}h {}m", s / 86400, (s % 86400) / 3600, (s % 3600) / 60));
         }
         let ws = self.policy.workspace().to_string_lossy().to_string();
-        if let Ok(r) = sandbox::run_argv(&["df".into(), "-h".into(), ws], self.policy.workspace(), Duration::from_secs(5), 8192, &ctx.cancel).await {
-            if let Some(l) = r.stdout.lines().nth(1) {
-                lines.push(format!("disk(workspace): {}", l.split_whitespace().collect::<Vec<_>>().join(" ")));
-            }
+        if let Ok(r) = sandbox::run_argv(&["df".into(), "-h".into(), ws], self.policy.workspace(), Duration::from_secs(5), 8192, &ctx.cancel).await
+            && let Some(l) = r.stdout.lines().nth(1)
+        {
+            lines.push(format!("disk(workspace): {}", l.split_whitespace().collect::<Vec<_>>().join(" ")));
         }
         Ok(ToolOutput::ok(lines.join("\n")))
     }
@@ -173,14 +175,18 @@ impl Tool for FsList {
             "fs_list",
             "list files and directories in a directory",
             "filesystem",
-            vec![ParamSpec::new("path", ParamType::String, false, "directory (default: workspace root)").hints(&["file path", "directory"]).default(json!("."))],
+            vec![
+                ParamSpec::new("path", ParamType::String, false, "directory (default: workspace root)").hints(&["file path", "directory"]).default(json!(".")),
+            ],
         );
         kw(&mut m, &["files", "directory", "folder", "list", "ls", "contents"]);
         let path = r"(?P<path>(?:\.{1,2}|~)?/[\w./\-]*|[\w\-]+/[\w./\-]*|\.)";
         pats(
             &mut m,
             &[
-                format!(r"(?i)\b(?:list|show|display|enumerate|ls)\b[^\n]*?\b(?:files|directory|directories|folder|folders|dir|contents)\b[^\n]*?\b(?:in|of|under|inside|at|from)\s+(?:the\s+)?(?:(?:folder|directory|dir)\s+)?{path}(?:\s|$|[?.!,])"),
+                format!(
+                    r"(?i)\b(?:list|show|display|enumerate|ls)\b[^\n]*?\b(?:files|directory|directories|folder|folders|dir|contents)\b[^\n]*?\b(?:in|of|under|inside|at|from)\s+(?:the\s+)?(?:(?:folder|directory|dir)\s+)?{path}(?:\s|$|[?.!,])"
+                ),
                 r"(?i)\bls\s+(?P<path>[\w./~\-]+)".into(),
                 r"(?i)\b(?:list|show|display|enumerate)\b[^\n]*?\b(?:files|directory|directories|folders?|contents)\b".into(),
             ],
@@ -231,7 +237,10 @@ impl Tool for FsRead {
             ],
         );
         kw(&mut m, &["read", "file", "cat", "open", "contents", "text", "view"]);
-        pats(&mut m, &[format!(r"(?i)\b(?:read|cat|open|show|print|display|view|get)\b[^\n]*?(?P<path>(?:\.{{0,2}}/)?(?:[\w.\-]+/)*[\w\-]+\.(?:{FILE_EXT}))\b")]);
+        pats(
+            &mut m,
+            &[format!(r"(?i)\b(?:read|cat|open|show|print|display|view|get)\b[^\n]*?(?P<path>(?:\.{{0,2}}/)?(?:[\w.\-]+/)*[\w\-]+\.(?:{FILE_EXT}))\b")],
+        );
         m
     }
     async fn execute(&self, input: Value, _c: ToolContext) -> Result<ToolOutput, ToolError> {
@@ -280,8 +289,12 @@ impl Tool for FsWrite {
         pats(
             &mut m,
             &[
-                format!(r#"(?i)\b(?:write|save|put|store)\s+["'`](?P<content>[^"'`]+)["'`]\s+(?:to|into|in|as)\s+(?:the\s+)?(?:file\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))"#),
-                format!(r#"(?i)\bcreate\s+(?:a\s+)?file\s+(?:called\s+|named\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))\s+(?:with|containing)\s+["'`](?P<content>[^"'`]+)["'`]"#),
+                format!(
+                    r#"(?i)\b(?:write|save|put|store)\s+["'`](?P<content>[^"'`]+)["'`]\s+(?:to|into|in|as)\s+(?:the\s+)?(?:file\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))"#
+                ),
+                format!(
+                    r#"(?i)\bcreate\s+(?:a\s+)?file\s+(?:called\s+|named\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))\s+(?:with|containing)\s+["'`](?P<content>[^"'`]+)["'`]"#
+                ),
             ],
         );
         m
@@ -312,7 +325,11 @@ impl Tool for FsWrite {
         Some(match tokio::fs::read(&p).await {
             Err(e) => Err(format!("read-back failed: {e}")),
             Ok(b) if append => {
-                if String::from_utf8_lossy(&b).ends_with(content) { Ok(format!("{raw} ends with the appended text ({} bytes total)", b.len())) } else { Err(format!("{raw} does not end with the appended text")) }
+                if String::from_utf8_lossy(&b).ends_with(content) {
+                    Ok(format!("{raw} ends with the appended text ({} bytes total)", b.len()))
+                } else {
+                    Err(format!("{raw} does not end with the appended text"))
+                }
             }
             Ok(b) if b == content.as_bytes() => Ok(format!("read-back sha256 {} matches ({} bytes)", &sha(&b)[..12], b.len())),
             Ok(_) => Err(format!("{raw} content differs from what was written")),
@@ -376,7 +393,9 @@ impl Tool for FsSearch {
             "filesystem",
             vec![
                 ParamSpec::new("pattern", ParamType::String, true, "regular expression"),
-                ParamSpec::new("path", ParamType::String, false, "directory to search (default: workspace)").hints(&["file path", "directory"]).default(json!(".")),
+                ParamSpec::new("path", ParamType::String, false, "directory to search (default: workspace)")
+                    .hints(&["file path", "directory"])
+                    .default(json!(".")),
                 ParamSpec::new("max_results", ParamType::Integer, false, "default 50"),
             ],
         );
@@ -458,7 +477,8 @@ pub struct HttpGet {
     policy: Arc<PolicyEngine>,
 }
 
-static SCRIPT_STYLE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>").unwrap());
+static SCRIPT_STYLE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>").unwrap());
 static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
 
 fn html_to_text(html: &str) -> String {
@@ -505,7 +525,10 @@ impl Tool for HttpGet {
             let parsed = reqwest::Url::parse(&url).map_err(|e| ToolError::args(format!("bad URL: {e}")))?;
             let host = parsed.host_str().unwrap_or_default().to_string();
             let port = parsed.port_or_known_default().unwrap_or(80);
-            let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port)).await.map_err(|e| ToolError::new(ErrorKind::Transient, format!("DNS lookup failed for {host}: {e}")))?.collect();
+            let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| ToolError::new(ErrorKind::Transient, format!("DNS lookup failed for {host}: {e}")))?
+                .collect();
             if addrs.is_empty() || addrs.iter().any(|a| is_private_ip(&a.ip())) {
                 return Err(ToolError::policy(format!("{host} resolves to a private or loopback address")));
             }
@@ -545,8 +568,14 @@ impl Tool for HttpGet {
             if status.as_u16() == 429 || status.is_server_error() {
                 return Err(ToolError::new(ErrorKind::Transient, format!("HTTP {status} for {url}")));
             }
-            let content = format!("HTTP {} {}\n{}{}", status.as_u16(), ctype.split(';').next().unwrap_or(""), text, if truncated { "\n…[truncated]" } else { "" });
-            return Ok(ToolOutput { content, ok: status.is_success(), exit_code: Some(status.as_u16() as i32), evidence: vec![format!("HTTP {}", status.as_u16())] });
+            let content =
+                format!("HTTP {} {}\n{}{}", status.as_u16(), ctype.split(';').next().unwrap_or(""), text, if truncated { "\n…[truncated]" } else { "" });
+            return Ok(ToolOutput {
+                content,
+                ok: status.is_success(),
+                exit_code: Some(status.as_u16() as i32),
+                evidence: vec![format!("HTTP {}", status.as_u16())],
+            });
         }
         Err(ToolError::other("too many redirects"))
     }
@@ -579,7 +608,8 @@ impl Tool for MemorySearch {
         if r.is_empty() {
             return Ok(ToolOutput::ok(format!("no relevant memories for '{q}'")));
         }
-        let lines: Vec<String> = r.iter().map(|m| format!("[{}] {} (sim {:.2})", m.item.kind.as_str(), tokens::truncate_tokens(&m.item.text, 80), m.similarity)).collect();
+        let lines: Vec<String> =
+            r.iter().map(|m| format!("[{}] {} (sim {:.2})", m.item.kind.as_str(), tokens::truncate_tokens(&m.item.text, 80), m.similarity)).collect();
         Ok(ToolOutput::ok(lines.join("\n")))
     }
 }
@@ -591,7 +621,12 @@ pub struct MemoryStoreTool {
 #[async_trait]
 impl Tool for MemoryStoreTool {
     fn metadata(&self) -> ToolMetadata {
-        let mut m = meta("memory_store", "remember a fact in long-term memory", "memory", vec![ParamSpec::new("text", ParamType::String, true, "the fact to remember")]);
+        let mut m = meta(
+            "memory_store",
+            "remember a fact in long-term memory",
+            "memory",
+            vec![ParamSpec::new("text", ParamType::String, true, "the fact to remember")],
+        );
         m.side_effects = true;
         kw(&mut m, &["remember", "store", "memorize", "note", "save", "fact"]);
         pats(&mut m, &[r"(?i)^\s*(?:please\s+)?(?:remember|memorize|note)\s+(?:that\s+)?(?P<text>.{3,})$".into()]);
@@ -609,7 +644,11 @@ impl Tool for MemoryStoreTool {
         let id = output.content.strip_prefix("stored memory ")?.trim().to_string();
         let text = input.get("text")?.as_str()?;
         let r = self.memory.retrieve(MemoryQuery { text: text.into(), kinds: vec![MemoryKind::Semantic], limit: 5, session_id: None }).await.ok()?;
-        Some(if r.iter().any(|m| m.item.id == id) { Ok(format!("memory {} is retrievable", &id[..8])) } else { Err("stored memory could not be retrieved".into()) })
+        Some(if r.iter().any(|m| m.item.id == id) {
+            Ok(format!("memory {} is retrievable", &id[..8]))
+        } else {
+            Err("stored memory could not be retrieved".into())
+        })
     }
 }
 
@@ -624,7 +663,12 @@ mod tests {
         let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), d.path().to_path_buf()));
         let mut r = ToolRegistry::new();
         register_native(&mut r, policy.clone(), Arc::new(InMemoryStore::new()));
-        let ctx = ToolContext { task_id: "t".into(), step_id: "s".into(), workspace: policy.workspace().to_path_buf(), cancel: tokio_util::sync::CancellationToken::new() };
+        let ctx = ToolContext {
+            task_id: "t".into(),
+            step_id: "s".into(),
+            workspace: policy.workspace().to_path_buf(),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        };
         (r, d, ctx)
     }
 

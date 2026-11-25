@@ -12,7 +12,7 @@ mod inmem;
 mod pg;
 
 pub use context::*;
-pub use embed::{cosine, HashEmbedder};
+pub use embed::{HashEmbedder, cosine};
 pub use inmem::InMemoryStore;
 pub use pg::PgStore;
 

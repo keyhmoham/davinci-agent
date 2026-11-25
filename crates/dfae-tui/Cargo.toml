@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "dfae"
+path = "src/main.rs"
+
 [dependencies]
 dfae-core = { workspace = true }
 tokio = { workspace = true }
@@ -14,4 +18,4 @@ anyhow = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
 ratatui = { workspace = true }
-crossterm = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }

@@ -73,8 +73,8 @@ impl Default for ShellPolicy {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         Self {
             allowed: v(&[
-                "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami",
-                "hostname", "stat", "du", "sort", "uniq", "diff", "cut", "tr", "basename", "dirname", "nproc", "id",
+                "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami", "hostname", "stat",
+                "du", "sort", "uniq", "diff", "cut", "tr", "basename", "dirname", "nproc", "id",
             ]),
             approval: v(&["mkdir", "touch", "cp", "mv"]),
             path_checked: v(&["cat", "head", "tail", "wc", "grep", "find", "ls", "stat", "du", "sort", "uniq", "diff", "cut", "tr"]),
@@ -90,8 +90,19 @@ impl Default for NetworkPolicy {
         let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         Self {
             allowed_domains: v(&[
-                "example.com", "example.org", "*.wikipedia.org", "github.com", "*.github.com", "raw.githubusercontent.com", "docs.rs",
-                "crates.io", "nvd.nist.gov", "*.postgresql.org", "httpbin.org", "*.python.org", "*.rust-lang.org",
+                "example.com",
+                "example.org",
+                "*.wikipedia.org",
+                "github.com",
+                "*.github.com",
+                "raw.githubusercontent.com",
+                "docs.rs",
+                "crates.io",
+                "nvd.nist.gov",
+                "*.postgresql.org",
+                "httpbin.org",
+                "*.python.org",
+                "*.rust-lang.org",
             ]),
             unlisted_requires_approval: true,
             max_response_bytes: 256 * 1024,
@@ -223,11 +234,7 @@ impl PolicyEngine {
                 }
             }
         }
-        if needs_approval {
-            PolicyDecision::RequireApproval(format!("'{bin}' modifies the filesystem"))
-        } else {
-            PolicyDecision::Allow
-        }
+        if needs_approval { PolicyDecision::RequireApproval(format!("'{bin}' modifies the filesystem")) } else { PolicyDecision::Allow }
     }
 
     fn check_url(&self, url: &str) -> PolicyDecision {
@@ -241,14 +248,20 @@ impl PolicyEngine {
         if authority.contains('@') {
             return PolicyDecision::Deny("credentials in URLs are not permitted".into());
         }
-        let host = authority.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map(|(h, _)| h).unwrap_or(authority).trim_matches(['[', ']']).to_lowercase();
+        let host = authority
+            .rsplit_once(':')
+            .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()))
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
+            .trim_matches(['[', ']'])
+            .to_lowercase();
         if host.is_empty() {
             return PolicyDecision::Deny("URL has no host".into());
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            if is_private_ip(&ip) {
-                return PolicyDecision::Deny("requests to private or loopback addresses are blocked".into());
-            }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>()
+            && is_private_ip(&ip)
+        {
+            return PolicyDecision::Deny("requests to private or loopback addresses are blocked".into());
         }
         if host == "localhost" || host.ends_with(".local") || host.ends_with(".internal") {
             return PolicyDecision::Deny("requests to local hosts are blocked".into());
@@ -279,7 +292,13 @@ pub fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     use std::net::IpAddr::*;
     match ip {
         V4(v) => {
-            v.is_private() || v.is_loopback() || v.is_link_local() || v.is_unspecified() || v.is_broadcast() || v.octets()[0] == 0 || (v.octets()[0] == 100 && (64..128).contains(&v.octets()[1]))
+            v.is_private()
+                || v.is_loopback()
+                || v.is_link_local()
+                || v.is_unspecified()
+                || v.is_broadcast()
+                || v.octets()[0] == 0
+                || (v.octets()[0] == 100 && (64..128).contains(&v.octets()[1]))
         }
         V6(v) => {
             v.is_loopback()
@@ -329,10 +348,10 @@ impl PathGuard {
             return Err(ToolError::policy(format!("{what} access outside the allowed roots: {raw}")));
         }
         for c in real.components() {
-            if let Component::Normal(n) = c {
-                if self.deny_names.iter().any(|d| n.to_string_lossy() == d.as_str()) {
-                    return Err(ToolError::policy(format!("access to '{}' is not permitted", n.to_string_lossy())));
-                }
+            if let Component::Normal(n) = c
+                && self.deny_names.iter().any(|d| n.to_string_lossy() == d.as_str())
+            {
+                return Err(ToolError::policy(format!("access to '{}' is not permitted", n.to_string_lossy())));
             }
         }
         Ok(real)
@@ -373,6 +392,20 @@ mod tests {
             keywords: vec![],
             direct_patterns: vec![],
         }
+    }
+
+    #[test]
+    fn shipped_policy_file_parses_and_matches_the_defaults() {
+        let shipped = PolicyConfig::from_toml(include_str!("../../../config/policy.toml")).expect("config/policy.toml must parse");
+        assert_eq!(serde_json::to_value(&shipped).unwrap(), serde_json::to_value(PolicyConfig::default()).unwrap());
+    }
+
+    #[test]
+    fn partial_policy_files_fall_back_to_safe_defaults() {
+        let p = PolicyConfig::from_toml("[network]\nunlisted_requires_approval = false\n").unwrap();
+        assert!(!p.network.unlisted_requires_approval);
+        assert!(p.filesystem.write_requires_approval, "unspecified sections keep their defaults");
+        assert!(PolicyConfig::from_toml("[filesystem\n").is_err());
     }
 
     #[test]

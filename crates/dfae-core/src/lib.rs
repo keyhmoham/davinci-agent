@@ -51,10 +51,7 @@ pub fn canonical_json(v: &serde_json::Value) -> String {
         Value::Object(m) => {
             let mut keys: Vec<_> = m.keys().collect();
             keys.sort();
-            let parts: Vec<String> = keys
-                .into_iter()
-                .map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(&m[k])))
-                .collect();
+            let parts: Vec<String> = keys.into_iter().map(|k| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical_json(&m[k]))).collect();
             format!("{{{}}}", parts.join(","))
         }
         Value::Array(a) => format!("[{}]", a.iter().map(canonical_json).collect::<Vec<_>>().join(",")),

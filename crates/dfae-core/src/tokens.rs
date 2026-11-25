@@ -12,7 +12,7 @@ pub fn estimate_tokens(s: &str) -> usize {
     let chars = s.chars().count();
     let words = s.split_whitespace().count();
     // ~4 chars per token for prose; ~1.33 tokens per word as a floor.
-    ((chars + 3) / 4).max((words * 4 + 2) / 3)
+    chars.div_ceil(4).max((words * 4).div_ceil(3))
 }
 
 /// Truncate `s` so that it fits in roughly `max_tokens` tokens.

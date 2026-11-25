@@ -16,7 +16,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.dependencies]
 dfae-core = { path = "crates/dfae-core" }
@@ -44,7 +44,7 @@ regex = "1"
 sha2 = "0.10"
 hex = "0.4"
 parking_lot = "0.12"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "query"] }
 axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.7", features = ["cors", "trace"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }

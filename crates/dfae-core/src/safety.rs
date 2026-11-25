@@ -40,11 +40,7 @@ static INJECTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(
 
 /// Returns the names of injection heuristics matched by (untrusted) `s`.
 pub fn scan_injection(s: &str) -> Vec<&'static str> {
-    let mut hits: Vec<&'static str> = INJECTION_PATTERNS
-        .iter()
-        .filter(|(re, _)| re.is_match(s))
-        .map(|(_, n)| *n)
-        .collect();
+    let mut hits: Vec<&'static str> = INJECTION_PATTERNS.iter().filter(|(re, _)| re.is_match(s)).map(|(_, n)| *n).collect();
     hits.sort();
     hits.dedup();
     hits

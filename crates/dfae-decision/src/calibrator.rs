@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// Beta-style calibration of decision confidence from verified outcomes.

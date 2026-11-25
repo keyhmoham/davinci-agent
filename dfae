@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Convenience launcher for the Docker stack.
+#
+#   ./dfae              start the stack (if needed) and open the TUI
+#   ./dfae up           start the stack in the background
+#   ./dfae ask "..."    run one request and print the answer
+#   ./dfae logs [svc]   follow logs (default: dfae)
+#   ./dfae status       component health
+#   ./dfae down         stop the stack (data is kept)
+#   ./dfae reset        stop the stack and DELETE all data and downloaded models
+set -euo pipefail
+cd "$(dirname "$0")"
+compose() { docker compose "$@"; }
+
+case "${1:-tui}" in
+  up)     compose up -d --build ;;
+  tui)    compose up -d --build; exec docker compose run --rm tui ;;
+  ask)    shift; compose up -d --build dfae >/dev/null; exec docker compose run --rm -T tui --ask "$*" ;;
+  logs)   shift; exec docker compose logs -f "${1:-dfae}" ;;
+  status) compose ps; docker compose exec -T dfae sh -c 'true' 2>/dev/null; curl -fsS "http://127.0.0.1:${DFAE_PORT:-8080}/v1/health" ${DFAE_API_TOKEN:+-H "Authorization: Bearer $DFAE_API_TOKEN"} || true; echo ;;
+  down)   compose down ;;
+  reset)  read -r -p "This deletes the database, workspace and downloaded models. Continue? [y/N] " a; [[ "$a" == y ]] && compose down -v ;;
+  *)      sed -n '2,10p' "$0"; exit 2 ;;
+esac

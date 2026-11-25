@@ -1,0 +1,124 @@
+# Decision-First Agentic Engine — full stack.
+#
+#   docker compose up -d --build     start everything (first run downloads models)
+#   docker compose run --rm tui      open the terminal UI
+#   ./dfae                           both of the above
+#
+# Everything optional degrades gracefully: without the GLiNER model the engine
+# extracts with rules; without a Jev key it decides with local rules; without
+# the SLM it still runs every request that can be bound deterministically.
+
+name: dfae
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dfae
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dfae}
+      POSTGRES_DB: dfae
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dfae -d dfae"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Entity extraction (GLiNER). The model downloads on first start.
+  gliner:
+    build: ./services/gliner-service
+    restart: unless-stopped
+    environment:
+      GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_small-v2.1}
+    volumes:
+      - hf-models:/models
+
+  # Small language model server (OpenAI-compatible API).
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # One-shot: pull the SLM into the ollama volume.
+  ollama-pull:
+    image: ollama/ollama:latest
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      SLM_MODEL: ${SLM_MODEL:-qwen2.5:3b}
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"$$SLM_MODEL\""]
+
+  # The engine: runtime + HTTP/SSE API.
+  dfae:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      target: server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://dfae:${POSTGRES_PASSWORD:-dfae}@postgres:5432/dfae
+      GLINER_URL: http://gliner:8000
+      # decision model (Jev via AI/ML API). Empty => built-in local decision rules.
+      JEV_API_KEY: ${JEV_API_KEY:-}
+      JEV_MODEL: ${JEV_MODEL:-typesafe/jev-1.14}
+      # small language model
+      SLM_PROVIDER: openai
+      SLM_BASE_URL: http://ollama:11434/v1
+      SLM_MODEL: ${SLM_MODEL:-qwen2.5:3b}
+      # optional stronger model for escalation (anthropic | openai)
+      STRONG_PROVIDER: ${STRONG_PROVIDER:-}
+      STRONG_API_KEY: ${STRONG_API_KEY:-}
+      STRONG_MODEL: ${STRONG_MODEL:-claude-sonnet-5-5}
+      STRONG_BASE_URL: ${STRONG_BASE_URL:-https://api.anthropic.com}
+      DFAE_API_TOKEN: ${DFAE_API_TOKEN:-}
+      DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
+      RUST_LOG: ${RUST_LOG:-info,tower_http=warn}
+    volumes:
+      - workspace:/workspace
+    # Published on loopback only: the API can run tools. Set DFAE_API_TOKEN
+    # before exposing it any further.
+    ports:
+      - "127.0.0.1:${DFAE_PORT:-8080}:8080"
+    # tools run inside this container as an unprivileged user
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  # Terminal UI. Not started by `up`; run it with `docker compose run --rm tui`.
+  tui:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      target: tui
+    profiles: ["tui"]
+    depends_on:
+      dfae:
+        condition: service_healthy
+    environment:
+      DFAE_URL: http://dfae:8080
+      DFAE_API_TOKEN: ${DFAE_API_TOKEN:-}
+    stdin_open: true
+    tty: true
+
+volumes:
+  pgdata:
+  ollama:
+  hf-models:
+  workspace:

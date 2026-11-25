@@ -1,0 +1,7 @@
+target
+.git
+.env
+workspace-data
+**/__pycache__
+services/gliner-service/tests
+*.log

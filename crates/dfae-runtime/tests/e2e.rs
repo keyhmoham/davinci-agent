@@ -1,3 +1,4 @@
+#![allow(clippy::field_reassign_with_default)]
 //! End-to-end tests of the whole pipeline with the in-memory store, the rule
 //! extractor, the local decision engine and *scripted* language models.
 
@@ -8,9 +9,9 @@ use dfae_extract::HybridExtractor;
 use dfae_memory::InMemoryStore;
 use dfae_models::{ModelGateway, ScriptedModel};
 use dfae_runtime::{Engine, EngineDeps};
-use dfae_tools::{register_native, PolicyConfig, PolicyEngine, ToolRegistry};
+use dfae_tools::{PolicyConfig, PolicyEngine, ToolRegistry, register_native};
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,7 +65,11 @@ fn plan_json(v: Value) -> String {
 }
 
 fn step<'a>(t: &'a TaskRecord, id: &str) -> &'a Step {
-    t.plan.as_ref().unwrap().step(id).unwrap_or_else(|| panic!("no step {id}: {:?}", t.plan.as_ref().map(|p| p.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>())))
+    t.plan
+        .as_ref()
+        .unwrap()
+        .step(id)
+        .unwrap_or_else(|| panic!("no step {id}: {:?}", t.plan.as_ref().map(|p| p.steps.iter().map(|s| s.id.clone()).collect::<Vec<_>>())))
 }
 
 #[tokio::test]
@@ -159,11 +164,11 @@ async fn approval_gates_writes_and_verifies_by_reading_back() {
     // wait for the approval request
     let mut approval = None;
     for _ in 0..200 {
-        if let Some(t) = r.engine.get_task(&id).await {
-            if let Some(a) = t.approvals.first() {
-                approval = Some((a.id.clone(), t.status));
-                break;
-            }
+        if let Some(t) = r.engine.get_task(&id).await
+            && let Some(a) = t.approvals.first()
+        {
+            approval = Some((a.id.clone(), t.status));
+            break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -441,4 +446,3 @@ async fn stats_report_savings_across_tasks() {
     assert_eq!(s.totals.generative_tokens, 0);
     assert!(s.totals.saved_pct > 90.0);
 }
-

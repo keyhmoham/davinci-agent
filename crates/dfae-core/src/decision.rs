@@ -72,10 +72,7 @@ impl Question {
         Question::Noul { instructions: instructions.into(), criteria: None }
     }
     pub fn choice<const N: usize>(instructions: impl Into<String>, options: [(&str, &str); N]) -> Self {
-        Question::Choice {
-            instructions: instructions.into(),
-            criteria: options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-        }
+        Question::Choice { instructions: instructions.into(), criteria: options.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect() }
     }
     pub fn score<const N: usize>(instructions: impl Into<String>, levels: [&str; N]) -> Self {
         Question::Score { instructions: instructions.into(), criteria: levels.iter().map(|s| s.to_string()).collect() }

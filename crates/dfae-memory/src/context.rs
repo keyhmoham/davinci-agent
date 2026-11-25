@@ -200,10 +200,15 @@ mod tests {
     fn budget_is_respected_and_goal_survives() {
         let ents = vec![ent("software", "Redis"), ent("constraint", "do not restart until Friday")];
         let mems: Vec<RankedMemory> = (0..8)
-            .map(|i| RankedMemory { item: MemoryItem::new(MemoryKind::Semantic, format!("memory number {i} {}", "filler ".repeat(40)), 0.5), similarity: 0.5, score: 0.5 })
+            .map(|i| RankedMemory {
+                item: MemoryItem::new(MemoryKind::Semantic, format!("memory number {i} {}", "filler ".repeat(40)), 0.5),
+                similarity: 0.5,
+                score: 0.5,
+            })
             .collect();
         let obs = vec![("s1 fs_list".to_string(), "x ".repeat(2000))];
-        let input = ContextInput { goal: "deploy redis", entities: &ents, memories: &mems, prior_turns: &[], observations: &obs, profile: ContextProfile::Minimal };
+        let input =
+            ContextInput { goal: "deploy redis", entities: &ents, memories: &mems, prior_turns: &[], observations: &obs, profile: ContextProfile::Minimal };
         let pkg = build_context(&input);
         assert!(pkg.total_tokens <= ContextProfile::Minimal.token_budget());
         let r = pkg.render();

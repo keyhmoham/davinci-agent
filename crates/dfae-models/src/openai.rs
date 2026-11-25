@@ -1,7 +1,7 @@
 use crate::is_retryable;
 use async_trait::async_trait;
 use dfae_core::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 pub struct OpenAiCompat {

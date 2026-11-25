@@ -164,7 +164,5 @@ pub trait Tool: Send + Sync {
 
 /// Convenience for tools: pull a typed argument.
 pub fn arg_str<'a>(v: &'a Value, k: &str) -> Result<&'a str, ToolError> {
-    v.get(k)
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| ToolError::new(ErrorKind::InvalidArgs, format!("missing string argument '{k}'")))
+    v.get(k).and_then(|x| x.as_str()).ok_or_else(|| ToolError::new(ErrorKind::InvalidArgs, format!("missing string argument '{k}'")))
 }

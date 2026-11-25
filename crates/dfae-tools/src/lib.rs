@@ -12,7 +12,7 @@ mod policy;
 mod registry;
 mod sandbox;
 
-pub use binder::{bind_direct, DirectCall};
+pub use binder::{DirectCall, bind_direct};
 pub use calc::{evaluate as evaluate_expression, format_number};
 pub use native::register_native;
 pub use policy::{PathGuard, PolicyConfig, PolicyDecision, PolicyEngine};

@@ -21,6 +21,11 @@ pub fn normalize_entities(mut es: Vec<Entity>) -> Vec<Entity> {
 }
 
 fn overlaps(a: &Entity, b: &Entity) -> bool {
+    // a constraint ("don't restart it until Friday") legitimately wraps other
+    // entities; it must never be displaced by what it contains
+    if a.label == "constraint" || b.label == "constraint" {
+        return false;
+    }
     match (a.start, a.end, b.start, b.end) {
         (Some(a0), Some(a1), Some(b0), Some(b1)) => a0 < b1 && b0 < a1,
         _ => false,
@@ -74,6 +79,14 @@ mod tests {
         let m = merge_entities(sem, vec![]);
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].label, "tool");
+    }
+
+    #[test]
+    fn constraints_may_contain_other_entities() {
+        let rules = vec![e("constraint", "don't restart it until Friday", 10, 39, 0.75), e("deadline", "Friday", 33, 39, 0.8)];
+        let m = merge_entities(vec![], rules);
+        assert_eq!(m.len(), 2);
+        assert!(m.iter().any(|x| x.label == "constraint"));
     }
 
     #[test]

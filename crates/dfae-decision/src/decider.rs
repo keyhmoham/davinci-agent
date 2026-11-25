@@ -1,10 +1,10 @@
+use crate::LocalDecider;
 use crate::calibrator::Calibrator;
 use crate::questions::*;
-use crate::LocalDecider;
 use chrono::Utc;
 use dfae_core::*;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -156,12 +156,11 @@ impl Decider {
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let mut picked: Vec<(String, f32)> =
-            scored.iter().filter(|(_, p)| *p >= self.thresholds.tool_min_relevance).take(6).cloned().collect();
-        if picked.is_empty() {
-            if let Some(top) = scored.first().filter(|(_, p)| *p >= 0.3) {
-                picked.push(top.clone());
-            }
+        let mut picked: Vec<(String, f32)> = scored.iter().filter(|(_, p)| *p >= self.thresholds.tool_min_relevance).take(6).cloned().collect();
+        if picked.is_empty()
+            && let Some(top) = scored.first().filter(|(_, p)| *p >= 0.3)
+        {
+            picked.push(top.clone());
         }
         Decided { value: picked, record, entry }
     }
@@ -181,7 +180,11 @@ impl Decider {
             "escalated" => ExecMode::Escalated,
             _ => ExecMode::Assisted,
         };
-        let mut reason = format!("{} ({:.2} calibrated)", raw, conf);
+        let mut reason = match mode {
+            ExecMode::Direct => format!("deterministic tool binding · decision confidence {conf:.2}"),
+            ExecMode::Assisted => format!("needs planning or reasoning by the SLM · decision confidence {conf:.2}"),
+            ExecMode::Escalated => format!("complex or high-stakes · decision confidence {conf:.2}"),
+        };
 
         // user override first
         match requested {
@@ -200,7 +203,13 @@ impl Decider {
             ModeRequest::Auto => {}
         }
         if mode == ExecMode::Direct && !facts.direct_bindable {
-            mode = if facts.slm_available { ExecMode::Assisted } else if facts.strong_available { ExecMode::Escalated } else { ExecMode::Assisted };
+            mode = if facts.slm_available {
+                ExecMode::Assisted
+            } else if facts.strong_available {
+                ExecMode::Escalated
+            } else {
+                ExecMode::Assisted
+            };
             reason = "no deterministic binding for this request".into();
         } else if mode == ExecMode::Direct && requested == ModeRequest::Auto && conf < self.thresholds.direct_min_confidence && facts.slm_available {
             mode = ExecMode::Assisted;

@@ -82,11 +82,7 @@ impl Ledger {
         s.generative_tokens = s.slm_tokens + s.strong_tokens;
         s.baseline_tokens = self.baseline_tokens;
         s.saved_tokens = s.baseline_tokens.saturating_sub(s.generative_tokens);
-        s.saved_pct = if s.baseline_tokens > 0 {
-            100.0 * s.saved_tokens as f32 / s.baseline_tokens as f32
-        } else {
-            0.0
-        };
+        s.saved_pct = if s.baseline_tokens > 0 { 100.0 * s.saved_tokens as f32 / s.baseline_tokens as f32 } else { 0.0 };
         s
     }
 }
@@ -94,13 +90,7 @@ impl Ledger {
 /// Estimate of the naive baseline: a monolithic agent that re-sends the system
 /// prompt, *every* tool schema, the goal and the entire raw history at each of
 /// `n_calls` model invocations (one per tool step plus the final answer).
-pub fn naive_baseline_tokens(
-    system_tokens: u64,
-    all_tool_schema_tokens: u64,
-    goal_tokens: u64,
-    raw_step_tokens: &[u64],
-    final_answer_tokens: u64,
-) -> u64 {
+pub fn naive_baseline_tokens(system_tokens: u64, all_tool_schema_tokens: u64, goal_tokens: u64, raw_step_tokens: &[u64], final_answer_tokens: u64) -> u64 {
     let calls = raw_step_tokens.len() as u64 + 1;
     let mut total = 0u64;
     let mut history = 0u64;
@@ -128,8 +118,7 @@ mod tests {
 
     #[test]
     fn summary_counts() {
-        let mut l = Ledger::default();
-        l.baseline_tokens = 1000;
+        let mut l = Ledger { baseline_tokens: 1000, ..Default::default() };
         l.record(LedgerEntry {
             ts: Utc::now(),
             component: Component::Slm,

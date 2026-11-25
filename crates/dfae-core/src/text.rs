@@ -4,12 +4,10 @@
 use std::collections::{HashMap, HashSet};
 
 const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "but", "if", "then", "else", "of", "to", "in", "on", "at", "for", "from",
-    "by", "with", "about", "as", "is", "are", "was", "were", "be", "been", "being", "it", "its", "this",
-    "that", "these", "those", "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "them",
-    "do", "does", "did", "can", "could", "would", "should", "will", "shall", "may", "might", "please",
-    "so", "than", "too", "very", "just", "also", "into", "out", "up", "down", "over", "any", "all", "some",
-    "what", "which", "who", "whom", "how", "when", "where", "why", "there", "here", "need", "want", "like",
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "of", "to", "in", "on", "at", "for", "from", "by", "with", "about", "as", "is", "are", "was",
+    "were", "be", "been", "being", "it", "its", "this", "that", "these", "those", "i", "me", "my", "we", "our", "you", "your", "he", "she", "they", "them",
+    "do", "does", "did", "can", "could", "would", "should", "will", "shall", "may", "might", "please", "so", "than", "too", "very", "just", "also", "into",
+    "out", "up", "down", "over", "any", "all", "some", "what", "which", "who", "whom", "how", "when", "where", "why", "there", "here", "need", "want", "like",
 ];
 
 pub fn is_stopword(w: &str) -> bool {
@@ -44,36 +42,32 @@ pub fn stem(w: &str) -> String {
     if let Some(p) = w.strip_suffix("ies") {
         return format!("{p}y");
     }
-    if n > 5 {
-        if let Some(p) = w.strip_suffix("ing") {
-            return p.to_string();
-        }
+    if n > 5
+        && let Some(p) = w.strip_suffix("ing")
+    {
+        return p.to_string();
     }
     if n > 4 {
         if let Some(p) = w.strip_suffix("ed") {
             return p.to_string();
         }
-        if let Some(p) = w.strip_suffix("es") {
-            if p.ends_with(['s', 'x', 'z']) || p.ends_with("ch") || p.ends_with("sh") {
-                return p.to_string();
-            }
-        }
-    }
-    if let Some(p) = w.strip_suffix('s') {
-        if !p.ends_with('s') {
+        if let Some(p) = w.strip_suffix("es")
+            && (p.ends_with(['s', 'x', 'z']) || p.ends_with("ch") || p.ends_with("sh"))
+        {
             return p.to_string();
         }
+    }
+    if let Some(p) = w.strip_suffix('s')
+        && !p.ends_with('s')
+    {
+        return p.to_string();
     }
     w.to_string()
 }
 
 /// Tokens with stopwords removed and stems applied.
 pub fn content_tokens(s: &str) -> Vec<String> {
-    tokenize(s)
-        .into_iter()
-        .filter(|t| !is_stopword(t))
-        .map(|t| stem(&t))
-        .collect()
+    tokenize(s).into_iter().filter(|t| !is_stopword(t)).map(|t| stem(&t)).collect()
 }
 
 /// BM25-style scores of `query` against each document, normalised to ~[0, 1].
@@ -110,11 +104,7 @@ pub fn bm25_scores(query: &str, docs: &[String]) -> Vec<f32> {
                 .iter()
                 .map(|t| {
                     let f = *tf.get(t.as_str()).unwrap_or(&0.0);
-                    if f == 0.0 {
-                        0.0
-                    } else {
-                        idf(t) * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / avgdl))
-                    }
+                    if f == 0.0 { 0.0 } else { idf(t) * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / avgdl)) }
                 })
                 .sum();
             (s / max_possible).clamp(0.0, 1.0)
@@ -146,10 +136,7 @@ mod tests {
 
     #[test]
     fn bm25_prefers_relevant_doc() {
-        let docs = vec![
-            "list directory entries files folder".to_string(),
-            "evaluate arithmetic expression calculate".to_string(),
-        ];
+        let docs = vec!["list directory entries files folder".to_string(), "evaluate arithmetic expression calculate".to_string()];
         let s = bm25_scores("show me the files in this folder", &docs);
         assert!(s[0] > s[1]);
         let s = bm25_scores("calculate 3 + 4", &docs);

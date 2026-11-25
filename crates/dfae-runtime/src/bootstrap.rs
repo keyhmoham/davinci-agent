@@ -5,8 +5,8 @@ use dfae_core::*;
 use dfae_decision::{Calibrator, Decider, JevProvider};
 use dfae_extract::{GlinerClient, HybridExtractor};
 use dfae_memory::{InMemoryStore, PgStore};
-use dfae_models::{build_model, ModelGateway};
-use dfae_tools::{register_native, PolicyConfig, PolicyEngine, ToolRegistry};
+use dfae_models::{ModelGateway, build_model};
+use dfae_tools::{PolicyConfig, PolicyEngine, ToolRegistry, register_native};
 use std::sync::Arc;
 
 pub async fn build_engine(config: Config) -> Result<Engine, String> {
@@ -20,7 +20,8 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     };
     // policy
     let policy_cfg = match &config.policy_path {
-        Some(p) => PolicyConfig::from_toml(&std::fs::read_to_string(p).map_err(|e| format!("reading policy {}: {e}", p.display()))?).map_err(|e| format!("invalid policy file: {e}"))?,
+        Some(p) => PolicyConfig::from_toml(&std::fs::read_to_string(p).map_err(|e| format!("reading policy {}: {e}", p.display()))?)
+            .map_err(|e| format!("invalid policy file: {e}"))?,
         None => PolicyConfig::default(),
     };
     let policy = Arc::new(PolicyEngine::new(policy_cfg, config.workspace.clone()));

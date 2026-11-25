@@ -98,6 +98,22 @@ pub trait EntityExtractor: Send + Sync {
 
 /// Default label set (task-specific sets are chosen by the runtime).
 pub const DEFAULT_LABELS: &[&str] = &[
-    "person", "organization", "software", "repository", "server", "database", "api", "tool", "file path",
-    "url", "version", "environment", "location", "deadline", "constraint", "action", "document", "risk",
+    "person",
+    "organization",
+    "software",
+    "repository",
+    "server",
+    "database",
+    "api",
+    "tool",
+    "file path",
+    "url",
+    "version",
+    "environment",
+    "location",
+    "deadline",
+    "constraint",
+    "action",
+    "document",
+    "risk",
 ];

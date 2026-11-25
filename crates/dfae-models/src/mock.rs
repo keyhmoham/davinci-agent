@@ -15,11 +15,7 @@ pub struct ScriptedModel {
 
 impl ScriptedModel {
     pub fn new(name: &str, responses: Vec<&str>) -> Self {
-        Self {
-            responses: Arc::new(Mutex::new(responses.into_iter().map(|s| Ok(s.to_string())).collect())),
-            requests: Arc::default(),
-            name: name.into(),
-        }
+        Self { responses: Arc::new(Mutex::new(responses.into_iter().map(|s| Ok(s.to_string())).collect())), requests: Arc::default(), name: name.into() }
     }
     pub fn push(&self, r: &str) {
         self.responses.lock().push_back(Ok(r.to_string()));
@@ -61,9 +57,7 @@ impl LanguageModel for OfflineStub {
     async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, ModelError> {
         let user = req.messages.last().map(|m| m.content.clone()).unwrap_or_default();
         let text = match req.purpose.as_str() {
-            p if p.starts_with("plan") || p == "replan" => {
-                r#"{"steps":[{"id":"s1","do":"Answer the request from the context","tool":null}]}"#.to_string()
-            }
+            p if p.starts_with("plan") || p == "replan" => r#"{"steps":[{"id":"s1","do":"Answer the request from the context","tool":null}]}"#.to_string(),
             "answer" => {
                 let ev = user.split("EVIDENCE:").nth(1).unwrap_or(&user).trim();
                 format!("[offline stub] {}", ev.chars().take(600).collect::<String>())

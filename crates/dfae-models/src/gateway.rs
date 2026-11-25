@@ -112,10 +112,10 @@ impl ModelGateway {
 /// code fences and surrounding prose).
 pub fn extract_json(text: &str) -> Option<Value> {
     let t = text.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(t) {
-        if v.is_object() {
-            return Some(v);
-        }
+    if let Ok(v) = serde_json::from_str::<Value>(t)
+        && v.is_object()
+    {
+        return Some(v);
     }
     let bytes: Vec<char> = t.chars().collect();
     let mut i = 0;

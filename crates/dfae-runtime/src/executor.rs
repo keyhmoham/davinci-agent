@@ -8,12 +8,12 @@ use chrono::Utc;
 use dfae_core::*;
 use dfae_models::Tier;
 use futures_util::FutureExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinSet;
 
 pub(crate) struct StepFailure {
@@ -78,7 +78,18 @@ impl Inner {
                 ready
             };
             for (id, tool) in blocked_ids {
-                self.emit(ctx, EventKind::StepUpdate { step_id: id, status: StepStatus::Cancelled, tool, summary: None, error: Some("blocked by a failed dependency".into()), attempts: 0 }).await;
+                self.emit(
+                    ctx,
+                    EventKind::StepUpdate {
+                        step_id: id,
+                        status: StepStatus::Cancelled,
+                        tool,
+                        summary: None,
+                        error: Some("blocked by a failed dependency".into()),
+                        attempts: 0,
+                    },
+                )
+                .await;
             }
             if ready.is_empty() {
                 break;
@@ -91,7 +102,10 @@ impl Inner {
                 let (inner, ctx2, sem2) = (self.clone(), ctx.clone(), sem.clone());
                 set.spawn(async move {
                     let _permit = sem2.acquire().await;
-                    let r = AssertUnwindSafe(inner.run_step(&ctx2, &id)).catch_unwind().await.unwrap_or_else(|_| Err(StepFailure::new(ErrorKind::Other, "internal error while running step")));
+                    let r = AssertUnwindSafe(inner.run_step(&ctx2, &id))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err(StepFailure::new(ErrorKind::Other, "internal error while running step")));
                     (id, r)
                 });
             }
@@ -145,7 +159,18 @@ impl Inner {
             s.error = None;
             (s.clone(), mode, tainted, deps)
         };
-        self.emit(ctx, EventKind::StepUpdate { step_id: id.into(), status: StepStatus::Running, tool: step.tool.clone(), summary: None, error: None, attempts: step.attempts }).await;
+        self.emit(
+            ctx,
+            EventKind::StepUpdate {
+                step_id: id.into(),
+                status: StepStatus::Running,
+                tool: step.tool.clone(),
+                summary: None,
+                error: None,
+                attempts: step.attempts,
+            },
+        )
+        .await;
 
         let result = match step.kind {
             StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps).await,
@@ -162,7 +187,16 @@ impl Inner {
                     {
                         ctx.rec.lock().await.tainted = true;
                     }
-                    self.emit(ctx, EventKind::Warning { message: format!("step {id}: tool output looks like a prompt injection ({}); side-effecting steps now require approval", hits.join(", ")) }).await;
+                    self.emit(
+                        ctx,
+                        EventKind::Warning {
+                            message: format!(
+                                "step {id}: tool output looks like a prompt injection ({}); side-effecting steps now require approval",
+                                hits.join(", ")
+                            ),
+                        },
+                    )
+                    .await;
                 }
                 {
                     let mut r = ctx.rec.lock().await;
@@ -174,7 +208,18 @@ impl Inner {
                         s.finished_at = Some(Utc::now());
                     }
                 }
-                self.emit(ctx, EventKind::StepUpdate { step_id: id.into(), status: StepStatus::Succeeded, tool: step.tool.clone(), summary: Some(tokens::truncate_tokens(&summary, 40)), error: None, attempts: step.attempts }).await;
+                self.emit(
+                    ctx,
+                    EventKind::StepUpdate {
+                        step_id: id.into(),
+                        status: StepStatus::Succeeded,
+                        tool: step.tool.clone(),
+                        summary: Some(tokens::truncate_tokens(&summary, 40)),
+                        error: None,
+                        attempts: step.attempts,
+                    },
+                )
+                .await;
                 Ok(())
             }
             Err(f) => {
@@ -186,13 +231,30 @@ impl Inner {
                         s.finished_at = Some(Utc::now());
                     }
                 }
-                self.emit(ctx, EventKind::StepUpdate { step_id: id.into(), status: StepStatus::Failed, tool: step.tool.clone(), summary: None, error: Some(f.message.clone()), attempts: step.attempts }).await;
+                self.emit(
+                    ctx,
+                    EventKind::StepUpdate {
+                        step_id: id.into(),
+                        status: StepStatus::Failed,
+                        tool: step.tool.clone(),
+                        summary: None,
+                        error: Some(f.message.clone()),
+                        attempts: step.attempts,
+                    },
+                )
+                .await;
                 Err(f)
             }
         }
     }
 
-    async fn run_reasoning(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, mode: ExecMode, deps: &[(String, Option<String>, String, String)]) -> Result<StepOutput, StepFailure> {
+    async fn run_reasoning(
+        self: &Arc<Self>,
+        ctx: &Arc<TaskCtx>,
+        step: &Step,
+        mode: ExecMode,
+        deps: &[(String, Option<String>, String, String)],
+    ) -> Result<StepOutput, StepFailure> {
         let tier = self.pick_tier(mode).ok_or_else(|| StepFailure::new(ErrorKind::Policy, "no language model is configured for reasoning steps"))?;
         let ctx_text = self.context_text(ctx, false).await;
         let inputs: String = deps
@@ -212,7 +274,13 @@ impl Inner {
         Ok(StepOutput { content: text, evidence: vec![] })
     }
 
-    async fn run_tool(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, tainted: bool, deps: &[(String, Option<String>, String, String)]) -> Result<StepOutput, StepFailure> {
+    async fn run_tool(
+        self: &Arc<Self>,
+        ctx: &Arc<TaskCtx>,
+        step: &Step,
+        tainted: bool,
+        deps: &[(String, Option<String>, String, String)],
+    ) -> Result<StepOutput, StepFailure> {
         let name = step.tool.clone().unwrap_or_default();
         let meta = self.tools.meta(&name).ok_or_else(|| StepFailure::new(ErrorKind::NotFound, format!("unknown tool '{name}'")))?;
         if !ctx.allowed.lock().iter().any(|a| a == &name) {
@@ -220,7 +288,9 @@ impl Inner {
         }
         // resolve {{sN}} templates against dependency outputs
         let outputs: HashMap<&str, &str> = deps.iter().map(|(id, _, _, out)| (id.as_str(), out.as_str())).collect();
-        let args = planner::substitute(&step.args, &|id| outputs.get(id).map(|o| tokens::compress_text(o, 800).chars().take(4000).collect::<String>().trim().to_string()));
+        let args = planner::substitute(&step.args, &|id| {
+            outputs.get(id).map(|o| tokens::compress_text(o, 800).chars().take(4000).collect::<String>().trim().to_string())
+        });
         meta.validate_args(&args).map_err(|e| StepFailure::new(ErrorKind::InvalidArgs, e))?;
 
         // ---- policy (authoritative, just-in-time, on the final arguments) ----
@@ -240,7 +310,8 @@ impl Inner {
         self.take_tool_call(ctx).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
 
         let tool = self.tools.get(&name).ok_or_else(|| StepFailure::new(ErrorKind::NotFound, "tool vanished"))?;
-        let tctx = ToolContext { task_id: ctx.id.clone(), step_id: step.id.clone(), workspace: self.policy.workspace().to_path_buf(), cancel: ctx.cancel.clone() };
+        let tctx =
+            ToolContext { task_id: ctx.id.clone(), step_id: step.id.clone(), workspace: self.policy.workspace().to_path_buf(), cancel: ctx.cancel.clone() };
         let out = match tokio::time::timeout(Duration::from_secs(120), tool.execute(args.clone(), tctx.clone())).await {
             Ok(r) => r.map_err(StepFailure::from)?,
             Err(_) => return Err(StepFailure::new(ErrorKind::Timeout, "tool timed out after 120s")),
@@ -406,7 +477,13 @@ impl Inner {
                 if tier == Tier::Strong {
                     ctx.rec.lock().await.mode = Some(ExecMode::Escalated);
                 }
-                let problem = format!("step {id} ({} {}) failed with {}: {}", step.tool.as_deref().unwrap_or("reasoning"), tokens::truncate_tokens(&step.args.to_string(), 30), kind_str(f.kind), tokens::truncate_tokens(&f.message, 50));
+                let problem = format!(
+                    "step {id} ({} {}) failed with {}: {}",
+                    step.tool.as_deref().unwrap_or("reasoning"),
+                    tokens::truncate_tokens(&step.args.to_string(), 30),
+                    kind_str(f.kind),
+                    tokens::truncate_tokens(&f.message, 50)
+                );
                 match self.replan(ctx, tier, &goal, &problem, Some(id)).await {
                     Ok(true) => None,
                     Ok(false) => Some(label),
@@ -463,7 +540,8 @@ impl Inner {
                 .filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped))
                 .map(|s| format!("{} {}: {}", s.id, s.tool.as_deref().unwrap_or("reasoning"), tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), 40)))
                 .collect();
-            let kept: Vec<String> = plan.steps.iter().filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped)).map(|s| s.id.clone()).collect();
+            let kept: Vec<String> =
+                plan.steps.iter().filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped)).map(|s| s.id.clone()).collect();
             (done.join("\n"), kept)
         };
         let prefix = format!("r{replans}_");

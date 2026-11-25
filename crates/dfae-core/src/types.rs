@@ -33,10 +33,7 @@ impl TaskStatus {
         }
         match self {
             Created => matches!(next, Running | Cancelled | Failed),
-            Running => matches!(
-                next,
-                WaitingForTool | WaitingForApproval | WaitingForAgent | Recovering | Verifying | Completed | Failed | Cancelled
-            ),
+            Running => matches!(next, WaitingForTool | WaitingForApproval | WaitingForAgent | Recovering | Verifying | Completed | Failed | Cancelled),
             WaitingForTool => matches!(next, Running | WaitingForApproval | Recovering | Verifying | Failed | Cancelled),
             WaitingForApproval => matches!(next, Running | WaitingForTool | Recovering | Failed | Cancelled),
             WaitingForAgent => matches!(next, Running | Failed | Cancelled),
@@ -103,7 +100,7 @@ impl ContextProfile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TaskRequest {
     pub goal: String,
     #[serde(default)]

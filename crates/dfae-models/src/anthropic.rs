@@ -1,7 +1,7 @@
 use crate::is_retryable;
 use async_trait::async_trait;
 use dfae_core::*;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 /// Claude via the Messages API. The system prompt is sent as a cacheable
@@ -28,16 +28,9 @@ impl LanguageModel for AnthropicModel {
     }
 
     async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, ModelError> {
-        let system = if req.json {
-            format!("{}\n\nRespond with a single JSON object and nothing else.", req.system)
-        } else {
-            req.system.clone()
-        };
-        let messages: Vec<Value> = req
-            .messages
-            .iter()
-            .map(|m| json!({"role": match m.role { Role::User => "user", Role::Assistant => "assistant" }, "content": m.content}))
-            .collect();
+        let system = if req.json { format!("{}\n\nRespond with a single JSON object and nothing else.", req.system) } else { req.system.clone() };
+        let messages: Vec<Value> =
+            req.messages.iter().map(|m| json!({"role": match m.role { Role::User => "user", Role::Assistant => "assistant" }, "content": m.content})).collect();
         let body = json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
@@ -74,10 +67,7 @@ impl LanguageModel for AnthropicModel {
                 return Err(ModelError::Request(last));
             }
             let v: Value = resp.json().await.map_err(|e| ModelError::InvalidOutput(e.to_string()))?;
-            let text: String = v["content"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join(""))
-                .unwrap_or_default();
+            let text: String = v["content"].as_array().map(|a| a.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("")).unwrap_or_default();
             let u = &v["usage"];
             let usage = Usage {
                 prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0)
