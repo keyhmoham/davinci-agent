@@ -121,5 +121,6 @@ async fn answers_are_stripped_of_filler_and_chat_is_short() {
     let t = run(&r, "what is a mutex?").await;
     assert_eq!(t.final_answer.as_deref(), Some("A mutex lets one thread in at a time."));
     let req = r.slm.requests.lock()[0].clone();
-    assert!(req.system.contains("Never ask for confirmation") && req.max_tokens <= 400);
+    assert!(req.system.contains("Never ask for confirmation"));
+    assert!(req.max_tokens > 400, "a self-hosted reply is not cut short (only a paid one is capped)");
 }

@@ -61,6 +61,11 @@ impl ToolRegistry {
         names.iter().filter_map(|n| self.meta(n)).map(|m| m.signature()).collect::<Vec<_>>().join("\n")
     }
 
+    /// Signatures with parameter descriptions (for a self-hosted model).
+    pub fn signatures_detailed(&self, names: &[String]) -> String {
+        names.iter().filter_map(|n| self.meta(n)).map(|m| m.signature_detailed()).collect::<Vec<_>>().join("\n")
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }

@@ -363,7 +363,8 @@ async fn no_model_and_no_binding_fails_clearly() {
 
 #[tokio::test]
 async fn model_call_budget_is_enforced() {
-    let r = rig(true, false, vec![], |c| c.budget.max_model_calls = 1);
+    // the self-hosted model is metered by the (generous) local guard, not the paid budget
+    let r = rig(true, false, vec![], |c| c.budget.max_local_calls = 1);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
     r.slm.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
@@ -373,6 +374,34 @@ async fn model_call_budget_is_enforced() {
     assert_eq!(t.status, TaskStatus::Failed);
     assert!(t.error.unwrap().contains("budget"));
     assert_eq!(r.slm.calls(), 1);
+}
+
+#[tokio::test]
+async fn the_paid_budget_meters_the_external_model_and_not_the_local_one() {
+    // a one-call paid budget does not stop a local model from making several calls
+    let r = rig(true, false, vec![], |c| c.budget.max_model_calls = 1);
+    std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
+    r.slm.push(&plan_json(json!({"steps": [
+        {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
+        {"id": "s2", "tool": null, "do": "explain", "after": ["s1"]},
+        {"id": "s3", "tool": null, "do": "also summarise", "after": ["s1"]}]})));
+    r.slm.push("explained");
+    r.slm.push("summarised");
+    r.slm.push("combined");
+    let t = run(&r, "Read a.txt and explain it and summarise it").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert_eq!((t.usage.model_calls, t.usage.local_calls), (0, 4), "plan + 2 steps + answer, all local");
+    // the same plan on the external model is refused up front by the plan gate
+    let r = rig(false, true, vec![], |c| c.budget.max_model_calls = 2);
+    std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
+    r.strong.push(&plan_json(json!({"steps": [
+        {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
+        {"id": "s2", "tool": null, "do": "explain", "after": ["s1"]},
+        {"id": "s3", "tool": null, "do": "also summarise", "after": ["s1"]}]})));
+    let t = run(&r, "Read a.txt and explain it and summarise it").await;
+    assert_eq!(t.status, TaskStatus::Failed);
+    let repair = r.strong.requests.lock()[1].messages.last().unwrap().content.clone();
+    assert!(repair.contains("model calls but only 1 remain"), "the paid budget gates the plan: {repair}");
 }
 
 #[tokio::test]

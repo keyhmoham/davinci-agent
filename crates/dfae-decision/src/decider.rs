@@ -58,9 +58,6 @@ pub struct Decider {
 }
 
 const CACHE_CAP: usize = 512;
-/// A decision model is asked about at most this many tools (the ones the local scorer ranks highest);
-/// the rest keep their local score. Each asked tool is one more model call.
-const MODEL_TOOL_CANDIDATES: usize = 4;
 
 impl Decider {
     pub fn new(primary: Option<Arc<dyn DecisionProvider>>, calibrator: Arc<Calibrator>, thresholds: Thresholds) -> Self {
@@ -172,26 +169,9 @@ impl Decider {
             let (_, record, entry) = self.decide(tools_request(state)).await;
             return Decided { value: vec![], record, entry };
         }
-        let mut req = tools_request(state);
-        // rank by the local scorer; a decision model is asked only about the best few
-        let local_all = self.local.answer(&req);
-        if self.primary.is_some() && self.model_kinds.contains(&DecisionKind::SelectTools) && req.questions.len() > MODEL_TOOL_CANDIDATES {
-            let mut ranked: Vec<(String, f64)> = local_all
-                .iter()
-                .filter_map(|(k, a)| match a {
-                    Answer::Noul { noul } => Some((k.clone(), *noul)),
-                    _ => None,
-                })
-                .collect();
-            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
-            let keep: std::collections::HashSet<String> = ranked.into_iter().take(MODEL_TOOL_CANDIDATES).map(|(k, _)| k).collect();
-            req.questions.retain(|k, _| keep.contains(k));
-        }
-        let (mut r, record, entry) = self.decide(req).await;
-        // tools the model was not asked about keep their local relevance
-        for (k, a) in local_all {
-            r.answers.entry(k).or_insert(a);
-        }
+        // a self-hosted decision model costs nothing per question, so it judges every tool
+        let req = tools_request(state);
+        let (r, record, entry) = self.decide(req).await;
         let mut scored: Vec<(String, f32)> = r
             .answers
             .iter()
@@ -201,7 +181,7 @@ impl Decider {
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let mut picked: Vec<(String, f32)> = scored.iter().filter(|(_, p)| *p >= self.thresholds.tool_min_relevance).take(6).cloned().collect();
+        let mut picked: Vec<(String, f32)> = scored.iter().filter(|(_, p)| *p >= self.thresholds.tool_min_relevance).take(10).cloned().collect();
         if picked.is_empty()
             && let Some(top) = scored.first().filter(|(_, p)| *p >= 0.3)
         {

@@ -157,3 +157,51 @@ async fn a_harmless_tool_the_selector_missed_is_admitted_not_fatal() {
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert_eq!(r.slm.calls(), 2, "plan + step: no repair round was needed");
 }
+
+#[tokio::test]
+async fn create_read_replace_read_changes_the_file_without_any_model() {
+    let r = rig();
+    let t = say(&r, "e2e", r#"create a file named "test.txt" that has this content : "hello world !" "#).await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let t = say(&r, "e2e", "now read that file").await;
+    assert_eq!(t.final_answer.as_deref(), Some("hello world !"));
+    let t = say(&r, "e2e", r#"ok. now replace the word "world" with "keyhan" in that file."#).await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let plan = t.plan.unwrap();
+    assert_eq!((plan.source, plan.steps[0].tool.as_deref()), (PlanSource::Direct, Some("fs_edit")), "{:?}", plan.steps);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("test.txt")).unwrap(), "hello keyhan !");
+    let t = say(&r, "e2e", "read it again").await;
+    assert_eq!(t.final_answer.as_deref(), Some("hello keyhan !"));
+    assert_eq!(r.slm.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_plan_that_only_reads_cannot_pass_for_an_edit() {
+    let r = rig();
+    std::fs::write(r.ws.path().join("test.txt"), "hello world !").unwrap();
+    // a phrasing nothing binds directly; the model first "plans" only a read and a reassuring sentence
+    r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {"path": "test.txt"}}, {"id": "s2", "tool": null, "do": "confirm the replacement", "after": ["s1"]}]}).to_string());
+    r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_edit", "args": {"path": "test.txt", "old_string": "world", "new_string": "keyhan"}}]}).to_string());
+    let t = say(&r, "lazy", "could you swap the word world for keyhan wherever it appears inside test.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("test.txt")).unwrap(), "hello keyhan !", "the file really changed");
+    let repair = r.slm.requests.lock()[1].messages.last().unwrap().content.clone();
+    assert!(repair.contains("no step does it") && repair.contains("fs_edit"), "{repair}");
+}
+
+#[tokio::test]
+async fn a_reply_cannot_claim_a_change_nothing_made() {
+    let r = rig();
+    std::fs::write(r.ws.path().join("test.txt"), "hello world !").unwrap();
+    // both attempts are read-only: the second is accepted (a plan merely less ambitious is still a plan)...
+    let lazy =
+        json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {"path": "test.txt"}}, {"id": "s2", "tool": null, "do": "say it is done", "after": ["s1"]}]})
+            .to_string();
+    r.slm.push(&lazy);
+    r.slm.push(&lazy);
+    r.slm.push("Done, I replaced it.");
+    let t = say(&r, "claim", "could you swap the word world for keyhan wherever it appears inside test.txt").await;
+    // ...but the answer says what happened
+    assert!(t.final_answer.as_deref().unwrap().contains("Nothing was changed"), "{:?}", t.final_answer);
+    assert_eq!(std::fs::read_to_string(r.ws.path().join("test.txt")).unwrap(), "hello world !");
+}

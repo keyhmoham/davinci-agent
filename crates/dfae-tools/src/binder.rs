@@ -79,7 +79,7 @@ fn coerce(p: &ParamSpec, raw: &str) -> Option<Value> {
         ParamType::Integer => raw.parse::<i64>().ok().map(|n| json!(n)),
         ParamType::Number => raw.parse::<f64>().ok().map(|n| json!(n)),
         ParamType::Boolean => match raw.to_lowercase().as_str() {
-            "true" | "yes" => Some(json!(true)),
+            "true" | "yes" | "all" | "every" | "each" => Some(json!(true)),
             "false" | "no" => Some(json!(false)),
             _ => None,
         },
@@ -228,6 +228,22 @@ mod tests {
             (c[0].tool.as_str(), &c[0].args),
             ("fs_edit", &json!({"path": "src/lib.rs", "old_string": "foo()", "new_string": "bar()"})),
             "edit strings are verbatim"
+        );
+        // natural phrasings of the same edit: filler words, bare words, the file first, "all occurrences"
+        let edit = |req: &str| {
+            let c = bind_direct(&metas(), req, &[]).unwrap_or_else(|| panic!("no binding for {req:?}"));
+            assert_eq!(c[0].tool, "fs_edit", "{req}");
+            c[0].args.clone()
+        };
+        assert_eq!(
+            edit(r#"ok. now replace the word "world" with "keyhan" in test.txt."#),
+            json!({"path": "test.txt", "old_string": "world", "new_string": "keyhan"})
+        );
+        assert_eq!(edit("replace world with keyhan in notes/a.md"), json!({"path": "notes/a.md", "old_string": "world", "new_string": "keyhan"}));
+        assert_eq!(edit(r#"in main.py, change "foo" to "bar""#), json!({"path": "main.py", "old_string": "foo", "new_string": "bar"}));
+        assert_eq!(
+            edit(r#"replace all occurrences of "foo" with "bar" in the file src/lib.rs"#),
+            json!({"path": "src/lib.rs", "old_string": "foo", "new_string": "bar", "replace_all": true})
         );
         // vague requests are not guessed: a model plans them
         assert!(bind("delete the old stuff").is_none());

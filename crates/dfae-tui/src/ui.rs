@@ -378,7 +378,7 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     .map(|s| s.tool.clone().unwrap_or_else(|| if s.kind == StepKind::Agent { "agent".into() } else { "reason".into() }))
                     .collect::<Vec<_>>()
                     .join(" → ");
-                let price = plan.estimate.map(|e| format!("  · est. {} model calls ≈ {} tok", e.model_calls, fmt_tokens(e.tokens))).unwrap_or_default();
+                let price = plan.estimate.map(|e| format!("  · est. {} model calls · {}", e.model_calls, price_text(e))).unwrap_or_default();
                 push(
                     badge("plan", ACCENT),
                     format!("{} step{} ({:?}) {route}{price}", plan.steps.len(), if plan.steps.len() == 1 { "" } else { "s" }, plan.source),
@@ -699,7 +699,7 @@ fn draw_plan(f: &mut Frame, area: Rect, app: &App) {
                 "{:?} · rev {}{} · W = parallel wave · Ctrl+↑/↓ select ",
                 plan.source,
                 plan.revision,
-                plan.estimate.map(|e| format!(" · est. {} calls ≈ {} tok", e.model_calls, fmt_tokens(e.tokens))).unwrap_or_default()
+                plan.estimate.map(|e| format!(" · est. {} calls · {}", e.model_calls, price_text(e))).unwrap_or_default()
             ),
             Style::new().fg(DIM),
         ),
@@ -765,8 +765,15 @@ fn draw_cognition(f: &mut Frame, area: Rect, app: &App) {
     l.push(Line::from(vec![
         label("budget "),
         Span::raw(format!(
-            "model calls {}/{} · tool calls {}/{} · replans {}/{}",
-            d.usage.model_calls, d.budget.max_model_calls, d.usage.tool_calls, d.budget.max_tool_calls, d.usage.replans, d.budget.max_replans
+            "external calls {}/{} · local calls {}/{} · tool calls {}/{} · replans {}/{}",
+            d.usage.model_calls,
+            d.budget.max_model_calls,
+            d.usage.local_calls,
+            d.budget.max_local_calls,
+            d.usage.tool_calls,
+            d.budget.max_tool_calls,
+            d.usage.replans,
+            d.budget.max_replans
         )),
         if d.tainted { Span::styled("  ⚠ tainted context", Style::new().fg(WARN)) } else { Span::raw("") },
     ]));
@@ -999,6 +1006,11 @@ fn bar(label_s: &str, value: u64, max: u64, width: usize, color: Color) -> Line<
     ])
 }
 
+/// What a plan's model work costs: nothing on a self-hosted model.
+fn price_text(e: dfae_core::CostEstimate) -> String {
+    if e.external { format!("≈ {} external tok", fmt_tokens(e.tokens)) } else { "local, free".to_string() }
+}
+
 fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
     let [top, mid, bot] = Layout::vertical([Constraint::Length(11), Constraint::Min(4), Constraint::Length(7)]).areas(area);
     let s = app.detail.as_ref().map(|d| d.ledger.summary()).unwrap_or_default();
@@ -1008,9 +1020,9 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
     let max = s.baseline_tokens.max(s.generative_tokens).max(1);
     let lines = vec![
         bar("naive LLM agent (est.)", s.baseline_tokens, max, w, BAD),
-        bar("generative: SLM", s.slm_tokens, max, w, WARN),
-        bar("generative: strong model", s.strong_tokens, max, w, VIOLET),
-        bar("decision model", s.decision_tokens, max, w, ACCENT),
+        bar("external LLM (paid)", s.strong_tokens, max, w, VIOLET),
+        bar("self-hosted SLM (free)", s.slm_tokens, max, w, WARN),
+        bar("self-hosted decision (free)", s.decision_tokens, max, w, ACCENT),
         Line::from(vec![
             label(" calls   "),
             Span::raw(format!(
@@ -1022,7 +1034,7 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
             label(" economy "),
             Span::raw(format!(
                 "plan priced at {} · {} step{} fixed in code (no model call)",
-                est.map(|e| format!("{} model calls ≈ {} tok", e.model_calls, fmt_tokens(e.tokens))).unwrap_or_else(|| "—".into()),
+                est.map(|e| format!("{} model calls · {}", e.model_calls, price_text(e))).unwrap_or_else(|| "—".into()),
                 repairs,
                 if repairs == 1 { "" } else { "s" }
             )),
@@ -1035,7 +1047,7 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::new().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM).border_type(BorderType::Rounded).border_style(Style::new().fg(DIM)))
             .gauge_style(Style::new().fg(OK).bg(Color::Rgb(40, 44, 52)))
             .ratio((s.saved_pct as f64 / 100.0).clamp(0.0, 1.0))
-            .label(format!("{:.0}% generative tokens saved vs a naive agent (estimate)", s.saved_pct)),
+            .label(format!("{:.0}% external-LLM tokens saved vs a naive agent (estimate)", s.saved_pct)),
         gauge,
     );
 

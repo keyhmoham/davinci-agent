@@ -349,7 +349,7 @@ pub fn plan_from_decomposition(goal: &str, d: &Decomposition, direct: &[bool]) -
 }
 
 /// Facts the decision layer judges the split on.
-pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool, cost: &crate::economy::CostModel) -> TeamFacts {
+pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool, cost: &crate::economy::CostModel, external: bool) -> TeamFacts {
     let is_direct = |id: &str| d.subgoals.iter().position(|s| s.id == id).map(|i| direct[i]).unwrap_or(false);
     let mut parallel_model = 0;
     let mut model_after_direct = 0;
@@ -364,7 +364,7 @@ pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool, co
         }
     }
     let model_parts = direct.iter().filter(|free| !**free).count();
-    let (flat, team) = cost.flat_vs_team(model_parts, d.synthesis.is_some());
+    let (flat, team) = cost.flat_vs_team(model_parts, d.synthesis.is_some(), external);
     TeamFacts {
         subgoals: d.subgoals.iter().map(|s| tokens::truncate_tokens(&s.text, 14)).collect(),
         direct: direct.iter().filter(|b| **b).count(),

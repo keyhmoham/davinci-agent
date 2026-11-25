@@ -141,7 +141,7 @@ async fn tool_selection_asks_one_yes_no_question_per_tool() {
 }
 
 #[tokio::test]
-async fn the_model_is_asked_about_the_best_few_tools_only() {
+async fn a_self_hosted_model_judges_every_tool_because_its_questions_are_free() {
     let seen: Seen = Arc::default();
     let base = serve(Router::new().route("/v1/chat/completions", post(chat)).with_state(seen.clone())).await;
     let d = decider(OpenModelProvider::new(&cfg(base)).unwrap());
@@ -154,20 +154,13 @@ async fn the_model_is_asked_about_the_best_few_tools_only() {
         keywords: vec![],
     };
     let mut st = DecisionState { request: "read the file a.txt".into(), ..Default::default() };
-    st.tools = vec![
-        tool("fs_read", "read a file"),
-        tool("fs_list", "list files in a directory"),
-        tool("fs_write", "write a file"),
-        tool("fs_search", "search files"),
-        tool("calc", "arithmetic"),
-        tool("time_now", "current time"),
-        tool("system_info", "machine status"),
-        tool("memory_store", "remember a fact"),
-    ];
+    st.tools = ["fs_read", "fs_list", "fs_write", "fs_search", "calc", "time_now", "system_info", "memory_store"]
+        .iter()
+        .map(|n| tool(n, &format!("{n} tool")))
+        .collect();
     let picked = d.select_tools(st).await;
-    assert_eq!(seen.lock().unwrap().len(), 4, "one call per candidate, not per tool");
-    assert!(picked.value.iter().any(|(n, _)| n == "fs_read"));
-    assert!(!picked.value.iter().any(|(n, _)| n == "time_now" || n == "memory_store"), "tools nobody asked the model about keep their (low) local score");
+    assert_eq!(seen.lock().unwrap().len(), 8, "one question per tool, no pre-filtering to save calls");
+    assert_eq!(picked.value.len(), 8);
 }
 
 #[tokio::test]

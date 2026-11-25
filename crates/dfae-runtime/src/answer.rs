@@ -5,6 +5,7 @@
 use crate::engine::{Inner, TaskCtx};
 use crate::prompts;
 use dfae_core::*;
+use dfae_models::Tier;
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
 
@@ -140,7 +141,8 @@ impl Inner {
             from_model = true;
             t
         } else if let Some(tier) = self.pick_tier(mode) {
-            let ev = evidence_block(&snapshot, 220);
+            // the paid model gets tight evidence; a self-hosted one gets what the steps produced
+            let ev = evidence_block(&snapshot, if tier == Tier::Strong { 220 } else { 800 });
             let user = format!("REQUEST: {goal}\nEVIDENCE:\n{ev}");
             match self.generate_text(ctx, tier, self.gen_request(tier, prompts::ANSWER_SYSTEM, user, "answer")).await {
                 Ok(t) => {
@@ -165,7 +167,8 @@ impl Inner {
             }
         }
         // a model must not tell the user something was changed when no step that changes anything finished
-        let asked_to_change = snapshot.route.as_ref().map(|r| r.needs_tools && r.risk != Risk::Low).unwrap_or(false);
+        let asked_to_change =
+            snapshot.route.as_ref().map(|r| r.needs_tools && (r.risk != Risk::Low || crate::planner::asks_for_change(&goal))).unwrap_or(false);
         let did_change = plan.steps.iter().any(|s| {
             s.status == StepStatus::Succeeded
                 && (s.kind == StepKind::Agent || s.tool.as_deref().and_then(|t| self.tools.meta(t)).map(|m| m.side_effects).unwrap_or(false))

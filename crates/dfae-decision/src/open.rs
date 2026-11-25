@@ -243,9 +243,14 @@ fn clip(s: &str, n: usize) -> String {
 
 /// The situation, as compact lines (shared by every question of a request).
 pub(crate) fn render_state(s: &DecisionState) -> String {
-    let mut out = vec![format!("REQUEST: {}", clip(&s.request, 600))];
+    // the decision model is self-hosted, so its context is generous: a decision is only as good as what it can see
+    let mut out = Vec::new();
+    if !s.recent.is_empty() {
+        out.push(format!("RECENT CONVERSATION (oldest first):\n{}", s.recent.iter().map(|t| format!("- {}", clip(t, 600))).collect::<Vec<_>>().join("\n")));
+    }
+    out.push(format!("REQUEST: {}", clip(&s.request, 6000)));
     if !s.entities.is_empty() {
-        out.push(format!("ENTITIES: {}", s.entities.iter().map(|e| format!("{}={}", e.label, clip(&e.text, 40))).collect::<Vec<_>>().join(" | ")));
+        out.push(format!("ENTITIES: {}", s.entities.iter().map(|e| format!("{}={}", e.label, clip(&e.text, 300))).collect::<Vec<_>>().join(" | ")));
     }
     if let Some(m) = &s.mode_facts {
         out.push(format!(
@@ -267,7 +272,7 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
             p.reasoning_steps,
             p.side_effect_steps,
             p.max_risk.map(|r| format!("{r:?}").to_lowercase()).unwrap_or_else(|| "none".into()),
-            clip(&p.summary, 300)
+            clip(&p.summary, 2000)
         ));
     }
     if let Some(f) = &s.step_facts {
@@ -275,7 +280,7 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
             "FAILED STEP: tool={} error_kind={} error=\"{}\" attempt {}/{} replans {}/{} optional={} strong_model={}",
             f.tool.as_deref().unwrap_or("reasoning"),
             f.error_kind,
-            clip(&f.error, 200),
+            clip(&f.error, 1000),
             f.attempts,
             f.max_attempts,
             f.replans_used,
@@ -292,13 +297,13 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
             c.steps_failed,
             c.checks_passed,
             c.checks_failed,
-            clip(&c.evidence, 800)
+            clip(&c.evidence, 6000)
         ));
     }
     if let Some(t) = &s.team_facts {
         out.push(format!(
             "SUBTASKS: {} | deterministic={} dependent={} independent_model_tasks={} changes_state={} needs_synthesis={} est_tokens one_plan={} team={}",
-            t.subgoals.iter().map(|g| format!("\"{}\"", clip(g, 60))).collect::<Vec<_>>().join(", "),
+            t.subgoals.iter().map(|g| format!("\"{}\"", clip(g, 300))).collect::<Vec<_>>().join(", "),
             t.direct,
             t.dependent,
             t.parallel_model,

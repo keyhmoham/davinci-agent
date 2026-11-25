@@ -445,7 +445,7 @@ async fn cancelling_the_coordinator_cancels_its_agents_and_frees_their_slots() {
 
 #[tokio::test]
 async fn independent_model_agents_get_disjoint_slices_of_the_budget() {
-    let r = rig(true, vec![], |c| c.budget.max_model_calls = 8);
+    let r = rig(true, vec![], |c| c.budget.max_local_calls = 8);
     r.slm.plan("GOAL: explain what a mutex is", "mutex-text").plan("GOAL: explain what a semaphore is", "sem-text");
     r.slm.step("mutex-text", "A mutex is a lock.").step("sem-text", "A semaphore is a counter.");
     let t = run(&r, "explain what a mutex is and explain what a semaphore is").await;
@@ -453,11 +453,12 @@ async fn independent_model_agents_get_disjoint_slices_of_the_budget() {
     let kids = children(&r, &t).await;
     assert_eq!(kids.len(), 2);
     assert!(kids.iter().all(|k| k.team.as_ref().unwrap().role == AgentRole::Analyst));
-    let sum: u32 = kids.iter().map(|k| k.budget.max_model_calls).sum();
+    let sum: u32 = kids.iter().map(|k| k.budget.max_local_calls).sum();
     assert!(sum <= 8, "children cannot overspend the coordinator's budget: {sum}");
     assert!(kids.iter().all(|k| k.budget.max_children == 0));
-    assert_eq!(t.usage.model_calls, kids.iter().map(|k| k.usage.model_calls).sum::<u32>(), "usage rolls up");
-    assert_eq!(t.usage.model_calls, 4);
+    assert_eq!(t.usage.local_calls, kids.iter().map(|k| k.usage.local_calls).sum::<u32>(), "usage rolls up");
+    assert_eq!(t.usage.local_calls, 4);
+    assert_eq!(t.usage.model_calls, 0, "no external call was made: the self-hosted model is not metered against the paid budget");
     let a = t.final_answer.unwrap();
     assert!(a.contains("A mutex is a lock.") && a.contains("A semaphore is a counter."), "{a}");
     // agents ran concurrently under the analyst pool

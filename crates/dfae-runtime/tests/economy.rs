@@ -138,7 +138,7 @@ async fn plan_argument_problems_are_fixed_without_a_repair_call() {
 
 #[tokio::test]
 async fn an_unaffordable_plan_is_rejected_before_any_tool_runs() {
-    let r = rig(true, vec![], |c| c.budget.max_model_calls = 4);
+    let r = rig(true, vec![], |c| c.budget.max_local_calls = 4);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
     // three independent reasoning leaves need 3 steps + an answer call = 4, but only 3 calls remain after planning
     r.slm.push(&plan(json!([
@@ -155,7 +155,7 @@ async fn an_unaffordable_plan_is_rejected_before_any_tool_runs() {
     assert!(repair.contains("needs about 4 model calls but only 3 remain"), "{repair}");
     assert_eq!(t.usage.tool_calls, 1, "the rejected plan's tool never ran");
     assert_eq!(t.plan.as_ref().unwrap().steps.len(), 2);
-    assert_eq!(t.usage.model_calls, 3);
+    assert_eq!(t.usage.local_calls, 3);
 }
 
 // ----------------------------------------------------------------- pricing ----
