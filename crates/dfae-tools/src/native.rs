@@ -24,8 +24,7 @@ pub fn register_native(reg: &mut ToolRegistry, policy: Arc<PolicyEngine>, memory
     reg.register(Arc::new(FsSearch { policy: policy.clone() }));
     reg.register(Arc::new(Shell { policy: policy.clone() }));
     reg.register(Arc::new(HttpGet { policy: policy.clone() }));
-    reg.register(Arc::new(crate::web::WebSearch { policy: policy.clone() }));
-    reg.register(Arc::new(crate::web::Weather { policy }));
+    reg.register(Arc::new(crate::web::WebSearch { policy }));
     reg.register(Arc::new(MemorySearch { memory: memory.clone() }));
     reg.register(Arc::new(MemoryStoreTool { memory }));
 }
@@ -497,12 +496,12 @@ impl Tool for HttpGet {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta(
             "http_get",
-            "HTTP GET a URL (allowlisted domains) and return its text",
+            "HTTP GET any public URL and return its text; current weather: https://wttr.in/<city>?format=3",
             "web",
             vec![ParamSpec::new("url", ParamType::String, true, "http(s) URL").hints(&["url"])],
         );
         m.contract = vec![Check::Matches { pattern: r"^HTTP \d{3}".into() }];
-        kw(&mut m, &["fetch", "download", "web", "url", "http", "website", "page", "internet", "browse"]);
+        kw(&mut m, &["fetch", "download", "web", "url", "http", "website", "page", "internet", "browse", "weather", "temperature", "forecast"]);
         pats(
             &mut m,
             &[

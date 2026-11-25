@@ -1,9 +1,8 @@
-//! The agent's window on the world: one hardened fetch routine shared by
-//! `http_get`, `web_search` and `weather`, plus the two keyless tools.
+//! The agent's window on the world: one hardened fetch routine shared by `http_get` and
+//! `web_search`.
 //!
 //! * `web_search` — SearXNG (`SEARXNG_URL`) or Brave (`BRAVE_API_KEY`) when configured, else
 //!   DuckDuckGo's HTML endpoint, else Wikipedia's search API. Optionally reads the top pages.
-//! * `weather` — Open-Meteo (no key): geocoding + forecast, formatted by code, no model involved.
 //!
 //! Every request, and every redirect hop, is checked: http(s) only, no credentials in the
 //! URL, and no hostname that resolves to a private, loopback or link-local address.
@@ -44,7 +43,7 @@ pub(crate) struct Fetched {
 }
 
 /// GET `url`, following up to 3 redirects. `trusted` skips only the domain allowlist (used for the
-/// fixed backends of the search and weather tools); every other check always applies.
+/// fixed backends of the search tool); every other check always applies.
 pub(crate) async fn fetch(
     policy: &PolicyEngine,
     meta: &ToolMetadata,
@@ -365,7 +364,7 @@ impl Tool for WebSearch {
     fn metadata(&self) -> ToolMetadata {
         let mut m = ToolMetadata {
             name: "web_search".into(),
-            description: "search the web; returns titles, URLs and snippets (fetch_top=1..2 also reads the top pages)".into(),
+            description: "search the web: titles, URLs, snippets (fetch_top=1..2 also reads the top pages). For current weather prefer http_get on https://wttr.in/<city>?format=3".into(),
             category: "web".into(),
             risk: Risk::Low,
             requires_approval: false,
@@ -377,7 +376,7 @@ impl Tool for WebSearch {
                 ParamSpec::new("max_results", ParamType::Integer, false, "1-8, default 5"),
                 ParamSpec::new("fetch_top", ParamType::Integer, false, "also read the first N result pages (0-2, default 0)"),
             ],
-            keywords: ["search", "google", "web", "internet", "online", "latest", "news", "lookup", "look", "find", "who", "current", "price"]
+            keywords: ["search", "google", "web", "internet", "online", "latest", "news", "lookup", "look", "find", "who", "current", "price", "weather", "temperature", "forecast"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
@@ -413,175 +412,6 @@ impl Tool for WebSearch {
     }
 }
 
-// --------------------------------------------------------------- weather ----
-
-fn wmo(code: i64) -> &'static str {
-    match code {
-        0 => "clear sky",
-        1 => "mostly clear",
-        2 => "partly cloudy",
-        3 => "overcast",
-        45 | 48 => "fog",
-        51..=57 => "drizzle",
-        61..=67 => "rain",
-        71..=77 => "snow",
-        80..=82 => "rain showers",
-        85 | 86 => "snow showers",
-        95 => "thunderstorm",
-        96 | 99 => "thunderstorm with hail",
-        _ => "unsettled",
-    }
-}
-
-pub(crate) fn render_weather(place: &str, w: &Value) -> Option<String> {
-    let c = &w["current"];
-    let temp = c["temperature_2m"].as_f64()?;
-    let unit = w["current_units"]["temperature_2m"].as_str().unwrap_or("°C");
-    let mut s = format!(
-        "{place}: now {temp:.0}{unit} (feels {:.0}{unit}), {}, humidity {:.0}%, wind {:.0} km/h",
-        c["apparent_temperature"].as_f64().unwrap_or(temp),
-        wmo(c["weather_code"].as_i64().unwrap_or(-1)),
-        c["relative_humidity_2m"].as_f64().unwrap_or(0.0),
-        c["wind_speed_10m"].as_f64().unwrap_or(0.0)
-    );
-    let d = &w["daily"];
-    let (hi, lo, pr, dates) =
-        (d["temperature_2m_max"].as_array()?, d["temperature_2m_min"].as_array()?, d["precipitation_probability_max"].as_array(), d["time"].as_array()?);
-    for i in 0..dates.len().min(3) {
-        let label = ["today", "tomorrow", "day after"][i];
-        s.push_str(&format!(
-            "\n{label}: {:.0}–{:.0}{unit}{}",
-            lo.get(i)?.as_f64()?,
-            hi.get(i)?.as_f64()?,
-            pr.and_then(|p| p.get(i)).and_then(|p| p.as_f64()).map(|p| format!(", rain chance {p:.0}%")).unwrap_or_default()
-        ));
-    }
-    Some(s)
-}
-
-pub struct Weather {
-    pub(crate) policy: Arc<PolicyEngine>,
-}
-
-#[async_trait]
-impl Tool for Weather {
-    fn metadata(&self) -> ToolMetadata {
-        ToolMetadata {
-            name: "weather".into(),
-            description: "current weather and 3-day forecast for a city or place".into(),
-            category: "web".into(),
-            risk: Risk::Low,
-            requires_approval: false,
-            side_effects: false,
-            reversible: true,
-            cost_class: "free".into(),
-            params: vec![ParamSpec::new("location", ParamType::String, true, "city or place name").hints(&["location"])],
-            keywords: ["weather", "temperature", "forecast", "rain", "snow", "humidity", "wind", "climate", "hot", "cold", "sunny"].iter().map(|s| s.to_string()).collect(),
-            direct_patterns: vec![
-                r"(?i)\b(?:weather|temperature|forecast|climate|how\s+(?:hot|cold|warm)\s+is\s+it|is\s+it\s+(?:raining|snowing))\b[^\n]*?\b(?:in|for|at|of|near)\s+(?P<location>[^\n.,!?;]+?)(?:\s+(?:today|tomorrow|now|tonight|please|right\s+now)\b|\s*[.,!?;]|\s*$)".into(),
-                r"(?i)\b(?:weather|temperature|forecast)\b".into(),
-            ],
-            cacheable: true,
-            contract: vec![Check::Contains { value: "now ".into() }],
-        }
-    }
-    async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let loc =
-            input.get("location").and_then(|v| v.as_str()).map(str::trim).filter(|l| !l.is_empty()).ok_or_else(|| ToolError::args("missing 'location'"))?;
-        match self.open_meteo(loc, &ctx.cancel).await {
-            Ok(t) => Ok(ToolOutput::ok(t)),
-            // the primary service is down or rate limited: a second keyless service answers instead
-            Err(e) if e.kind == ErrorKind::Transient || e.kind == ErrorKind::Timeout => match self.wttr(loc, &ctx.cancel).await {
-                Ok(t) => Ok(ToolOutput::ok(t)),
-                Err(e2) => Err(ToolError::new(ErrorKind::Transient, format!("{}; fallback: {}", e.message, e2.message))),
-            },
-            Err(e) => Err(e),
-        }
-    }
-}
-
-impl Weather {
-    async fn open_meteo(&self, loc: &str, cancel: &CancellationToken) -> Result<String, ToolError> {
-        let meta = http_meta();
-        let geo = fetch(
-            &self.policy,
-            &meta,
-            &format!("https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&format=json&name={}", enc(loc)),
-            &[],
-            cancel,
-            true,
-        )
-        .await?;
-        let g: Value = serde_json::from_str(&geo.text)
-            .map_err(|_| ToolError::new(ErrorKind::Transient, format!("geocoder answered HTTP {} with an unreadable body", geo.status)))?;
-        if g["error"].as_bool() == Some(true) {
-            return Err(ToolError::new(ErrorKind::Transient, format!("geocoder: {}", g["reason"].as_str().unwrap_or("request refused"))));
-        }
-        let Some(r) = g["results"].as_array().and_then(|a| a.first()) else {
-            return Err(ToolError::new(ErrorKind::NotFound, format!("no place named '{loc}' was found")));
-        };
-        let (lat, lon) = (r["latitude"].as_f64().unwrap_or(0.0), r["longitude"].as_f64().unwrap_or(0.0));
-        let place = [r["name"].as_str(), r["admin1"].as_str().filter(|a| Some(*a) != r["name"].as_str()), r["country"].as_str()]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let url = format!(
-            "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&timezone=auto&forecast_days=3&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max"
-        );
-        let f = fetch(&self.policy, &meta, &url, &[], cancel, true).await?;
-        let w: Value = serde_json::from_str(&f.text)
-            .map_err(|_| ToolError::new(ErrorKind::Transient, format!("weather service answered HTTP {} with an unreadable body", f.status)))?;
-        if w["error"].as_bool() == Some(true) {
-            return Err(ToolError::new(ErrorKind::Transient, format!("weather service: {}", w["reason"].as_str().unwrap_or("request refused"))));
-        }
-        render_weather(&place, &w).ok_or_else(|| ToolError::new(ErrorKind::Transient, "weather service returned no data"))
-    }
-
-    async fn wttr(&self, loc: &str, cancel: &CancellationToken) -> Result<String, ToolError> {
-        let f = fetch(&self.policy, &http_meta(), &format!("https://wttr.in/{}?format=j1", enc(loc)), &[], cancel, true).await?;
-        let w: Value = serde_json::from_str(&f.text)
-            .map_err(|_| ToolError::new(ErrorKind::Transient, format!("wttr.in answered HTTP {} with an unreadable body", f.status)))?;
-        render_wttr(loc, &w).ok_or_else(|| ToolError::new(ErrorKind::NotFound, format!("no weather data for '{loc}'")))
-    }
-}
-
-/// wttr.in's JSON (all values are strings).
-pub(crate) fn render_wttr(asked: &str, w: &Value) -> Option<String> {
-    let c = w["current_condition"].as_array()?.first()?;
-    let n = |v: &Value| v.as_str().and_then(|s| s.trim().parse::<f64>().ok());
-    let area = w["nearest_area"].as_array().and_then(|a| a.first());
-    let place = area
-        .map(|a| {
-            [a["areaName"][0]["value"].as_str(), a["region"][0]["value"].as_str().filter(|r| !r.is_empty()), a["country"][0]["value"].as_str()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| asked.to_string());
-    let mut s = format!(
-        "{place}: now {:.0}°C (feels {:.0}°C), {}, humidity {:.0}%, wind {:.0} km/h",
-        n(&c["temp_C"])?,
-        n(&c["FeelsLikeC"]).unwrap_or(n(&c["temp_C"])?),
-        c["weatherDesc"][0]["value"].as_str().unwrap_or("").trim().to_lowercase(),
-        n(&c["humidity"]).unwrap_or(0.0),
-        n(&c["windspeedKmph"]).unwrap_or(0.0)
-    );
-    for (i, d) in w["weather"].as_array()?.iter().take(3).enumerate() {
-        let rain = d["hourly"].as_array().map(|h| h.iter().filter_map(|x| n(&x["chanceofrain"])).fold(0.0, f64::max));
-        s.push_str(&format!(
-            "\n{}: {:.0}–{:.0}°C{}",
-            ["today", "tomorrow", "day after"][i],
-            n(&d["mintempC"])?,
-            n(&d["maxtempC"])?,
-            rain.map(|r| format!(", rain chance {r:.0}%")).unwrap_or_default()
-        ));
-    }
-    Some(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,32 +442,6 @@ mod tests {
         let h = parse_wikipedia(&w, 5);
         assert_eq!(h[0].url, "https://en.wikipedia.org/wiki/New_York_City");
         assert_eq!(h[0].snippet, "a big city");
-    }
-
-    #[test]
-    fn formats_weather_compactly() {
-        let w = json!({
-            "current_units": {"temperature_2m": "°C"},
-            "current": {"temperature_2m": 11.6, "apparent_temperature": 9.2, "relative_humidity_2m": 61, "weather_code": 2, "wind_speed_10m": 14.4},
-            "daily": {"time": ["a", "b", "c"], "temperature_2m_max": [14.0, 15.1, 12.0], "temperature_2m_min": [7.0, 8.2, 6.0], "precipitation_probability_max": [10, 60, 5]}
-        });
-        let s = render_weather("New York, New York, United States", &w).unwrap();
-        assert!(s.starts_with("New York, New York, United States: now 12°C (feels 9°C), partly cloudy, humidity 61%, wind 14 km/h"), "{s}");
-        assert!(s.contains("tomorrow: 8–15°C, rain chance 60%"), "{s}");
-        assert!(render_weather("x", &json!({})).is_none());
-    }
-
-    #[test]
-    fn formats_the_fallback_weather_service() {
-        let w = json!({
-            "current_condition": [{"temp_C": "2", "FeelsLikeC": "-1", "humidity": "63", "windspeedKmph": "11", "weatherDesc": [{"value": "Clear "}]}],
-            "nearest_area": [{"areaName": [{"value": "New York"}], "region": [{"value": "New York"}], "country": [{"value": "United States of America"}]}],
-            "weather": [{"mintempC": "-2", "maxtempC": "5", "hourly": [{"chanceofrain": "0"}, {"chanceofrain": "30"}]}, {"mintempC": "0", "maxtempC": "7", "hourly": []}]
-        });
-        let s = render_wttr("new york", &w).unwrap();
-        assert!(s.starts_with("New York, New York, United States of America: now 2°C (feels -1°C), clear, humidity 63%, wind 11 km/h"), "{s}");
-        assert!(s.contains("today: -2–5°C, rain chance 30%") && s.contains("tomorrow: 0–7°C"), "{s}");
-        assert!(render_wttr("x", &json!({})).is_none());
     }
 
     #[test]

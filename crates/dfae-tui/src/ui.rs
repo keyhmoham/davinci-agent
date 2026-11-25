@@ -541,7 +541,7 @@ fn welcome() -> Vec<Line<'static>> {
         Line::from(vec![Span::styled("  A ", Style::new().fg(WARN).bold()), ds("assisted  small language model plans / reasons / writes.")]),
         Line::from(vec![Span::styled("  E ", Style::new().fg(VIOLET).bold()), ds("escalated stronger model, only when needed.")]),
         Line::from(""),
-        d("  Talk to it, or give it a job. Try:  hi · what is a mutex? · weather in Paris"),
+        d("  Talk to it, or give it a job. Try:  hi · what is a mutex? · weather in Paris (searches the web)"),
         d("        what is 12 * (3 + 4)?"),
         d("        search the web for rust async book"),
         d("        list the files in ./  and what time is it"),

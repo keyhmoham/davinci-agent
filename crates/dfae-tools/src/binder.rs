@@ -212,12 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn binds_weather_and_web_search() {
-        assert_eq!(one("what's the weather in Paris today?"), ("weather".into(), json!({"location": "Paris"})));
-        assert_eq!(one("tell me weather temperature in my city.").1, json!({"location": "my city"}), "resolved against the user's known place later");
-        assert_eq!(one("forecast for New York").1, json!({"location": "New York"}));
-        let c = bind_direct(&metas(), "weather Berlin", &[ent("location", "Berlin")]).expect("the location entity fills the argument");
-        assert_eq!((c[0].tool.as_str(), &c[0].args), ("weather", &json!({"location": "Berlin"})));
+    fn binds_web_search() {
         assert_eq!(one("search the web for rust async book").1["query"], "rust async book");
         assert_eq!(one("google tokio runtime tuning").1["query"], "tokio runtime tuning");
         assert_eq!(one("search for rust async book online").1["query"], "rust async book");

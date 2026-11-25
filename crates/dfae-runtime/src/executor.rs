@@ -333,7 +333,7 @@ impl Inner {
         let tier = self.pick_tier(mode).ok_or_else(|| {
             StepFailure::new(
                 ErrorKind::Policy,
-                "no language model is configured, so I can only run tool requests (files, calculator, web search, weather…) — set SLM_BASE_URL or STRONG_API_KEY to chat",
+                "no language model is configured, so I can only run tool requests (files, calculator, web search and pages…) — set SLM_BASE_URL or STRONG_API_KEY to chat",
             )
         })?;
         let turns = ctx.base_ctx.lock().turns.clone();

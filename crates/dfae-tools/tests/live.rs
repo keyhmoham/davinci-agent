@@ -18,7 +18,7 @@ fn setup() -> (ToolRegistry, ToolContext) {
 #[ignore]
 async fn weather_and_search_live() {
     let (r, ctx) = setup();
-    let w = r.get("weather").unwrap().execute(json!({"location": "new york"}), ctx.clone()).await;
+    let w = r.get("http_get").unwrap().execute(json!({"url": "https://wttr.in/new+york?format=3"}), ctx.clone()).await;
     println!("WEATHER: {w:?}");
     let s = r.get("web_search").unwrap().execute(json!({"query": "rust async book", "fetch_top": 1}), ctx.clone()).await;
     println!("SEARCH: {s:?}");

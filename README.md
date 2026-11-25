@@ -198,14 +198,13 @@ The Chat tab shows the thread; Tab shows how each reply was produced.
 | Tool | What it does | Notes |
 |---|---|---|
 | `web_search` | titles, URLs, snippets; `fetch_top=1..2` also reads the top pages | SearXNG (`SEARXNG_URL`) → Brave (`BRAVE_API_KEY`) → DuckDuckGo HTML → Wikipedia |
-| `http_get` | fetch any public URL as text | `open_web = true` in `config/policy.toml` (shipped); set `false` to restrict to the allowlist |
-| `weather` | current weather + 3-day forecast, formatted by code | Open-Meteo, falling back to wttr.in; "weather in Paris" runs with **0 model tokens** |
+| `http_get` | fetch any public URL as text | `open_web = true` in `config/policy.toml` (shipped); set `false` to restrict to the allowlist. Its description tells the planner how to get current weather: `https://wttr.in/<city>?format=3` |
 
 The open web is read-only and bounded: private, loopback, link-local and metadata addresses are always blocked (after DNS and on every
 redirect), responses are size- and time-capped, and once any tool output looks like a prompt injection, fetching an unlisted host needs approval
 again (a URL can carry data out). Search results and pages are untrusted data to the model.
 
-Things to try: `hi` · `what is a mutex?` · `search the web for rust async book` · `weather in Paris` · `what is 12 * (3 + 4)?` · `list the files in ./ and what time is it` ·
+Things to try: `hi` · `what is a mutex?` · `search the web for rust async book` · `weather in Paris` (found on the web) · `what is 12 * (3 + 4)?` · `list the files in ./ and what time is it` ·
 `write 'hello' to notes/hello.txt` (asks for approval) · `remember that the staging db is db-staging-01`
 then `what do you remember about the staging db?` · with the SLM up:
 `read notes/hello.txt and tell me how many words it contains`.
@@ -274,7 +273,7 @@ scripts/bench.sh                             # token/mode table over examples/ta
 | Token economy payoff on a *real* model | **unmeasured** — priors come from the shipped prompts; savings per avoided repair (~300–500 tokens) are estimates; lazy context may cost more than it saves for some workloads |
 | Quality of automatic splits with a *real* SLM/Jev | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
 | Conversation (small talk, chat turns, session history, "it"/"that file"/"my city" resolution), file-creation phrasings, planner-slip recovery | verified (`crates/dfae-runtime/tests/chat.rs`) and with the real server |
-| `web_search` / `http_get` / `weather` | parsers unit-tested on fixtures; **run live from the build sandbox**: DuckDuckGo search + page read worked, Open-Meteo was rate-limited there and the wttr.in fallback answered. Third-party services change — treat as best effort |
+| `web_search` / `http_get` | parsers unit-tested on fixtures; **run live from the build sandbox**: DuckDuckGo search + page read worked once and was bot-blocked later (Wikipedia answered instead); `http_get` on `wttr.in/<city>?format=3` returned the weather. Whether a *real SLM* plans weather lookups well is **untested**. Third-party services change — treat as best effort |
 | Postgres store, audit chain | verified against PostgreSQL 16 (`real[]` fallback path) |
 | HTTP API + SSE + auth, TUI rendering and key handling | verified (integration tests; TUI also driven in a real terminal) |
 | GLiNER service with the real model, called by the Rust engine | verified manually (extraction of the blueprint example) |

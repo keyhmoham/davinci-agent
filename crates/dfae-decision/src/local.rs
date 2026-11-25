@@ -231,7 +231,11 @@ impl LocalDecider {
         }
         let docs: Vec<String> =
             s.tools.iter().map(|t| format!("{} {} {} {}", t.name.replace('_', " "), t.description, t.category, t.keywords.join(" "))).collect();
-        let bm = bm25_scores(&s.request, &docs);
+        // Score only the words the tools' vocabulary knows: chatter around the request ("hi, I'm Sam from
+        // New York, tell me the weather") must not dilute a clear match.
+        let vocab: HashSet<String> = docs.iter().flat_map(|d| content_tokens(d)).collect();
+        let query = content_tokens(&s.request).into_iter().filter(|t| vocab.contains(t)).collect::<Vec<_>>().join(" ");
+        let bm = if query.is_empty() { vec![0.0; docs.len()] } else { bm25_scores(&query, &docs) };
         s.tools
             .iter()
             .zip(bm)
@@ -539,5 +543,31 @@ mod tests {
             (Answer::Noul { noul: a }, Answer::Noul { noul: b }) => assert!(a > 0.5 && b < 0.3, "{a} {b}"),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn chatter_around_a_request_does_not_hide_the_tool_it_needs() {
+        let d = dec();
+        let brief = |name: &str, desc: &str, cat: &str, kw: &[&str]| ToolBrief {
+            name: name.into(),
+            description: desc.into(),
+            category: cat.into(),
+            risk: Risk::Low,
+            side_effects: false,
+            keywords: kw.iter().map(|k| k.to_string()).collect(),
+        };
+        let mut st = state("hi. i'm keyhan from new york. tell me weather temperature in new york.");
+        st.tools = vec![
+            brief("http_get", "HTTP GET any public URL; current weather: https://wttr.in/<city>?format=3", "web", &["fetch", "weather", "temperature"]),
+            brief("fs_list", "list files in a directory folder", "filesystem", &[]),
+            brief("calc", "evaluate arithmetic expression", "math", &[]),
+        ];
+        let r = d.answer(&tools_request(st));
+        let p = |k: &str| match &r[k] {
+            Answer::Noul { noul } => *noul,
+            _ => panic!(),
+        };
+        assert!(p("tool:http_get") > 0.5, "{}", p("tool:http_get"));
+        assert!(p("tool:fs_list") < 0.3 && p("tool:calc") < 0.3);
     }
 }

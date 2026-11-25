@@ -39,7 +39,7 @@ routing, so a mis-classified state-changing request fails closed (its write tool
   numeric facts to the configured decision API. With no key, decisions are made locally and nothing is sent.
 - **Stronger model** (only if configured): plan/answer prompts, including compressed tool outputs, go to that provider.
 - **SLM / GLiNER / Postgres** are local services in the compose network.
-- `http_get` contacts the domains the policy allows; with `open_web = true` any public host (never private ranges). `web_search` and `weather` call fixed third-party backends (SearXNG/Brave if configured, DuckDuckGo, Wikipedia, Open-Meteo, wttr.in) through the same private-address and size/time guards. What you search for and the places you ask about leave the machine.
+- `http_get` contacts the domains the policy allows; with `open_web = true` any public host (never private ranges). `web_search` calls fixed third-party backends (SearXNG/Brave if configured, DuckDuckGo, Wikipedia) through the same private-address and size/time guards. What you search for, and any URL you fetch, leaves the machine.
 
 ## Known limits
 

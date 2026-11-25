@@ -111,16 +111,18 @@ async fn it_and_that_file_mean_what_the_conversation_was_about() {
 }
 
 #[tokio::test]
-async fn weather_in_my_city_binds_the_place_said_in_the_same_message() {
+async fn weather_is_found_through_the_web_tools_with_the_place_from_the_conversation() {
     let r = rig();
+    r.slm
+        .push(&json!({"steps": [{"id": "s1", "tool": "http_get", "do": "current weather", "args": {"url": "https://wttr.in/new+york?format=3"}}]}).to_string());
     let t = say(&r, "w", "hi. i'm keyhan from new york. tell me weather temperature in my city.").await;
+    assert_eq!(t.goal, "hi. i'm keyhan from new york. tell me weather temperature in new york.", "'my city' was resolved before planning");
+    let prompt = r.slm.requests.lock()[0].messages.last().unwrap().content.clone();
+    assert!(prompt.contains("http_get(") && prompt.contains("wttr.in"), "the planner is told how to get weather from the web: {prompt}");
+    assert!(prompt.contains("web_search("), "{prompt}");
     let plan = t.plan.expect("a plan was made");
-    let s = &plan.steps[0];
-    assert_eq!(s.tool.as_deref(), Some("weather"), "{:?}", plan.steps);
-    assert_eq!(s.args, json!({"location": "new york"}));
-    // bound by rules, not planned (whether the service is reachable from the test machine is not the point)
-    assert_eq!((plan.source, t.mode), (PlanSource::Direct, Some(ExecMode::Direct)));
-    assert!(!r.slm.requests.lock().iter().any(|q| q.purpose == "plan"), "no planning call was made");
+    assert_eq!(plan.steps[0].tool.as_deref(), Some("http_get"), "{:?}", plan.steps);
+    assert_eq!(plan.source, PlanSource::Slm);
 }
 
 #[tokio::test]

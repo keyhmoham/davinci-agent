@@ -267,7 +267,7 @@ impl PolicyEngine {
     }
 
     /// Scheme, credentials and local/private-address checks that apply to *every* outbound request,
-    /// including the fixed backends of the search and weather tools. Returns the lowercase host.
+    /// including the fixed backends of the search tool. Returns the lowercase host.
     pub fn public_host(&self, url: &str) -> Result<String, String> {
         let Some((scheme, rest)) = url.split_once("://") else {
             return Err("URL must include a scheme".into());
