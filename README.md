@@ -213,6 +213,10 @@ Things to try: `hi` · `what is a mutex?` · `search the web for rust async book
 then `what do you remember about the staging db?` · with the SLM up:
 `read notes/hello.txt and tell me how many words it contains`.
 
+If you update the code, rebuild **both** images: `./dfae` does (`docker compose up -d --build` alone does not rebuild the TUI,
+which is behind a compose profile — an old TUI cannot read a newer server's task list and the UI then looks empty; the TUI now
+says so in the status bar).
+
 ### CLI / API
 
 ```bash

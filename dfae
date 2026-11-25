@@ -21,8 +21,10 @@ wait_models() {
 
 case "${1:-tui}" in
   up)     compose up -d --build; echo "The SLM may still be downloading on first start: ./dfae logs ollama-pull" >&2 ;;
-  tui)    compose up -d --build; wait_models; exec docker compose run --rm tui ;;
-  ask)    shift; compose up -d --build dfae >/dev/null; wait_models; exec docker compose run --rm -T tui --ask "$*" ;;
+  # the TUI image is built separately from the server (it is behind a compose profile): rebuild it too, or an
+  # old TUI talks to a newer server and cannot read its answers
+  tui)    compose up -d --build; compose build tui; wait_models; exec docker compose run --rm tui ;;
+  ask)    shift; compose up -d --build dfae >/dev/null; compose build tui >/dev/null; wait_models; exec docker compose run --rm -T tui --ask "$*" ;;
   logs)   shift; exec docker compose logs -f "${1:-dfae}" ;;
   status) compose ps; docker compose exec -T dfae sh -c 'true' 2>/dev/null; curl -fsS "http://127.0.0.1:${DFAE_PORT:-8080}/v1/health" ${DFAE_API_TOKEN:+-H "Authorization: Bearer $DFAE_API_TOKEN"} || true; echo ;;
   down)   compose down ;;

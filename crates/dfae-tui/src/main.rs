@@ -275,9 +275,21 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
     {
         let (tx, api) = (tx.clone(), api.clone());
         tokio::spawn(async move {
+            let mut last_warned: Option<std::time::Instant> = None;
             loop {
-                if let Ok(t) = api.tasks().await {
-                    let _ = tx.send(Msg::Tasks(t));
+                match api.tasks().await {
+                    Ok(t) => {
+                        let _ = tx.send(Msg::Tasks(t));
+                    }
+                    // never leave an empty list unexplained: a server and a TUI of different versions disagree on the format
+                    Err(e) if last_warned.map(|t| t.elapsed() > Duration::from_secs(15)).unwrap_or(true) => {
+                        last_warned = Some(std::time::Instant::now());
+                        let _ = tx.send(Msg::Notice(
+                            format!("cannot read the task list: {e} (if the server was updated, rebuild the TUI: docker compose build tui)"),
+                            true,
+                        ));
+                    }
+                    Err(_) => {}
                 }
                 tokio::time::sleep(Duration::from_millis(700)).await;
             }
