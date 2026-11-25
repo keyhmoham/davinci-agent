@@ -154,11 +154,16 @@ impl Decider {
             _ => Risk::Moderate,
         };
         let conf = self.calibrator.calibrate(&format!("route_task:{tt}"), (tconf + rconf) / 2.0) as f32;
-        Decided {
-            value: Routing { task_type: tt, complexity: (cscore / 2.0).clamp(0.0, 1.0) as f32, needs_tools: needs, risk, confidence: conf },
-            record,
-            entry,
-        }
+        let yes = |k: &str| r.noul(k).map(|p| p >= 0.5).unwrap_or(false);
+        let pick = |k: &str| r.choice(k).map(|(c, _)| c.to_string());
+        let smalltalk = pick("smalltalk").filter(|c| c != "none");
+        let role = pick("role");
+        let mut routing = Routing::new(&tt, (cscore / 2.0).clamp(0.0, 1.0) as f32, needs, risk, conf);
+        routing.changes = yes("changes_state");
+        routing.conditional = yes("conditional_change");
+        routing.smalltalk = smalltalk;
+        routing.role = role;
+        Decided { value: routing, record, entry }
     }
 
     // ------------------------------------------------------------ tools ----
@@ -208,7 +213,10 @@ impl Decider {
         let mut reason = match mode {
             ExecMode::Direct => format!("deterministic tool binding · decision confidence {conf:.2}"),
             ExecMode::Assisted => format!("needs planning or reasoning by the SLM · decision confidence {conf:.2}"),
-            ExecMode::Escalated => format!("complex or high-stakes · decision confidence {conf:.2}"),
+            ExecMode::Escalated => format!(
+                "medium or complex work (complexity {:.2}): the external model plans it, the local system carries it out · decision confidence {conf:.2}",
+                facts.complexity
+            ),
         };
 
         // user override first
@@ -252,17 +260,6 @@ impl Decider {
                 mode = ExecMode::Direct;
                 reason = "no language model configured; using deterministic binding".into();
             }
-        }
-        // medium and complex work is planned by the external model (and carried out by the local system)
-        if requested == ModeRequest::Auto
-            && mode != ExecMode::Escalated
-            && facts.strong_available
-            && !facts.direct_bindable
-            && facts.skill_score.is_none()
-            && facts.complexity >= self.thresholds.external_min_complexity
-        {
-            mode = ExecMode::Escalated;
-            reason = format!("medium or complex task (complexity {:.2}): the external model plans it, the local system carries it out", facts.complexity);
         }
         if requested == ModeRequest::Auto && mode == ExecMode::Assisted && conf < self.thresholds.escalate_below && facts.strong_available {
             mode = ExecMode::Escalated;
@@ -316,6 +313,28 @@ impl Decider {
         Decided { value: self.calibrator.calibrate("assess_decomposition:split", raw) as f32, record, entry }
     }
 
+    /// Does the evidence satisfy what a planner expected of one step? A different question from "is the request done":
+    /// a correct "nothing is there" satisfies an expectation of showing what exists.
+    pub async fn judge_step(&self, state: DecisionState) -> Decided<f32> {
+        let mut req = completion_request(state);
+        req.questions.insert(
+            "complete".into(),
+            Question::noul(
+                "Does the EVIDENCE satisfy the EXPECTATION of this STEP? Answer yes when it does. A result that correctly reports that something is missing or empty satisfies an expectation of showing what exists. Answer no only when the evidence is an error, is off-topic, or clearly contradicts the expectation.",
+            ),
+        );
+        let (r, record, entry) = self.decide(req).await;
+        Decided { value: r.noul("complete").unwrap_or(0.0) as f32, record, entry }
+    }
+
+    /// What, if anything, does the request lean on from earlier in the conversation? `options` are what exists
+    /// (`file`, `url`, `place`, `code` with a description); the answer is one of them or `None`.
+    pub async fn resolve_reference(&self, state: DecisionState, options: &[(String, String)]) -> Decided<Option<String>> {
+        let (r, record, entry) = self.decide(resolve_request(state, options)).await;
+        let value = r.choice("refers_to").filter(|(c, conf)| *c != "none" && *conf >= 0.5 && options.iter().any(|(k, _)| k == c)).map(|(c, _)| c.to_string());
+        Decided { value, record, entry }
+    }
+
     pub async fn assess_escalation(&self, state: DecisionState) -> Decided<f32> {
         let (r, record, entry) = self.decide(escalation_request(state)).await;
         Decided { value: r.noul("escalate").unwrap_or(0.0) as f32, record, entry }
@@ -367,7 +386,14 @@ mod tests {
         let mode = |complexity: f32, direct: bool, strong: bool, requested: ModeRequest| {
             let st = DecisionState {
                 request: "x".into(),
-                mode_facts: Some(ModeFacts { complexity, direct_bindable: direct, strong_available: strong, slm_available: true, ..Default::default() }),
+                mode_facts: Some(ModeFacts {
+                    complexity,
+                    direct_bindable: direct,
+                    strong_available: strong,
+                    slm_available: true,
+                    external_min_complexity: 0.3,
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             let d = &d;

@@ -248,6 +248,9 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
     if !s.recent.is_empty() {
         out.push(format!("RECENT CONVERSATION (oldest first):\n{}", s.recent.iter().map(|t| format!("- {}", clip(t, 600))).collect::<Vec<_>>().join("\n")));
     }
+    if !s.known.is_empty() {
+        out.push(format!("KNOWN FROM THE CONVERSATION: {}", s.known.join("; ")));
+    }
     out.push(format!("REQUEST: {}", clip(&s.request, 6000)));
     if !s.entities.is_empty() {
         out.push(format!("ENTITIES: {}", s.entities.iter().map(|e| format!("{}={}", e.label, clip(&e.text, 300))).collect::<Vec<_>>().join(" | ")));
@@ -263,6 +266,12 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
             m.slm_available,
             m.strong_available
         ));
+        if m.external_min_complexity > 0.0 {
+            out.push(format!(
+                "POLICY: work of complexity {:.2} or more that does not bind to tools outright is medium or complex: with an external model available it is planned by it and carried out by the local system",
+                m.external_min_complexity
+            ));
+        }
     }
     if let Some(p) = &s.plan_facts {
         out.push(format!(

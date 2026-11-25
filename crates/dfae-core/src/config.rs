@@ -153,7 +153,7 @@ impl Config {
                 model: env_or("DECISION_MODEL", "qwen3:4b-instruct-2507-q4_K_M"),
                 api_key: env("DECISION_API_KEY"),
                 timeout_ms: env_parse("DECISION_TIMEOUT_MS", 15_000),
-                parallel: env_parse("DECISION_PARALLEL", 1),
+                parallel: env_parse("DECISION_PARALLEL", 3),
                 // the model is self-hosted and free per token, so it makes every decision; narrow it to save latency
                 kinds: env_or("DECISION_KINDS", "all").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             },

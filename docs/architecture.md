@@ -30,6 +30,15 @@ No model owns control flow, permissions, or the claim that a task is done.
    answers are checked for ungrounded numbers/paths/URLs.
 10. **Learn** — calibration, episodic memory, validated fact promotion, skill crystallisation.
 
+## What decides, and what only enforces
+
+Judgement is the decision model's: every question above is a typed question over `DecisionState` (the request, the entities, the recent turns,
+`known` things from the session, mode/plan/step/completion facts and the policy). Code does three things only: it supplies *facts* (a tool
+binds or it does not; an external model is configured or it is not; a step's side effects), it *enforces limits* (policy, budgets, the schema
+of every answer), and it does *mechanical work* the answer points at (substituting the file a request referred to, canned replies by
+small-talk kind). The sentence is never re-read by the runtime to second-guess an answer. The local fallback decider (`local.rs`) is the only
+place with phrase lists and regexes, and it answers exactly the same questions.
+
 ## Planning and acting (`planner.rs`, `implement.rs`, `executor.rs::run_step`)
 
 Mode selection has one hard rule on top of the decision model's answer: with an external model available, a request that does not bind

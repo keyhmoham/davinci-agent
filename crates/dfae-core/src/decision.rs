@@ -24,10 +24,12 @@ pub enum DecisionKind {
     AssessCompletion,
     AssessEscalation,
     AssessDecomposition,
+    /// Does the request refer to something said earlier ("it", "that file", "my city")? What?
+    ResolveReference,
 }
 
 impl DecisionKind {
-    pub const ALL: [DecisionKind; 8] = [
+    pub const ALL: [DecisionKind; 9] = [
         Self::RouteTask,
         Self::SelectMode,
         Self::SelectTools,
@@ -36,6 +38,7 @@ impl DecisionKind {
         Self::AssessCompletion,
         Self::AssessEscalation,
         Self::AssessDecomposition,
+        Self::ResolveReference,
     ];
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -52,6 +55,7 @@ impl DecisionKind {
             Self::AssessCompletion => "assess_completion",
             Self::AssessEscalation => "assess_escalation",
             Self::AssessDecomposition => "assess_decomposition",
+            Self::ResolveReference => "resolve_reference",
         }
     }
 }
@@ -179,6 +183,9 @@ pub struct ModeFacts {
     pub complexity: f32,
     pub risk: Option<Risk>,
     pub task_type: String,
+    /// Policy: from this complexity, medium and complex work is planned by the external model (if there is one).
+    #[serde(default)]
+    pub external_min_complexity: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -249,6 +256,9 @@ pub struct DecisionState {
     /// The last few turns of the conversation (oldest first), so "now do the same for b.txt" can be judged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<String>,
+    /// Things named earlier in the conversation that a request could refer to (`file: a.txt`, `place: Paris`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<EntityBrief>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

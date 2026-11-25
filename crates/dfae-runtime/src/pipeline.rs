@@ -133,6 +133,7 @@ impl Inner {
             complexity: routing.complexity,
             risk: Some(routing.risk),
             task_type: routing.task_type.clone(),
+            external_min_complexity: self.cfg.thresholds.external_min_complexity,
         });
         let choice = self.note(ctx, self.decider.select_mode(mstate, req.mode).await).await;
         let mut mode = choice.mode;
@@ -376,7 +377,7 @@ impl Inner {
     }
 
     /// Earlier finished turns of this conversation (oldest first), without sub-agent tasks.
-    async fn session_history(&self, ctx: &Arc<TaskCtx>) -> Vec<TaskRecord> {
+    pub(crate) async fn session_history(&self, ctx: &Arc<TaskCtx>) -> Vec<TaskRecord> {
         let session = ctx.rec.lock().await.session_id.clone();
         let mut v: Vec<TaskRecord> = self
             .store
@@ -390,13 +391,29 @@ impl Inner {
         v
     }
 
-    /// Resolve "it" / "that file" / "my city" from the session before anything else looks at the request.
+    /// Does the request lean on something said earlier ("it", "that file", "my city")? The decision model is shown what
+    /// exists and decides whether and which; the code then makes that explicit before anything else reads the request.
     async fn stage_resolve(&self, ctx: &Arc<TaskCtx>, goal: String, entities: Vec<Entity>, history: &[TaskRecord]) -> (String, Vec<Entity>) {
-        if history.is_empty() && !entities.iter().any(|e| e.label == "location") {
-            return (goal, entities);
-        }
         let facts = session::facts_from(history.iter());
-        let (new_goal, new_entities, notes) = session::resolve(&goal, &entities, &facts);
+        let own_place = entities.iter().find(|e| e.label == "location").map(|e| e.text.clone());
+        let has_code = session::artifacts_from(history).iter().any(|(n, _, _)| n == "prev_code");
+        let (known, options) = session::known_things(&facts, own_place.as_deref(), has_code);
+        if options.is_empty() {
+            return (goal, entities); // nothing was said that a request could refer to
+        }
+        let mut st = self.decision_state(&goal, &entities);
+        st.known = known;
+        st.recent = history
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(|t| {
+                format!("user: {} → assistant: {}", tokens::truncate_tokens(&t.goal, 60), tokens::truncate_tokens(t.final_answer.as_deref().unwrap_or(""), 100))
+            })
+            .collect();
+        let Some(kind) = self.note(ctx, self.decider.resolve_reference(st, &options).await).await else { return (goal, entities) };
+        let (new_goal, new_entities, notes) = session::apply(&goal, &entities, &facts, own_place.as_deref(), &kind);
         if notes.is_empty() {
             return (goal, entities);
         }
@@ -481,7 +498,8 @@ impl Inner {
             .and_then(|t| t.link.as_ref())
             .map(|l| l.upstream.iter().map(|u| (u.label.clone(), u.summary.clone())).collect())
             .unwrap_or_default();
-        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, upstream };
+        let artifacts = session::artifacts_from(history);
+        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, artifacts, upstream };
         if profile != ContextProfile::Minimal {
             ctx.rec.lock().await.retrieved = refs.clone();
             self.emit(ctx, EventKind::Retrieval { items: refs }).await;
@@ -531,7 +549,13 @@ impl Inner {
             upstream: &base.upstream,
             profile,
         });
-        pkg.render()
+        let mut text = pkg.render();
+        // what "it", "that code" and "the page above" can refer to, by name: a step uses `{{prev_code}}`, nobody copies the code
+        if !base.artifacts.is_empty() {
+            let list = base.artifacts.iter().map(|(n, _, d)| format!("{n} = {d}")).collect::<Vec<_>>().join("; ");
+            text.push_str(&format!("\nVALUES from the conversation (write {{{{name}}}} in an argument or a step instead of copying them): {list}"));
+        }
+        text
     }
 
     async fn find_skill(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) -> Option<SkillMatch> {
@@ -699,9 +723,8 @@ impl Inner {
         planner::validate_plan(&steps, &self.tools, &allowed, &remaining)?;
         if expect_effect {
             let member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
-            let wants_change =
-                ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && (r.risk != Risk::Low || planner::asks_for_change(goal))).unwrap_or(false);
-            let changes = !member && !planner::is_conditional(goal) && wants_change;
+            // the decision model said whether the request asks for a change, and whether that change is only conditional
+            let changes = !member && ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && r.changes && !r.conditional).unwrap_or(false);
             if changes && let Some(p) = planner::missing_effect(&steps, &self.tools, &allowed) {
                 return Err(vec![p]);
             }

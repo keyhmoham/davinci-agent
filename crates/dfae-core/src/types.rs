@@ -398,6 +398,24 @@ pub struct Routing {
     pub needs_tools: bool,
     pub risk: Risk,
     pub confidence: f32,
+    /// The request asks for something to be created, changed or deleted.
+    #[serde(default)]
+    pub changes: bool,
+    /// ...but only if needed, or as a proposal ("patch it if necessary", "suggest a fix").
+    #[serde(default)]
+    pub conditional: bool,
+    /// `greeting`, `thanks`, `farewell`, `how_are_you`, `about_you`: nothing to do, just a social reply.
+    #[serde(default)]
+    pub smalltalk: Option<String>,
+    /// The kind of agent that fits the work: `researcher`, `operator`, `analyst`, `verifier`.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+impl Routing {
+    pub fn new(task_type: &str, complexity: f32, needs_tools: bool, risk: Risk, confidence: f32) -> Self {
+        Self { task_type: task_type.into(), complexity, needs_tools, risk, confidence, changes: false, conditional: false, smalltalk: None, role: None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

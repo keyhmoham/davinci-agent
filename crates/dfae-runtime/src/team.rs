@@ -396,6 +396,16 @@ pub fn pick_role(goal: &str, routing: &Routing, bound_tools: Option<&[ToolMetada
         }
         return if VERIFY_VERB.is_match(goal) { AgentRole::Verifier } else { AgentRole::Researcher };
     }
+    // the decision model's judgement of the work, when it gave one
+    if let Some(role) = routing.role.as_deref() {
+        match role {
+            "operator" => return AgentRole::Operator,
+            "analyst" => return AgentRole::Analyst,
+            "verifier" => return AgentRole::Verifier,
+            "researcher" => return AgentRole::Researcher,
+            _ => {}
+        }
+    }
     if routing.risk >= Risk::Moderate || routing.task_type == "maintenance" {
         AgentRole::Operator
     } else if !routing.needs_tools {
@@ -552,7 +562,7 @@ mod tests {
 
     #[test]
     fn roles_follow_what_the_task_will_do() {
-        let r = |risk, needs, ty: &str| Routing { task_type: ty.into(), complexity: 0.3, needs_tools: needs, risk, confidence: 0.8 };
+        let r = |risk, needs, ty: &str| Routing::new(ty, 0.3, needs, risk, 0.8);
         let meta = |side| ToolMetadata {
             name: "t".into(),
             description: String::new(),

@@ -35,7 +35,6 @@ pub fn facts_from<'a>(tasks: impl IntoIterator<Item = &'a TaskRecord>) -> Facts 
 static MY_PLACE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(?:my|our)\s+(?:current\s+)?(?:city|town|location|area|place|neighbou?rhood)\b|\bwhere\s+i\s+(?:live|am)\b").unwrap());
 static HERE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:here|outside)\b").unwrap());
-static WEATHERISH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:weather|temperature|forecast|rain\w*|snow\w*|hot|cold|warm)\b").unwrap());
 static THAT_FILE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:that|this|the\s+same|the\s+above|the\s+previous|the\s+last)\s+file\b").unwrap());
 static FILE_IT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -45,99 +44,138 @@ static FILE_IT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static THAT_URL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b(?:that|this|the\s+same)\s+(?:url|link|page|site|website)\b").unwrap());
 
-fn has(entities: &[Entity], labels: &[&str]) -> bool {
-    entities.iter().any(|e| labels.contains(&e.label.as_str()))
+/// What the request could be leaning on, as the decision model is shown it (`file: a.txt`) and as the options it
+/// chooses between. Only things that exist are offered.
+pub fn known_things(facts: &Facts, own_place: Option<&str>, has_code: bool) -> (Vec<String>, Vec<(String, String)>) {
+    let (mut known, mut options) = (Vec::new(), Vec::new());
+    if let Some(p) = &facts.path {
+        known.push(format!("file: {p}"));
+        options.push(("file".to_string(), format!("the file named earlier ({p})")));
+    }
+    if let Some(u) = &facts.url {
+        known.push(format!("url: {u}"));
+        options.push(("url".to_string(), format!("the link given earlier ({u})")));
+    }
+    if let Some(pl) = own_place.map(String::from).or_else(|| facts.location.clone()) {
+        known.push(format!("place: {pl}"));
+        options.push(("place".to_string(), format!("the user's city or place ({pl})")));
+    }
+    if has_code {
+        known.push("code: a code block from an earlier reply".to_string());
+        options.push(("code".to_string(), "the code or page from an earlier reply".to_string()));
+    }
+    (known, options)
 }
 
-/// Rewrite references to earlier turns using `facts`. Returns the new request, the entities
-/// it now contains, and what was resolved (for the event log). Unchanged if nothing applies.
-pub fn resolve(goal: &str, entities: &[Entity], facts: &Facts) -> (String, Vec<Entity>, Vec<String>) {
+/// Make the request self-contained for the thing the decision model said it leans on. The model decides *whether*
+/// and *what*; this only does the mechanical part: put the value where the reference stands (or after the request when
+/// no phrase can be located), so rules, the planner and the binder all see it. `code` needs no rewriting: it is
+/// available to every step by name (`{{prev_code}}`).
+pub fn apply(goal: &str, entities: &[Entity], facts: &Facts, own_place: Option<&str>, kind: &str) -> (String, Vec<Entity>, Vec<String>) {
     let mut goal = goal.to_string();
     let mut ents = entities.to_vec();
     let mut notes = Vec::new();
     let add = |ents: &mut Vec<Entity>, label: &str, text: &str| {
         ents.push(Entity { label: label.into(), text: text.into(), start: None, end: None, score: 0.9, source: "session".into() });
     };
-
-    // a place: said in this very message ("I'm from Paris. weather in my city") or earlier in the session
-    let place = entities.iter().find(|e| e.label == "location").map(|e| e.text.clone()).or_else(|| facts.location.clone());
-    if let Some(place) = &place {
-        let weatherish = WEATHERISH.is_match(&goal);
-        if MY_PLACE.is_match(&goal) || (weatherish && HERE.is_match(&goal)) {
-            goal = if MY_PLACE.is_match(&goal) { MY_PLACE.replace(&goal, place.as_str()) } else { HERE.replace(&goal, format!("in {place}").as_str()) }
-                .into_owned();
-            if !has(&ents, &["location"]) {
-                add(&mut ents, "location", place);
+    match kind {
+        "file" => {
+            if let Some(path) = &facts.path {
+                goal = if THAT_FILE.is_match(&goal) {
+                    THAT_FILE.replace(&goal, path.as_str()).into_owned()
+                } else if FILE_IT.is_match(&goal) {
+                    FILE_IT.replace(&goal, format!("${{verb}} ${{me}}{path}").as_str()).into_owned()
+                } else {
+                    format!("{} ({path})", goal.trim_end())
+                };
+                add(&mut ents, "file path", path);
+                notes.push(format!("it refers to the file '{path}'"));
             }
-            notes.push(format!("your place is '{place}'"));
         }
-    }
-    if let Some(path) = &facts.path
-        && !has(&ents, &["file path", "path", "url"])
-    {
-        if THAT_FILE.is_match(&goal) {
-            goal = THAT_FILE.replace(&goal, path.as_str()).into_owned();
-            add(&mut ents, "file path", path);
-            notes.push(format!("'that file' is '{path}'"));
-        } else if FILE_IT.is_match(&goal) {
-            goal = FILE_IT.replace(&goal, format!("${{verb}} ${{me}}{path}").as_str()).into_owned();
-            add(&mut ents, "file path", path);
-            notes.push(format!("'it' is '{path}'"));
+        "url" => {
+            if let Some(url) = &facts.url {
+                goal = if THAT_URL.is_match(&goal) { THAT_URL.replace(&goal, url.as_str()).into_owned() } else { format!("{} ({url})", goal.trim_end()) };
+                add(&mut ents, "url", url);
+                notes.push(format!("it refers to the link '{url}'"));
+            }
         }
-    }
-    if let Some(url) = &facts.url
-        && !has(&ents, &["url"])
-        && THAT_URL.is_match(&goal)
-    {
-        goal = THAT_URL.replace(&goal, url.as_str()).into_owned();
-        add(&mut ents, "url", url);
-        notes.push(format!("'that link' is '{url}'"));
+        "place" => {
+            if let Some(place) = own_place.map(String::from).or_else(|| facts.location.clone()) {
+                goal = if MY_PLACE.is_match(&goal) {
+                    MY_PLACE.replace(&goal, place.as_str()).into_owned()
+                } else if HERE.is_match(&goal) {
+                    HERE.replace(&goal, format!("in {place}").as_str()).into_owned()
+                } else {
+                    format!("{} (in {place})", goal.trim_end())
+                };
+                if !ents.iter().any(|e| e.label == "location") {
+                    add(&mut ents, "location", &place);
+                }
+                notes.push(format!("your place is '{place}'"));
+            }
+        }
+        _ => {}
     }
     (goal, ents, notes)
 }
 
+// -------------------------------------------------------------- artifacts ----
+
+/// Names a step may use in its arguments for things said earlier in the conversation.
+pub const ARTIFACT_NAMES: [&str; 2] = ["prev_code", "prev_reply"];
+
+static FENCE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)```([A-Za-z0-9_+.\-]*)[ \t]*\n(.*?)```").unwrap());
+
+/// What the user can point at with "it", "that code", "the page above": the largest code block of the most recent reply
+/// that had one (`prev_code`), and the most recent reply itself (`prev_reply`). `history` is oldest first.
+/// Returns `(name, value, description)`.
+pub fn artifacts_from(history: &[TaskRecord]) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    let replies: Vec<&str> = history.iter().rev().filter_map(|t| t.final_answer.as_deref()).filter(|a| !a.trim().is_empty()).collect();
+    if let Some(last) = replies.first() {
+        out.push(("prev_reply".to_string(), last.to_string(), format!("the last reply, {} chars", last.chars().count())));
+    }
+    for reply in replies.iter().take(3) {
+        let best = FENCE.captures_iter(reply).map(|c| (c[1].trim().to_string(), c[2].to_string())).max_by_key(|(_, code)| code.len());
+        if let Some((lang, code)) = best.filter(|(_, code)| !code.trim().is_empty()) {
+            let what = if lang.is_empty() { "code".to_string() } else { format!("{lang} code") };
+            out.push(("prev_code".to_string(), code.clone(), format!("{what} block from an earlier reply, {} lines", code.lines().count())));
+            break;
+        }
+    }
+    out
+}
+
+/// Replace `{{prev_code}}`-style references in step arguments with the values themselves.
+pub fn substitute_artifacts(args: &serde_json::Value, artifacts: &[(String, String)]) -> serde_json::Value {
+    use serde_json::Value;
+    match args {
+        Value::String(s) => {
+            let mut out = s.clone();
+            for (name, value) in artifacts {
+                out = out.replace(&format!("{{{{{name}}}}}"), value);
+            }
+            Value::String(out)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|x| substitute_artifacts(x, artifacts)).collect()),
+        Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), substitute_artifacts(x, artifacts))).collect()),
+        other => other.clone(),
+    }
+}
+
 // ------------------------------------------------------------- small talk ----
 
-static GREETING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*(?:hi|hello|hey|hiya|howdy|yo|greetings|good\s+(?:morning|afternoon|evening|day)|sup)\b[\s,.!-]*").unwrap());
-static HOW_ARE_YOU: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:so[,\s]+|and\s+)?(?:tell\s+me\s+|can\s+you\s+tell\s+me\s+)?(?:how\s+are\s+(?:you|u)(?:\s+(?:doing|today|going))*|how\s+do\s+you\s+do|how(?:'s|\s+is)\s+it\s+going|how\s+have\s+you\s+been|what'?s\s+up|how(?:'re|\s+are)\s+things)\s*[?!.]*$").unwrap()
-});
-static THANKS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:thanks|thank\s+you|thx|ty|cheers|much\s+appreciated|great,?\s+thanks)(?:\s+(?:a\s+lot|so\s+much|very\s+much|again))?\s*[.!]*$")
-        .unwrap()
-});
-static BYE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:bye|goodbye|see\s+you|see\s+ya|good\s*night|cya)(?:\s+\w+)?\s*[.!]*$").unwrap());
-static WHO: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)^(?:who\s+are\s+you|what\s+are\s+you|what\s+can\s+you\s+do|what\s+do\s+you\s+do|help|what\s+are\s+your\s+(?:capabilities|abilities))\s*[?!.]*$",
-    )
-    .unwrap()
-});
-
-/// Replies that need no model: greetings, thanks, "how are you", "what can you do".
+/// The reply to a purely social message, by the kind the decision model recognised. No model call.
 /// `can` is a one-line list of what the agent can do (built from its tools).
-pub fn small_talk(goal: &str, can: &str) -> Option<String> {
-    let greeted = GREETING.find(goal);
-    let rest = greeted.map(|m| &goal[m.end()..]).unwrap_or(goal).trim();
-    let rest = rest.trim_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
-    let intro = format!("I'm DFAE: I chat and use tools ({can}). What do you need?");
-    if rest.is_empty() {
-        return greeted.map(|_| format!("Hi! {intro}"));
-    }
-    if HOW_ARE_YOU.is_match(rest) {
-        return Some("Doing well, thanks. What do you need?".into());
-    }
-    if THANKS.is_match(rest) {
-        return Some("You're welcome.".into());
-    }
-    if BYE.is_match(rest) {
-        return Some("Goodbye.".into());
-    }
-    if WHO.is_match(rest) {
-        return Some(intro);
-    }
-    None
+pub fn small_talk_reply(kind: &str, can: &str) -> Option<String> {
+    Some(match kind {
+        "greeting" => format!("Hi! I'm DFAE: I chat and use tools ({can}). What do you need?"),
+        "how_are_you" => "Doing well, thanks. What do you need?".into(),
+        "thanks" => "You're welcome.".into(),
+        "farewell" => "Goodbye.".into(),
+        "about_you" => format!("I'm DFAE: I chat and use tools ({can}). What do you need?"),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -161,45 +199,63 @@ mod tests {
     }
 
     #[test]
-    fn resolves_references_to_the_previous_turns() {
-        let f = Facts { path: Some("test.txt".into()), url: Some("https://example.com/x".into()), location: Some("new york".into()) };
-        let (g, e, n) = resolve("read it", &[], &f);
-        assert_eq!(g, "read test.txt");
-        assert!(e.iter().any(|x| x.label == "file path" && x.text == "test.txt") && n.len() == 1);
-        assert_eq!(resolve("show me it again", &[], &f).0, "show me test.txt again");
-        assert_eq!(resolve("delete that file", &[], &f).0, "delete test.txt");
-        assert_eq!(resolve("what's the weather in my city?", &[], &f).0, "what's the weather in new york?");
-        assert_eq!(resolve("is it raining here", &[], &f).0, "is it raining in new york");
-        assert_eq!(resolve("fetch that link", &[], &f).0, "fetch https://example.com/x");
-        // an explicit file wins; "it" without a file verb is left alone; "here" without weather is left alone
-        assert_eq!(resolve("read notes.md", &[ent("file path", "notes.md")], &f).0, "read notes.md");
-        assert_eq!(resolve("it is fine", &[], &f).0, "it is fine");
-        assert_eq!(resolve("list files here", &[], &f).0, "list files here");
-        // nothing known: nothing invented
-        assert_eq!(resolve("read it", &[], &Facts::default()).0, "read it");
-        // a place given in the same message beats an older one
-        let (g, _, _) = resolve("i'm from berlin. weather in my city", &[ent("location", "berlin")], &f);
-        assert_eq!(g, "i'm from berlin. weather in berlin");
+    fn only_things_that_exist_are_offered_to_the_decision_model() {
+        let f = Facts { path: Some("test.txt".into()), url: None, location: None };
+        let (known, options) = known_things(&f, None, false);
+        assert_eq!((known, options.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()), (vec!["file: test.txt".to_string()], vec!["file"]));
+        let (known, options) = known_things(&Facts::default(), Some("Berlin"), true);
+        assert_eq!(known, ["place: Berlin", "code: a code block from an earlier reply"]);
+        assert_eq!(options.len(), 2);
+        assert!(known_things(&Facts::default(), None, false).1.is_empty(), "nothing to refer to: the model is not even asked");
     }
 
     #[test]
-    fn small_talk_needs_no_model() {
+    fn the_chosen_reference_is_made_explicit() {
+        let f = Facts { path: Some("test.txt".into()), url: Some("https://example.com/x".into()), location: Some("new york".into()) };
+        let go = |g: &str, kind: &str| apply(g, &[], &f, None, kind).0;
+        assert_eq!(go("read it", "file"), "read test.txt");
+        assert_eq!(go("show me it again", "file"), "show me test.txt again");
+        assert_eq!(go("delete that file", "file"), "delete test.txt");
+        assert_eq!(go("what's the weather in my city?", "place"), "what's the weather in new york?");
+        assert_eq!(go("is it raining here", "place"), "is it raining in new york");
+        assert_eq!(go("fetch that link", "url"), "fetch https://example.com/x");
+        // no phrase to replace: the value is added after the request, where rules and models can still see it
+        assert_eq!(go("turn the lights off, same as before", "file"), "turn the lights off, same as before (test.txt)");
+        assert_eq!(go("anything", "none"), "anything");
+        assert_eq!(go("anything", "code"), "anything", "code is available by name, no rewriting");
+        let (g, e, n) = apply("read it", &[], &f, None, "file");
+        assert!(e.iter().any(|x| x.label == "file path" && x.text == "test.txt") && n.len() == 1 && g == "read test.txt");
+        // a place said in this very message beats an older one
+        assert_eq!(apply("weather in my city", &[], &f, Some("berlin"), "place").0, "weather in berlin");
+        // a kind that has no value does nothing
+        assert_eq!(apply("read it", &[], &Facts::default(), None, "file").0, "read it");
+    }
+
+    #[test]
+    fn small_talk_replies_are_short_and_by_kind() {
         let can = "files, shell";
-        assert!(small_talk("hi", can).unwrap().starts_with("Hi! I'm DFAE"));
-        assert!(small_talk("Hello!!", can).is_some());
-        assert!(small_talk("hi. tell me how are you ?", can).unwrap().contains("oing well"));
-        assert!(small_talk("how are you?", can).is_some());
-        assert!(small_talk("thanks a lot!", can).unwrap().contains("welcome"));
-        assert!(small_talk("bye", can).unwrap().contains("Goodbye"));
-        assert!(small_talk("what can you do?", can).unwrap().contains("files, shell"));
-        // anything with a real question or task goes on to the pipeline
-        for s in [
-            "hi. create a file named a.txt",
-            "hello, what is the capital of France?",
-            "hi. i'm keyhan from new york. tell me weather",
-            "how are you going to fix the build",
-        ] {
-            assert!(small_talk(s, can).is_none(), "{s}");
-        }
+        assert!(small_talk_reply("greeting", can).unwrap().starts_with("Hi! I'm DFAE"));
+        assert!(small_talk_reply("how_are_you", can).unwrap().contains("oing well"));
+        assert!(small_talk_reply("thanks", can).unwrap().contains("welcome"));
+        assert!(small_talk_reply("about_you", can).unwrap().contains("files, shell"));
+        assert!(small_talk_reply("none", can).is_none());
+    }
+
+    #[test]
+    fn what_the_user_can_point_at_is_the_code_of_the_last_reply() {
+        let mut t = task(vec![]);
+        t.final_answer = Some("Here you go:\n```html\n<h1>Hi</h1>\n<p>x</p>\n```\nAnd some css:\n```css\nh1{}\n```".into());
+        let mut chat = task(vec![]);
+        chat.final_answer = Some("Sure, anything else?".into());
+        let a = artifacts_from(&[t.clone(), chat]);
+        let get = |n: &str| a.iter().find(|(k, _, _)| k == n).cloned().unwrap();
+        assert_eq!(get("prev_reply").1, "Sure, anything else?");
+        let (_, code, what) = get("prev_code");
+        assert_eq!(code, "<h1>Hi</h1>\n<p>x</p>\n", "the largest block of the latest reply that had code");
+        assert!(what.contains("html code") && what.contains("2 lines"), "{what}");
+        assert!(artifacts_from(&[task(vec![])]).is_empty());
+        let args = serde_json::json!({"path": "index.html", "content": "{{prev_code}}", "n": 1});
+        let out = substitute_artifacts(&args, &[("prev_code".into(), "<b>x</b>".into())]);
+        assert_eq!(out, serde_json::json!({"path": "index.html", "content": "<b>x</b>", "n": 1}));
     }
 }

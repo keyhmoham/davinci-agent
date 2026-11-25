@@ -123,6 +123,8 @@ services:
     # before exposing it any further.
     ports:
       - "127.0.0.1:${DFAE_PORT:-8080}:8080"
+      # what the agent serves (a web page, an app): it must listen on 0.0.0.0 in this range to be reachable from the host
+      - "127.0.0.1:8000-8010:8000-8010"
     # tools run inside this container as an unprivileged user
     read_only: true
     mem_limit: ${DFAE_MEM_LIMIT:-2g}

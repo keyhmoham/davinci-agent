@@ -33,7 +33,7 @@ pub fn route_request(state: DecisionState) -> DecisionRequest {
             ["simple: one deterministic step", "intermediate: a few dependent steps", "complex: open-ended multi-step reasoning"],
         ),
     );
-    q.insert("needs_tools".into(), Question::noul("Does fulfilling the request require running tools (files, shell, web, calculation)?"));
+    q.insert("needs_tools".into(), Question::noul("Does fulfilling the request require tools (files, shell, web, calculation)? Creating, building, saving, running or serving anything (code, a web page, an app, a script, a document) does: deliverables are files in the workspace, not text in the chat. Only a question or conversation that needs no action does not."));
     q.insert(
         "risk".into(),
         Question::choice(
@@ -41,7 +41,54 @@ pub fn route_request(state: DecisionState) -> DecisionRequest {
             [("low", "read-only"), ("moderate", "reversible changes"), ("high", "destructive or irreversible")],
         ),
     );
+    q.insert("changes_state".into(), Question::noul("Does the request ask for something to be created, written, changed, moved, deleted, installed or started (files, code, settings, a server)? Reading, listing, searching and questions do not count."));
+    q.insert(
+        "conditional_change".into(),
+        Question::noul("Is the change only conditional or a proposal — \"if necessary\", \"if needed\", \"suggest a fix\", \"propose a patch\" — so that doing nothing can be a correct outcome?"),
+    );
+    q.insert(
+        "smalltalk".into(),
+        Question::choice(
+            "Is the message only social, with nothing to do or answer beyond a courtesy?",
+            [
+                ("none", "no: it asks for something, even if it starts with a greeting"),
+                ("greeting", "only a greeting (hi, hello, good morning)"),
+                ("thanks", "only thanks"),
+                ("farewell", "only a goodbye"),
+                ("how_are_you", "asks how the assistant is, and nothing else"),
+                ("about_you", "asks who or what the assistant is or what it can do"),
+            ],
+        ),
+    );
+    q.insert(
+        "role".into(),
+        Question::choice(
+            "Which kind of agent fits this work best?",
+            [
+                ("researcher", "finds and reads information without changing anything"),
+                ("operator", "changes things: writes files, runs commands that modify, deploys, patches"),
+                ("analyst", "reasons or writes from information already at hand, no tools"),
+                ("verifier", "checks, validates or tests that something is true or works"),
+            ],
+        ),
+    );
     DecisionRequest { kind: DecisionKind::RouteTask, state, questions: q }
+}
+
+/// Does the request refer to something said earlier, and which of the known things is it? `options` are
+/// `(key, description)` of what exists (`file`, `url`, `place`); `none` is always possible.
+pub fn resolve_request(state: DecisionState, options: &[(String, String)]) -> DecisionRequest {
+    let mut criteria: BTreeMap<String, String> = BTreeMap::new();
+    criteria.insert("none".into(), "nothing: the request stands on its own".into());
+    for (k, d) in options {
+        criteria.insert(k.clone(), d.clone());
+    }
+    let mut q = BTreeMap::new();
+    q.insert(
+        "refers_to".into(),
+        Question::Choice { instructions: "Does the request rely on something named earlier in the conversation instead of saying it (\"it\", \"that file\", \"the page above\", \"my city\", \"there\")? Which one?".into(), criteria },
+    );
+    DecisionRequest { kind: DecisionKind::ResolveReference, state, questions: q }
 }
 
 pub fn mode_request(state: DecisionState) -> DecisionRequest {
@@ -49,11 +96,11 @@ pub fn mode_request(state: DecisionState) -> DecisionRequest {
     q.insert(
         "mode".into(),
         Question::choice(
-            "Choose the cheapest execution mode that can do this reliably.",
+            "Choose the execution mode. direct when the request binds to tools outright; escalated when it is medium or complex work (see POLICY) and an external model exists; otherwise assisted.",
             [
                 ("direct", "deterministic tools only; arguments bind straight from the text; no language model"),
                 ("assisted", "a small language model must plan or write"),
-                ("escalated", "complex, ambiguous or high-stakes; needs a stronger model"),
+                ("escalated", "medium or complex work (at or above the POLICY complexity), or ambiguous or high-stakes work; the external model plans it and the local system carries it out"),
             ],
         ),
     );

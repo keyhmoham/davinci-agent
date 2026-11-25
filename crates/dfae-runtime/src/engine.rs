@@ -49,6 +49,8 @@ pub(crate) struct TaskCtx {
     pub permit: Mutex<Option<AgentPermit>>,
     /// Receives the final record when this task is a subagent.
     pub done: Mutex<Option<oneshot::Sender<TaskRecord>>>,
+    /// Results that did not meet the planner's expectation: the plan is revisited once the running steps finish.
+    pub checkpoints: Mutex<Vec<String>>,
 }
 
 impl TaskCtx {
@@ -66,6 +68,7 @@ impl TaskCtx {
             shared: OnceLock::new(),
             permit: Mutex::new(None),
             done: Mutex::new(None),
+            checkpoints: Mutex::new(Vec::new()),
         })
     }
 
@@ -80,6 +83,8 @@ pub(crate) struct ContextBase {
     pub prior_turns: Vec<String>,
     /// The last few `(request, reply)` pairs of this session, for conversational replies.
     pub turns: Vec<(String, String)>,
+    /// Values from earlier in the conversation a step may use by name (`{{prev_code}}`): `(name, full value)`.
+    pub artifacts: Vec<(String, String, String)>,
     /// Results of the agents this one depends on `(label, summary)`.
     pub upstream: Vec<(String, String)>,
 }
