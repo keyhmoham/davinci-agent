@@ -232,7 +232,8 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 
 | Variable | Effect |
 |---|---|
-| `DECISION_MODEL` | open-weight decision model pulled into Ollama (`qwen3:4b-instruct-2507-q8_0` default); `DECISION_PROVIDER=local` turns it off |
+| `DECISION_MODEL` | open-weight decision model pulled into Ollama (`qwen3:4b-instruct-2507-q4_K_M` default); `DECISION_PROVIDER=local` turns it off |
+| `DECISION_KINDS` | which decisions the model makes (default `route_task,select_tools,assess_recovery,assess_escalation,assess_completion`; `all` for every kind). The rest — mode, plan check, team split — use the built-in rules. The model is loaded in the background at start (decisions use the rules until it answers), a failure pauses it for 30 s instead of making every decision wait out a timeout, and tool selection asks it about the 4 best-ranked tools only |
 | `SLM_MODEL` | model pulled into Ollama (`qwen2.5:3b` default; `1.5b` faster, `7b` smarter) |
 | `STRONG_PROVIDER` / `STRONG_API_KEY` / `STRONG_MODEL` | optional escalation model (`anthropic` or `openai`-compatible) |
 | `DFAE_API_TOKEN` | bearer token for the API |

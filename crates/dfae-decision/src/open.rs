@@ -19,8 +19,10 @@
 use async_trait::async_trait;
 use dfae_core::*;
 use futures_util::stream::{self, StreamExt};
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SYSTEM: &str = "You are the decision component of an agent runtime. You judge requests and situations. \
@@ -29,23 +31,89 @@ Reply with exactly one token from the allowed answers: no explanation, no punctu
 /// Below this much probability on valid answer tokens the reply is not trusted.
 const MIN_VALID_MASS: f64 = 0.3;
 
+/// A reqwest error with its causes ("error sending request: operation timed out").
+fn describe(e: &reqwest::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        out.push_str(&format!(": {s}"));
+        src = s.source();
+    }
+    out
+}
+
+/// While the model is still loading, or right after it failed, decisions go straight to the local
+/// rules instead of each waiting out a timeout (a task makes several decisions).
+struct Gate {
+    ready: bool,
+    paused_until: Option<Instant>,
+}
+
 pub struct OpenModelProvider {
     http: reqwest::Client,
+    /// no overall timeout beyond a generous one: the first request loads the model
+    warm_http: reqwest::Client,
     base: String,
     model: String,
     key: Option<String>,
     parallel: usize,
+    gate: Mutex<Gate>,
+    pause: Duration,
+    warm_retry: Duration,
 }
 
 impl OpenModelProvider {
     pub fn new(cfg: &DecisionConfig) -> Option<Self> {
         let base = cfg.base_url.clone()?.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder().timeout(Duration::from_millis(cfg.timeout_ms)).build().ok()?;
-        Some(Self { http, base, model: cfg.model.clone(), key: cfg.api_key.clone(), parallel: cfg.parallel.max(1) })
+        let warm_http = reqwest::Client::builder().timeout(Duration::from_secs(300)).build().ok()?;
+        Some(Self {
+            http,
+            warm_http,
+            base,
+            model: cfg.model.clone(),
+            key: cfg.api_key.clone(),
+            parallel: cfg.parallel.max(1),
+            gate: Mutex::new(Gate { ready: true, paused_until: None }),
+            pause: Duration::from_secs(30),
+            warm_retry: Duration::from_secs(5),
+        })
+    }
+
+    /// Test hook: how long a failure pauses the model, and how often warm-up retries.
+    pub fn with_timing(mut self, pause: Duration, warm_retry: Duration) -> Self {
+        self.pause = pause;
+        self.warm_retry = warm_retry;
+        self
+    }
+
+    /// Load the model in the background. Until the first answer arrives, decisions use the local
+    /// rules, so a cold start (or a model that is still being pulled) never stalls a task.
+    pub fn start_warmup(self: &Arc<Self>) {
+        self.gate.lock().ready = false;
+        let me = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let prompt = "REQUEST: ready\n\nQUESTION: Is this a test?\nAllowed answers: yes, no".to_string();
+                match me.first_token(&me.warm_http, prompt).await {
+                    Ok(_) => {
+                        let mut g = me.gate.lock();
+                        g.ready = true;
+                        g.paused_until = None;
+                        tracing::info!(model = %me.model, "decision model is ready");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::info!(model = %me.model, error = %e, "decision model not ready yet; decisions use the local rules");
+                        tokio::time::sleep(me.warm_retry).await;
+                    }
+                }
+            }
+        });
     }
 
     /// One single-token completion: the first token's top alternatives as `(token, probability)`.
-    async fn first_token(&self, prompt: String) -> Result<(Vec<(String, f64)>, u64, u64), DecisionError> {
+    async fn first_token(&self, client: &reqwest::Client, prompt: String) -> Result<(Vec<(String, f64)>, u64, u64), DecisionError> {
         let body = json!({
             "model": self.model,
             "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": prompt}],
@@ -55,11 +123,11 @@ impl OpenModelProvider {
             "top_logprobs": 20,
             "stream": false,
         });
-        let mut rb = self.http.post(format!("{}/chat/completions", self.base)).json(&body);
+        let mut rb = client.post(format!("{}/chat/completions", self.base)).json(&body);
         if let Some(k) = &self.key {
             rb = rb.bearer_auth(k);
         }
-        let resp = rb.send().await.map_err(|e| DecisionError::Unavailable(e.to_string()))?;
+        let resp = rb.send().await.map_err(|e| DecisionError::Unavailable(describe(&e)))?;
         let status = resp.status();
         if !status.is_success() {
             let txt = resp.text().await.unwrap_or_default();
@@ -78,7 +146,7 @@ impl OpenModelProvider {
 
     async fn answer(&self, state: &str, q: &Question) -> Result<(Answer, u64, u64), DecisionError> {
         let (prompt, labels) = render_question(state, q);
-        let (toks, i, o) = self.first_token(prompt).await?;
+        let (toks, i, o) = self.first_token(&self.http, prompt).await?;
         Ok((interpret(q, &labels, &toks)?, i, o))
     }
 }
@@ -90,6 +158,33 @@ impl DecisionProvider for OpenModelProvider {
     }
 
     async fn decide(&self, request: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
+        {
+            let g = self.gate.lock();
+            if !g.ready {
+                return Err(DecisionError::Unavailable("the decision model is still loading".into()));
+            }
+            if g.paused_until.map(|t| Instant::now() < t).unwrap_or(false) {
+                return Err(DecisionError::Unavailable("the decision model is paused after an error".into()));
+            }
+        }
+        let out = self.decide_inner(request).await;
+        let mut g = self.gate.lock();
+        match &out {
+            Ok(_) => g.paused_until = None,
+            // a malformed answer is the model's fault for that question, not a reason to stop asking
+            Err(DecisionError::Invalid(_)) => {}
+            Err(_) => g.paused_until = Some(Instant::now() + self.pause),
+        }
+        out
+    }
+
+    async fn health(&self) -> Option<bool> {
+        self.check_health().await
+    }
+}
+
+impl OpenModelProvider {
+    async fn decide_inner(&self, request: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
         let started = Instant::now();
         let state = render_state(&request.state);
         let jobs: Vec<(String, Question)> = request.questions.iter().map(|(k, q)| (k.clone(), q.clone())).collect();
@@ -118,8 +213,10 @@ impl DecisionProvider for OpenModelProvider {
             latency_ms: started.elapsed().as_millis() as u64,
         })
     }
+}
 
-    async fn health(&self) -> Option<bool> {
+impl OpenModelProvider {
+    async fn check_health(&self) -> Option<bool> {
         let mut rb = self.http.get(format!("{}/models", self.base)).timeout(Duration::from_secs(3));
         if let Some(k) = &self.key {
             rb = rb.bearer_auth(k);

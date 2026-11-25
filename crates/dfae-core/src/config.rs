@@ -26,8 +26,11 @@ pub struct DecisionConfig {
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
     pub timeout_ms: u64,
-    /// How many questions of one decision are asked at the same time.
+    /// How many questions of one decision are asked at the same time (1 lets the server reuse
+    /// the cached state prefix between them, which is cheapest on a CPU).
     pub parallel: usize,
+    /// Which decisions the model makes (`all` or a list of kinds); the rest use the built-in rules.
+    pub kinds: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,10 +133,17 @@ impl Config {
             decision: DecisionConfig {
                 // `DECISION_PROVIDER=local` switches the model off even when a URL is set
                 base_url: env("DECISION_BASE_URL").filter(|_| env("DECISION_PROVIDER").map(|p| p != "local").unwrap_or(true)),
-                model: env_or("DECISION_MODEL", "qwen3:4b-instruct-2507-q8_0"),
+                model: env_or("DECISION_MODEL", "qwen3:4b-instruct-2507-q4_K_M"),
                 api_key: env("DECISION_API_KEY"),
-                timeout_ms: env_parse("DECISION_TIMEOUT_MS", 10_000),
-                parallel: env_parse("DECISION_PARALLEL", 4),
+                timeout_ms: env_parse("DECISION_TIMEOUT_MS", 15_000),
+                parallel: env_parse("DECISION_PARALLEL", 1),
+                // what the model adds most to; mode and plan checks are mostly hard rules, and the team-split
+                // decision is priced by the cost model, so they stay on the local rules
+                kinds: env_or("DECISION_KINDS", "route_task,select_tools,assess_recovery,assess_escalation,assess_completion")
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
             },
             slm: ModelConfig {
                 provider: slm_provider,
