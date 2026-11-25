@@ -106,6 +106,10 @@ services:
       DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
       # never (default): no tool call waits for a human. ask: risky calls wait for approval in the TUI.
       DFAE_APPROVALS: ${DFAE_APPROVALS:-never}
+      # complexity (0..1) from which a task is planned by the external model (needs STRONG_*); 2 = never
+      DFAE_EXTERNAL_MIN_COMPLEXITY: ${DFAE_EXTERNAL_MIN_COMPLEXITY:-}
+      DFAE_MAX_MODEL_CALLS: ${DFAE_MAX_MODEL_CALLS:-}
+      DFAE_MAX_LOCAL_CALLS: ${DFAE_MAX_LOCAL_CALLS:-}
       DFAE_REPAIR: ${DFAE_REPAIR:-}
       DFAE_LAZY_CONTEXT: ${DFAE_LAZY_CONTEXT:-}
       DFAE_TEAM: ${DFAE_TEAM:-}

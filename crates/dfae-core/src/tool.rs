@@ -92,6 +92,14 @@ impl ToolMetadata {
         format!("{}({}) {}", self.name, ps.join(", "), self.description)
     }
 
+    /// `name: what it does` (first sentence): enough for a planner that only chooses tools, because a local
+    /// system fills in the arguments.
+    pub fn brief_line(&self) -> String {
+        let first = self.description.split(". ").next().unwrap_or(&self.description);
+        let first: String = first.chars().take(140).collect();
+        format!("{}: {}", self.name, first.trim_end_matches('.'))
+    }
+
     /// The signature plus what each parameter means: for self-hosted models, where extra prompt text costs nothing.
     pub fn signature_detailed(&self) -> String {
         let help: Vec<String> = self.params.iter().filter(|p| !p.description.trim().is_empty()).map(|p| format!("{}: {}", p.name, p.description)).collect();

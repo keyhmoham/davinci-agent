@@ -16,7 +16,7 @@ impl Inner {
         }
         let entities = ctx.rec.lock().await.entities.clone();
         let mut fixed = Vec::new();
-        for s in steps.iter_mut().filter(|s| s.kind == StepKind::Tool && template_refs(&s.args).is_empty()) {
+        for s in steps.iter_mut().filter(|s| s.kind == StepKind::Tool && !s.brief && template_refs(&s.args).is_empty()) {
             let Some(meta) = s.tool.as_deref().and_then(|t| self.tools.meta(t)) else { continue };
             if let Some(fix) = repair::fix_args(&meta, &s.args, goal, &entities) {
                 s.args = fix.args;

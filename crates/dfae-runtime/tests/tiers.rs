@@ -51,6 +51,11 @@ fn plan(read: &str) -> String {
         .to_string()
 }
 
+/// What the external model writes: intents, the reasoning step done by itself (`strong`) so its prompt can be compared.
+fn brief(read: &str) -> String {
+    json!({"steps": [{"id": "s1", "do": format!("read {read}"), "tool": "fs_read"}, {"id": "s2", "do": "summarise the file", "tool": null, "after": ["s1"], "strong": true}]}).to_string()
+}
+
 fn big_file(r: &Rig) {
     let text: String = (1..=600).map(|i| format!("line number {i} of the log with some words in it\n")).collect();
     std::fs::write(r.ws.path().join("big.log"), text).unwrap();
@@ -72,15 +77,15 @@ async fn the_planner_prompt_is_generous_for_the_self_hosted_model_and_lean_for_t
         local.messages[0].content
     );
 
-    r.strong.push(&plan("big.log"));
+    r.strong.push(&brief("big.log"));
     r.strong.push("summary");
     let t = run(&r, "Read big.log and summarise it", ModeRequest::Escalated).await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     let paid = r.strong.requests.lock()[0].clone();
-    assert_eq!(paid.system, prompts::PLAN_SYSTEM);
+    assert_eq!(paid.system, prompts::BRIEF_PLAN_SYSTEM);
     assert!(!paid.system.contains("Examples") && !paid.messages[0].content.contains("params —"));
     assert!(paid.system.len() < local.system.len(), "the paid prompt is the shorter one");
-    assert_eq!(t.usage.model_calls, 2, "the plan and the step (a lone reasoning leaf is the answer) are the paid calls");
+    assert_eq!(t.usage.model_calls, 2, "the brief plan and the one step the planner kept for itself are the paid calls");
 }
 
 #[tokio::test]
@@ -91,7 +96,7 @@ async fn a_self_hosted_model_reads_the_whole_observation_the_paid_one_reads_a_su
     r.slm.push("ok");
     run(&r, "Read big.log and summarise it", ModeRequest::Assisted).await;
     let local_step = r.slm.requests.lock().iter().find(|q| q.purpose == "step").unwrap().messages[0].content.clone();
-    r.strong.push(&plan("big.log"));
+    r.strong.push(&brief("big.log"));
     r.strong.push("ok");
     run(&r, "Read big.log and summarise it", ModeRequest::Escalated).await;
     let paid_step = r.strong.requests.lock().iter().find(|q| q.purpose == "step").unwrap().messages[0].content.clone();

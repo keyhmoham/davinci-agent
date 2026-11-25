@@ -260,6 +260,19 @@ pub struct Step {
     pub started_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub finished_at: Option<DateTime<Utc>>,
+    /// An intent from a planner that has not been turned into an action yet: the program (rules, GLiNER, the
+    /// decision model, the SLM) decides the tool and its arguments right before the step runs.
+    #[serde(default)]
+    pub brief: bool,
+    /// What success looks like, in words (from the planner); the decision model judges the result against it.
+    #[serde(default)]
+    pub expect: Option<String>,
+    /// The planner wants the external model to do this reasoning step itself.
+    #[serde(default)]
+    pub strong: bool,
+    /// How the local system turned the intent into an action (provenance), e.g. `rules`, `rules+slm`.
+    #[serde(default)]
+    pub how: Option<String>,
 }
 
 fn default_step_status() -> StepStatus {
@@ -267,6 +280,12 @@ fn default_step_status() -> StepStatus {
 }
 
 impl Step {
+    /// Work for the self-hosted models: a brief step (not yet implemented) or one the local system implemented,
+    /// unless the planner asked for the external model.
+    pub fn runs_local(&self) -> bool {
+        (self.brief || self.how.is_some()) && !self.strong
+    }
+
     pub fn tool(id: &str, tool: &str, description: &str, args: Value) -> Self {
         Self {
             id: id.into(),
@@ -288,6 +307,10 @@ impl Step {
             evidence: vec![],
             started_at: None,
             finished_at: None,
+            brief: false,
+            expect: None,
+            strong: false,
+            how: None,
         }
     }
 

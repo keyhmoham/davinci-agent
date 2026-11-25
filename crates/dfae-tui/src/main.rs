@@ -115,6 +115,10 @@ fn describe(e: &Event) -> Option<String> {
                 .unwrap_or_default()
         ),
         EventKind::Repaired { step_id, note } => format!("repair    {step_id}: {note} (no model call)"),
+        EventKind::Phase { phase, detail } => format!("{phase:<9} {detail}"),
+        EventKind::StepImplemented { step_id, how, tool, args } => {
+            format!("act       {step_id} → {} {args} (by {how})", tool.as_deref().unwrap_or("reasoning"))
+        }
         EventKind::TeamFormed { goals, reason } => format!("team      {} agents — {reason}", goals.iter().filter(|g| !g.synth).count()),
         EventKind::AgentDone { step_id, role, status, generative_tokens, .. } => {
             format!("agent     {step_id} ({}) → {status:?}, {generative_tokens} generative tokens", role.as_str())
