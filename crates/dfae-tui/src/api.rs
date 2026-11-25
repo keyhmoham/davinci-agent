@@ -18,6 +18,13 @@ pub struct Api {
 pub struct TaskRow {
     pub task_id: String,
     pub goal: String,
+    /// What the user typed.
+    #[serde(default)]
+    pub asked: String,
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
     pub status: dfae_core::TaskStatus,
     pub mode: Option<dfae_core::ExecMode>,
     #[allow(dead_code)]

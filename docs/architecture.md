@@ -30,6 +30,24 @@ No model owns control flow, permissions, or the claim that a task is done.
    answers are checked for ungrounded numbers/paths/URLs.
 10. **Learn** — calibration, episodic memory, validated fact promotion, skill crystallisation.
 
+## Conversation (`session.rs`, `pipeline.rs::run_chat`, `executor.rs::run_chat_reply`)
+
+Routing already says whether a request needs tools. If it does not (and nothing binds directly or matches a skill) — or if
+tool selection finds nothing that fits — the pipeline builds a one-step `PlanSource::Chat` plan **without a planning call**.
+Its single step is a reply: greetings, thanks, "how are you" and "what can you do" are answered by rules (0 tokens);
+anything else is one call with `CHAT_SYSTEM`, a one-line `CAN:` capability list (tool categories), `NOTE: no tool fits` when
+a tool-shaped request has no tool (so the model says so instead of inventing), and the session's last four turns as real
+chat messages (≤48/80 tokens each). Chat replies skip the evidence-grounding check (there is no tool evidence) and the
+continuation round. Before routing, `session::resolve` rewrites references to earlier turns using the entities of the
+session's finished tasks (newest wins): `it`/`that file` → last file, `that link` → last URL, `my city`/`here` (with a weather
+word) → the place given in this message or earlier. The rewrite is recorded as a `repaired` event on step `goal`; the user's own
+words stay in `request.goal` and are what the Chat view shows.
+
+Planner robustness that came with it: a read-only, approval-free tool the selector missed is admitted instead of failing the plan;
+a request routed as *changing something* whose plan has no side-effecting step is sent back once with the tool names
+(`missing_effect`); dangling `after` ids are dropped; replan ids are not double-prefixed; a model's reply that claims a change
+when no side-effecting step finished gets a deterministic "nothing was changed" note.
+
 ## Token economy (`crates/dfae-runtime/src/economy/`)
 
 Zero-cost mechanisms, one module, one cost model. Inspired by the Dagwood preprint's compile-validate-repair idea;

@@ -47,6 +47,10 @@ pub struct NetworkPolicy {
     pub allowed_domains: Vec<String>,
     /// Public hosts that are not listed need approval (true) or are denied (false).
     pub unlisted_requires_approval: bool,
+    /// Read-only GETs to any *public* host run without approval (the web is the agent's window on the
+    /// world). Private/loopback addresses stay blocked, and once the task is suspected of a prompt
+    /// injection, unlisted hosts need approval again (a fetched URL is an exfiltration channel).
+    pub open_web: bool,
     pub max_response_bytes: usize,
     pub timeout_secs: u64,
 }
@@ -114,6 +118,7 @@ impl Default for NetworkPolicy {
                 "*.rust-lang.org",
             ]),
             unlisted_requires_approval: true,
+            open_web: false,
             max_response_bytes: 256 * 1024,
             timeout_secs: 15,
         }
@@ -194,7 +199,7 @@ impl PolicyEngine {
                 Err(e) => PolicyDecision::Deny(e.message),
             },
             "shell" => self.check_shell(&guard, args.get("command").and_then(|v| v.as_str()).unwrap_or("")),
-            "http_get" => self.check_url(args.get("url").and_then(|v| v.as_str()).unwrap_or("")),
+            "http_get" => self.check_url(args.get("url").and_then(|v| v.as_str()).unwrap_or(""), tainted),
             _ => PolicyDecision::Allow,
         };
         if decision == PolicyDecision::Allow {
@@ -261,16 +266,18 @@ impl PolicyEngine {
         if needs_approval { PolicyDecision::RequireApproval(format!("'{bin}' modifies the filesystem")) } else { PolicyDecision::Allow }
     }
 
-    fn check_url(&self, url: &str) -> PolicyDecision {
+    /// Scheme, credentials and local/private-address checks that apply to *every* outbound request,
+    /// including the fixed backends of the search and weather tools. Returns the lowercase host.
+    pub fn public_host(&self, url: &str) -> Result<String, String> {
         let Some((scheme, rest)) = url.split_once("://") else {
-            return PolicyDecision::Deny("URL must include a scheme".into());
+            return Err("URL must include a scheme".into());
         };
         if scheme != "http" && scheme != "https" {
-            return PolicyDecision::Deny(format!("scheme '{scheme}' is not permitted"));
+            return Err(format!("scheme '{scheme}' is not permitted"));
         }
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
         if authority.contains('@') {
-            return PolicyDecision::Deny("credentials in URLs are not permitted".into());
+            return Err("credentials in URLs are not permitted".into());
         }
         let host = authority
             .rsplit_once(':')
@@ -280,18 +287,32 @@ impl PolicyEngine {
             .trim_matches(['[', ']'])
             .to_lowercase();
         if host.is_empty() {
-            return PolicyDecision::Deny("URL has no host".into());
+            return Err("URL has no host".into());
         }
         if let Ok(ip) = host.parse::<std::net::IpAddr>()
             && is_private_ip(&ip)
         {
-            return PolicyDecision::Deny("requests to private or loopback addresses are blocked".into());
+            return Err("requests to private or loopback addresses are blocked".into());
         }
         if host == "localhost" || host.ends_with(".local") || host.ends_with(".internal") {
-            return PolicyDecision::Deny("requests to local hosts are blocked".into());
+            return Err("requests to local hosts are blocked".into());
         }
+        Ok(host)
+    }
+
+    fn check_url(&self, url: &str, tainted: bool) -> PolicyDecision {
+        let host = match self.public_host(url) {
+            Ok(h) => h,
+            Err(e) => return PolicyDecision::Deny(e),
+        };
         if self.cfg.network.allowed_domains.iter().any(|d| domain_matches(d, &host)) {
             PolicyDecision::Allow
+        } else if self.cfg.network.open_web {
+            if tainted {
+                PolicyDecision::RequireApproval(format!("'{host}' is not on the allowlist and the context contains suspected prompt injection"))
+            } else {
+                PolicyDecision::Allow
+            }
         } else if self.cfg.network.unlisted_requires_approval {
             PolicyDecision::RequireApproval(format!("'{host}' is not on the network allowlist"))
         } else {
@@ -300,7 +321,7 @@ impl PolicyEngine {
     }
 
     pub fn host_allowed_without_approval(&self, url: &str) -> bool {
-        self.check_url(url) == PolicyDecision::Allow
+        self.check_url(url, false) == PolicyDecision::Allow
     }
 }
 
@@ -423,7 +444,11 @@ mod tests {
     #[test]
     fn shipped_policy_file_parses_and_matches_the_defaults() {
         let shipped = PolicyConfig::from_toml(include_str!("../../../config/policy.toml")).expect("config/policy.toml must parse");
-        assert_eq!(serde_json::to_value(&shipped).unwrap(), serde_json::to_value(PolicyConfig::default()).unwrap());
+        // the one deliberate difference: the shipped file opens the web, the code default stays closed
+        let mut expected = PolicyConfig::default();
+        assert!(!expected.network.open_web, "the built-in default must stay closed");
+        expected.network.open_web = true;
+        assert_eq!(serde_json::to_value(&shipped).unwrap(), serde_json::to_value(expected).unwrap());
     }
 
     #[test]
@@ -513,6 +538,25 @@ mod tests {
         assert!(matches!(c("file:///etc/passwd"), PolicyDecision::Deny(_)));
         assert!(matches!(c("https://user:pw@example.com/"), PolicyDecision::Deny(_)));
         assert!(matches!(c("https://evilexample.com/"), PolicyDecision::RequireApproval(_)));
+    }
+
+    #[test]
+    fn open_web_allows_public_hosts_but_never_private_ones_and_not_after_an_injection() {
+        let d = tempfile::tempdir().unwrap();
+        let cfg = PolicyConfig::from_toml("[network]\nopen_web = true\n").unwrap();
+        let e = PolicyEngine::new(cfg, d.path().to_path_buf());
+        let c = |u: &str, tainted: bool| e.check(&meta("http_get"), &serde_json::json!({"url": u}), tainted);
+        assert_eq!(c("https://news.ycombinator.com/", false), PolicyDecision::Allow);
+        assert!(
+            matches!(c("https://news.ycombinator.com/?q=secret", true), PolicyDecision::RequireApproval(_)),
+            "a suspected injection turns a fetch into a possible leak"
+        );
+        assert_eq!(c("https://example.com/", true), PolicyDecision::Allow, "allowlisted hosts stay open");
+        for u in ["http://127.0.0.1/", "http://10.0.0.5/", "http://169.254.169.254/", "http://localhost/", "https://u:p@example.com/", "ftp://example.com/"] {
+            assert!(matches!(c(u, false), PolicyDecision::Deny(_)), "{u}");
+        }
+        assert!(e.public_host("https://api.open-meteo.com/v1/forecast").is_ok());
+        assert!(e.public_host("http://192.168.1.1/").is_err());
     }
 
     #[test]

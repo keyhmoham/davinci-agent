@@ -41,7 +41,7 @@ impl Routed {
     }
     /// A reasoning step whose description is `step` gets `reply`.
     fn step(&self, step: &'static str, reply: &str) -> &Self {
-        self.when(move |r| r.system.starts_with("You perform ONE reasoning step") && last(r).contains(&format!("STEP: {step}")), reply)
+        self.when(move |r| r.system == dfae_runtime::prompts::STEP_SYSTEM && last(r).contains(&format!("STEP: {step}")), reply)
     }
     fn calls(&self) -> usize {
         self.seen.lock().len()
@@ -230,7 +230,7 @@ async fn fan_out_runs_free_agents_and_pays_for_one_join() {
     }
     // the only model call in the whole request is the join
     assert_eq!(r.slm.calls(), 1);
-    let join = &r.slm.prompts("You perform ONE")[0];
+    let join = &r.slm.prompts("You do one step of the user")[0];
     for expect in ["<data src=\"c1 agent\">", "alpha", "beta", "gamma"] {
         assert!(join.contains(expect), "{join}");
     }

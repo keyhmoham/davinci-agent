@@ -309,6 +309,8 @@ pub enum PlanSource {
     Replan,
     /// Sub-goals delegated to a team of agents.
     Team,
+    /// A conversational reply: one step, no planning call.
+    Chat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

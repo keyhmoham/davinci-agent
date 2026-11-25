@@ -29,6 +29,19 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
             1.0,
         ),
         r("version", r"\b(?:v\d+(?:\.\d+)*|\d+\.\d+(?:\.\d+)+)(?:-[\w.]+)?\b", 0, 0.95),
+        // where the user is, said in passing ("I'm Sam from New York.") or asked about ("weather in Paris")
+        r(
+            "location",
+            r"(?i)\b(?:i(?:'m|\s+am)\b[^.!?\n]{0,40}?\bfrom|i\s+(?:live|am\s+living|am\s+based|'m\s+based)\s+in|(?:living|based|located)\s+in)\s+([A-Za-z][A-Za-z .'\-]{1,40}?)(?:\s*(?:[.,!?;\n]|$)|\s+(?:and|but|so|tell|please|what|how|can|could|now|today)\b)",
+            1,
+            0.8,
+        ),
+        r(
+            "location",
+            r"(?i)\b(?:weather|temperature|forecast|climate)\b[^.!?\n]*?\b(?:in|for|at|of|near)\s+((?:[A-Za-z][A-Za-z.'\-]*)(?:\s+[A-Za-z][A-Za-z.'\-]*){0,3}?)(?:\s+(?:today|tomorrow|now|tonight|please|right)\b|\s*[.,!?;\n]|\s*$)",
+            1,
+            0.75,
+        ),
         r("quoted", r#""([^"\n]{1,200})""#, 1, 0.9),
         r("quoted", r"'([^'\n]{2,200})'", 1, 0.8),
         r("quoted", r"`([^`\n]{1,200})`", 1, 0.9),

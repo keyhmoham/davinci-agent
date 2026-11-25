@@ -84,6 +84,9 @@ services:
       STRONG_API_KEY: ${STRONG_API_KEY:-}
       STRONG_MODEL: ${STRONG_MODEL:-claude-sonnet-5-5}
       STRONG_BASE_URL: ${STRONG_BASE_URL:-https://api.anthropic.com}
+      # web search backends (optional; without them DuckDuckGo's HTML endpoint and Wikipedia are used)
+      SEARXNG_URL: ${SEARXNG_URL:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
       DFAE_API_TOKEN: ${DFAE_API_TOKEN:-}
       DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
       DFAE_REPAIR: ${DFAE_REPAIR:-}

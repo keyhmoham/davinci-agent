@@ -135,6 +135,11 @@ struct TaskSummary {
     task_id: String,
     session_id: String,
     goal: String,
+    /// What the user typed (`goal` may have been made self-contained by the conversation resolver).
+    asked: String,
+    /// The reply (bounded: the task view has the full text).
+    answer: Option<String>,
+    error: Option<String>,
     status: TaskStatus,
     mode: Option<ExecMode>,
     verification: Option<VerificationStatus>,
@@ -164,6 +169,9 @@ async fn list_tasks(State(s): State<AppState>, Query(q): Query<ListQ>) -> Json<V
                 parent_id: t.team.as_ref().and_then(|i| i.link.as_ref()).map(|l| l.parent_id.clone()),
                 agents: t.team.as_ref().map(|i| i.children.len()).unwrap_or(0),
                 verification: t.verification.as_ref().map(|v| v.status),
+                asked: t.request.goal.clone(),
+                answer: t.final_answer.as_deref().map(|a| a.chars().take(2000).collect()),
+                error: t.error.as_deref().map(|a| a.chars().take(400).collect()),
                 task_id: t.task_id,
                 session_id: t.session_id,
                 goal: t.goal,

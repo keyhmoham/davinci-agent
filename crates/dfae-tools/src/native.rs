@@ -1,7 +1,7 @@
 //! Native tools. Each tool re-checks the policy at execution time (defence in
 //! depth) and returns compact, deterministic output.
 
-use crate::policy::{PathGuard, PolicyDecision, PolicyEngine, is_private_ip};
+use crate::policy::{PathGuard, PolicyDecision, PolicyEngine};
 use crate::registry::ToolRegistry;
 use crate::sandbox;
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Register every native tool.
@@ -23,7 +23,9 @@ pub fn register_native(reg: &mut ToolRegistry, policy: Arc<PolicyEngine>, memory
     reg.register(Arc::new(FsWrite { policy: policy.clone() }));
     reg.register(Arc::new(FsSearch { policy: policy.clone() }));
     reg.register(Arc::new(Shell { policy: policy.clone() }));
-    reg.register(Arc::new(HttpGet { policy }));
+    reg.register(Arc::new(HttpGet { policy: policy.clone() }));
+    reg.register(Arc::new(crate::web::WebSearch { policy: policy.clone() }));
+    reg.register(Arc::new(crate::web::Weather { policy }));
     reg.register(Arc::new(MemorySearch { memory: memory.clone() }));
     reg.register(Arc::new(MemoryStoreTool { memory }));
 }
@@ -287,7 +289,7 @@ impl Tool for FsWrite {
             "filesystem",
             vec![
                 ParamSpec::new("path", ParamType::String, true, "file path").hints(&["file path"]),
-                ParamSpec::new("content", ParamType::String, true, "text to write"),
+                ParamSpec::new("content", ParamType::String, true, "text to write").hints(&["quoted"]),
                 ParamSpec::new("append", ParamType::Boolean, false, "append instead of overwrite"),
             ],
         );
@@ -301,9 +303,12 @@ impl Tool for FsWrite {
                 format!(
                     r#"(?i)\b(?:write|save|put|store)\s+["'`](?P<content>[^"'`]+)["'`]\s+(?:to|into|in|as)\s+(?:the\s+)?(?:file\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))"#
                 ),
+                // "create a file named "x.txt" with content 'hi'": the path is named here, the content is the quoted entity
                 format!(
-                    r#"(?i)\bcreate\s+(?:a\s+)?file\s+(?:called\s+|named\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))\s+(?:with|containing)\s+["'`](?P<content>[^"'`]+)["'`]"#
+                    r#"(?i)\b(?:create|make|write|generate|add)\s+(?:(?:a|an|new|text)\s+)*file\s+(?:called\s+|named\s+)?["'`]?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))["'`]?(?:\s|$|[.,;!?])"#
                 ),
+                // anything else that says "create/write ... file": path and content come from the entities
+                format!(r#"(?i)\b(?:create|make|write|save|generate)\b[^\n]*?\b(?:file|[\w./\-]+\.(?:{FILE_EXT}))\b"#),
             ],
         );
         m
@@ -487,17 +492,6 @@ pub struct HttpGet {
     policy: Arc<PolicyEngine>,
 }
 
-static SCRIPT_STYLE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>").unwrap());
-static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
-
-fn html_to_text(html: &str) -> String {
-    let t = SCRIPT_STYLE.replace_all(html, " ");
-    let t = TAGS.replace_all(&t, " ");
-    let t = t.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&#39;", "'");
-    t.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 #[async_trait]
 impl Tool for HttpGet {
     fn metadata(&self) -> ToolMetadata {
@@ -519,76 +513,16 @@ impl Tool for HttpGet {
         m
     }
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
-        let meta = self.metadata();
-        let mut url = arg_str(&input, "url")?.to_string();
-        let net = &self.policy.config().network;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(net.timeout_secs))
-            .user_agent("dfae/0.1")
-            .build()
-            .map_err(|e| ToolError::other(e.to_string()))?;
-        for hop in 0..4 {
-            // every hop is re-checked against the policy
-            if let PolicyDecision::Deny(m) = self.policy.check(&meta, &json!({"url": url}), false) {
-                return Err(ToolError::policy(m));
-            }
-            let parsed = reqwest::Url::parse(&url).map_err(|e| ToolError::args(format!("bad URL: {e}")))?;
-            let host = parsed.host_str().unwrap_or_default().to_string();
-            let port = parsed.port_or_known_default().unwrap_or(80);
-            let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|e| ToolError::new(ErrorKind::Transient, format!("DNS lookup failed for {host}: {e}")))?
-                .collect();
-            if addrs.is_empty() || addrs.iter().any(|a| is_private_ip(&a.ip())) {
-                return Err(ToolError::policy(format!("{host} resolves to a private or loopback address")));
-            }
-            let resp = tokio::select! {
-                _ = ctx.cancel.cancelled() => return Err(ToolError::new(ErrorKind::Cancelled, "cancelled")),
-                r = client.get(parsed.clone()).send() => r.map_err(|e| if e.is_timeout() { ToolError::new(ErrorKind::Timeout, e.to_string()) } else { ToolError::new(ErrorKind::Transient, e.to_string()) })?,
-            };
-            let status = resp.status();
-            if status.is_redirection() {
-                let loc = resp.headers().get("location").and_then(|v| v.to_str().ok()).ok_or_else(|| ToolError::other("redirect without location"))?;
-                url = parsed.join(loc).map_err(|e| ToolError::other(e.to_string()))?.to_string();
-                if hop == 3 {
-                    return Err(ToolError::other("too many redirects"));
-                }
-                continue;
-            }
-            let ctype = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-            let cap = net.max_response_bytes;
-            let mut buf: Vec<u8> = Vec::new();
-            let mut stream = resp.bytes_stream();
-            use futures_util::StreamExt;
-            let mut truncated = false;
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|e| ToolError::new(ErrorKind::Transient, e.to_string()))?;
-                if buf.len() + chunk.len() > cap {
-                    buf.extend_from_slice(&chunk[..cap - buf.len()]);
-                    truncated = true;
-                    break;
-                }
-                buf.extend_from_slice(&chunk);
-            }
-            let body = String::from_utf8_lossy(&buf).into_owned();
-            let text = if ctype.contains("html") { html_to_text(&body) } else { body };
-            if status.as_u16() == 404 {
-                return Err(ToolError::new(ErrorKind::NotFound, format!("HTTP 404 for {url}")));
-            }
-            if status.as_u16() == 429 || status.is_server_error() {
-                return Err(ToolError::new(ErrorKind::Transient, format!("HTTP {status} for {url}")));
-            }
-            let content =
-                format!("HTTP {} {}\n{}{}", status.as_u16(), ctype.split(';').next().unwrap_or(""), text, if truncated { "\n…[truncated]" } else { "" });
-            return Ok(ToolOutput {
-                content,
-                ok: status.is_success(),
-                exit_code: Some(status.as_u16() as i32),
-                evidence: vec![format!("HTTP {}", status.as_u16())],
-            });
+        let url = arg_str(&input, "url")?.to_string();
+        let f = crate::web::fetch(&self.policy, &self.metadata(), &url, &[], &ctx.cancel, false).await?;
+        if f.status == 404 {
+            return Err(ToolError::new(ErrorKind::NotFound, format!("HTTP 404 for {url}")));
         }
-        Err(ToolError::other("too many redirects"))
+        if f.status == 429 || f.status >= 500 {
+            return Err(ToolError::new(ErrorKind::Transient, format!("HTTP {} for {url}", f.status)));
+        }
+        let content = format!("HTTP {} {}\n{}{}", f.status, f.ctype, f.text, if f.truncated { "\n…[truncated]" } else { "" });
+        Ok(ToolOutput { content, ok: (200..300).contains(&f.status), exit_code: Some(f.status as i32), evidence: vec![format!("HTTP {}", f.status)] })
     }
 }
 
@@ -735,6 +669,6 @@ mod tests {
 
     #[test]
     fn html_is_stripped() {
-        assert_eq!(html_to_text("<html><script>x()</script><body><h1>Hi</h1> there &amp; you</body></html>"), "Hi there & you");
+        assert_eq!(crate::web::html_to_text("<html><script>x()</script><body><h1>Hi</h1> there &amp; you</body></html>"), "Hi there & you");
     }
 }

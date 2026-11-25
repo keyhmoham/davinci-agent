@@ -278,6 +278,9 @@ impl Inner {
         mode: ExecMode,
         deps: &[(String, Option<String>, String, String)],
     ) -> Result<StepOutput, StepFailure> {
+        if ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false) {
+            return self.run_chat_reply(ctx, step, mode).await;
+        }
         let tier = self.pick_tier(mode).ok_or_else(|| StepFailure::new(ErrorKind::Policy, "no language model is configured for reasoning steps"))?;
         let ctx_text = self.context_text(ctx, false).await;
         // lazy context: short upstream summaries first; the model may ask for more (`NEED s1`)
@@ -317,6 +320,41 @@ impl Inner {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
         }
         Ok(StepOutput { content: text, evidence })
+    }
+
+    /// A conversational reply. Greetings and thanks cost nothing; anything else is one model call
+    /// with the last few turns of the session as real chat messages.
+    async fn run_chat_reply(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, mode: ExecMode) -> Result<StepOutput, StepFailure> {
+        let goal = ctx.rec.lock().await.goal.clone();
+        let can = self.capabilities(ctx);
+        if let Some(t) = crate::session::small_talk(&goal, &can) {
+            return Ok(StepOutput { content: t, evidence: vec!["answered without a model".into()] });
+        }
+        let tier = self.pick_tier(mode).ok_or_else(|| {
+            StepFailure::new(
+                ErrorKind::Policy,
+                "no language model is configured, so I can only run tool requests (files, calculator, web search, weather…) — set SLM_BASE_URL or STRONG_API_KEY to chat",
+            )
+        })?;
+        let turns = ctx.base_ctx.lock().turns.clone();
+        let gap = if step.description.contains("no tool fits") { "NOTE: no tool fits this request\n" } else { "" };
+        let user = format!("CAN: {can}\n{gap}{goal}");
+        let mut req = self.gen_request(tier, prompts::CHAT_SYSTEM, user, "chat");
+        req.temperature = 0.6;
+        let current = req.messages.pop();
+        for (q, a) in turns {
+            req.messages.push(Message::user(q));
+            if !a.trim().is_empty() {
+                req.messages.push(Message::assistant(a));
+            }
+        }
+        req.messages.extend(current);
+        let text = self.generate_text(ctx, tier, req).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?;
+        let text = text.trim().to_string();
+        if let Some(issue) = economy::contracts::model_output_issue(&text) {
+            return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
+        }
+        Ok(StepOutput { content: text, evidence: vec![] })
     }
 
     async fn run_tool(
@@ -657,6 +695,8 @@ impl Inner {
             m.extend(new_steps);
             m
         };
+        let mut merged = merged;
+        planner::prune_unknown_deps(&mut merged);
         let remaining = self.remaining_budget(ctx).await;
         planner::validate_plan(&merged, &self.tools, &allowed, &remaining).map_err(|e| e.join("; "))?;
         let revised = {

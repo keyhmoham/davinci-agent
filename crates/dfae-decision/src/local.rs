@@ -32,6 +32,13 @@ const TYPE_LEXICON: &[(&str, &[&str])] = &[
             "wiki",
             "summarize",
             "papers",
+            "weather",
+            "temperature",
+            "forecast",
+            "online",
+            "google",
+            "browse",
+            "website",
         ],
     ),
     (

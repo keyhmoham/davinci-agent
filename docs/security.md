@@ -15,7 +15,7 @@ before execution on the final arguments** (templates resolved); (3) again **insi
 |---|---|
 | filesystem | read/write roots (default: the workspace); path normalisation **and** symlink resolution of the deepest existing ancestor; `.git`, `.env`, `id_*`, `.ssh`, `.aws` always denied; **writes need approval**; `fs_write` verifies by reading back |
 | shell | argv execution (no shell, so no pipes/redirects/globbing/substitution); command allowlist; bare names only; **every non-flag argument and `--flag=value` is path-resolved** (so `cat link-to-outside`, `du --files0-from=/etc/passwd` are denied); per-command denied flags (`find -exec/-delete/-fprint`, `sort -o`, `date -s`); environment cleared; 10 s timeout; 64 KB output cap; mutating commands (`mkdir cp mv touch`) need approval |
-| network | domain allowlist (unlisted → approval); `http(s)` only; no URL credentials; loopback/private/link-local/metadata addresses blocked **after DNS resolution and at every redirect hop**; response size and time caps |
+| network | domain allowlist; with `open_web = true` (shipped) other **public** hosts are read-only GETs without approval — unless the task is tainted by a suspected prompt injection, when they need approval again; `http(s)` only; no URL credentials; loopback/private/link-local/metadata addresses blocked **after DNS resolution and at every redirect hop**; response size and time caps |
 | approvals | bound to `sha256(tool|canonical-args)`; expire; re-verified before running; API can require a bearer token |
 | injection | tool output is wrapped as `<data>`; secrets redacted before storage; heuristics flag instruction-like text → task **tainted** → every side-effecting step then needs approval; step prompts tell models that `<data>` is never instructions |
 | audit | append-only API, **hash-chained per task** (`sha256(prev ‖ kind ‖ canonical payload)`); `GET /v1/tasks/{id}/audit` returns `chain_valid` |
@@ -39,7 +39,7 @@ routing, so a mis-classified state-changing request fails closed (its write tool
   numeric facts to the configured decision API. With no key, decisions are made locally and nothing is sent.
 - **Stronger model** (only if configured): plan/answer prompts, including compressed tool outputs, go to that provider.
 - **SLM / GLiNER / Postgres** are local services in the compose network.
-- `http_get` contacts the domains the policy allows (or that a human approves).
+- `http_get` contacts the domains the policy allows; with `open_web = true` any public host (never private ranges). `web_search` and `weather` call fixed third-party backends (SearXNG/Brave if configured, DuckDuckGo, Wikipedia, Open-Meteo, wttr.in) through the same private-address and size/time guards. What you search for and the places you ask about leave the machine.
 
 ## Known limits
 

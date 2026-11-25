@@ -176,7 +176,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | Key | Action |
 |---|---|
 | `Enter` | submit the request |
-| `Tab` / `Shift+Tab` | Timeline · Plan · **Team** · Cognition · Tokens · Memory · Tools |
+| `Tab` / `Shift+Tab` | **Chat** (home) · Timeline · Plan · Team · Cognition · Tokens · Memory · Tools |
 | `↑`/`↓` | select task (empty input) or recall history |
 | `y` / `n` | approve / deny the pending approval |
 | `Ctrl+A` | jump to a task waiting for approval |
@@ -187,7 +187,25 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 
 Commands: `/mode`, `/team auto|on|off`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/cancel`, `/autoapprove on`, `/quit`.
 
-Things to try: `what is 12 * (3 + 4)?` · `list the files in ./ and what time is it` ·
+### Conversation and the open web
+
+A session is a conversation. Greetings and small talk cost **no model call**; a question that needs no tool is
+**one** call (no plan) with the last few turns attached as real chat messages; and short references are resolved
+by rules before anything else looks at the request — `read it`, `delete that file`, `fetch that link`,
+`what's the weather in my city` (a place you mentioned earlier in the session, or in the same message).
+The Chat tab shows the thread; Tab shows how each reply was produced.
+
+| Tool | What it does | Notes |
+|---|---|---|
+| `web_search` | titles, URLs, snippets; `fetch_top=1..2` also reads the top pages | SearXNG (`SEARXNG_URL`) → Brave (`BRAVE_API_KEY`) → DuckDuckGo HTML → Wikipedia |
+| `http_get` | fetch any public URL as text | `open_web = true` in `config/policy.toml` (shipped); set `false` to restrict to the allowlist |
+| `weather` | current weather + 3-day forecast, formatted by code | Open-Meteo, falling back to wttr.in; "weather in Paris" runs with **0 model tokens** |
+
+The open web is read-only and bounded: private, loopback, link-local and metadata addresses are always blocked (after DNS and on every
+redirect), responses are size- and time-capped, and once any tool output looks like a prompt injection, fetching an unlisted host needs approval
+again (a URL can carry data out). Search results and pages are untrusted data to the model.
+
+Things to try: `hi` · `what is a mutex?` · `search the web for rust async book` · `weather in Paris` · `what is 12 * (3 + 4)?` · `list the files in ./ and what time is it` ·
 `write 'hello' to notes/hello.txt` (asks for approval) · `remember that the staging db is db-staging-01`
 then `what do you remember about the staging db?` · with the SLM up:
 `read notes/hello.txt and tell me how many words it contains`.
@@ -239,7 +257,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 170+ tests, hermetic
+cargo test --workspace                       # 190+ tests, hermetic
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -249,12 +267,14 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 170+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 190+ unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
 | Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |
 | Token economy payoff on a *real* model | **unmeasured** — priors come from the shipped prompts; savings per avoided repair (~300–500 tokens) are estimates; lazy context may cost more than it saves for some workloads |
 | Quality of automatic splits with a *real* SLM/Jev | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
+| Conversation (small talk, chat turns, session history, "it"/"that file"/"my city" resolution), file-creation phrasings, planner-slip recovery | verified (`crates/dfae-runtime/tests/chat.rs`) and with the real server |
+| `web_search` / `http_get` / `weather` | parsers unit-tested on fixtures; **run live from the build sandbox**: DuckDuckGo search + page read worked, Open-Meteo was rate-limited there and the wttr.in fallback answered. Third-party services change — treat as best effort |
 | Postgres store, audit chain | verified against PostgreSQL 16 (`real[]` fallback path) |
 | HTTP API + SSE + auth, TUI rendering and key handling | verified (integration tests; TUI also driven in a real terminal) |
 | GLiNER service with the real model, called by the Rust engine | verified manually (extraction of the blueprint example) |

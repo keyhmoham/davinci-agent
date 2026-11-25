@@ -36,8 +36,13 @@ allowed_domains = [
   "raw.githubusercontent.com", "docs.rs", "crates.io", "nvd.nist.gov",
   "*.postgresql.org", "httpbin.org", "*.python.org", "*.rust-lang.org",
 ]
-# public hosts that are not listed need approval (false = denied outright).
-# Private, loopback and link-local addresses are always blocked.
+# Read-only GETs to any public host run without approval, so the agent can use the
+# open web (search results, pages, APIs). Private, loopback and link-local addresses
+# are always blocked, and once a tool output looks like a prompt injection unlisted
+# hosts need approval again (a URL can carry data out). Set false to restrict the
+# agent to the list above.
+open_web = true
+# with open_web = false: public hosts that are not listed need approval (false = denied).
 unlisted_requires_approval = true
 max_response_bytes = 262144
 timeout_secs = 15

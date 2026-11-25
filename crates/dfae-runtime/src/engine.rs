@@ -78,6 +78,8 @@ impl TaskCtx {
 pub(crate) struct ContextBase {
     pub memories: Vec<dfae_memory::RankedMemory>,
     pub prior_turns: Vec<String>,
+    /// The last few `(request, reply)` pairs of this session, for conversational replies.
+    pub turns: Vec<(String, String)>,
     /// Results of the agents this one depends on `(label, summary)`.
     pub upstream: Vec<(String, String)>,
 }

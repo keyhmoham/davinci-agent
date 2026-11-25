@@ -54,14 +54,26 @@ pub fn plan_from_calls(goal: &str, calls: &[DirectCall]) -> Plan {
     Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None }
 }
 
+/// A conversational reply: one reasoning step, no planning call. `gap` marks a request that
+/// needs a capability none of the tools has, so the reply says so honestly.
+pub fn chat_plan(goal: &str, gap: bool) -> Plan {
+    let desc = if gap { "reply; no tool fits this request" } else { "reply" };
+    Plan { goal: goal.into(), steps: vec![Step::reasoning("s1", desc)], source: PlanSource::Chat, revision: 0, estimate: None }
+}
+
 /// Parse a model-produced plan. `prefix` is prepended to every new step id
 /// (replans); dependencies on ids outside the new set are kept verbatim.
 pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, registry: &ToolRegistry) -> Result<Vec<Step>, String> {
     let arr = v.get("steps").and_then(|s| s.as_array()).ok_or("missing 'steps' array")?;
+    // the replan prompt asks for ids that start with the prefix, so a model that obeys must not get it twice
+    let strip = |id: &str| -> String { if prefix.is_empty() { id.to_string() } else { id.strip_prefix(prefix).unwrap_or(id).to_string() } };
     let raw_ids: Vec<String> =
-        arr.iter().enumerate().map(|(i, s)| s.get("id").and_then(|x| x.as_str()).map(String::from).unwrap_or_else(|| format!("s{}", i + 1))).collect();
+        arr.iter().enumerate().map(|(i, s)| s.get("id").and_then(|x| x.as_str()).map(&strip).unwrap_or_else(|| format!("s{}", i + 1))).collect();
     let new_ids: HashSet<&String> = raw_ids.iter().collect();
-    let rename = |id: &str| -> String { if new_ids.contains(&id.to_string()) { format!("{prefix}{id}") } else { id.to_string() } };
+    let rename = |id: &str| -> String {
+        let bare = strip(id);
+        if new_ids.contains(&bare) { format!("{prefix}{bare}") } else { id.to_string() }
+    };
     let mut steps = Vec::new();
     for (i, s) in arr.iter().enumerate() {
         let id = format!("{prefix}{}", raw_ids[i]);
@@ -108,6 +120,36 @@ pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, regis
     }
     let _ = (goal, source);
     Ok(steps)
+}
+
+/// Drop dependencies on steps that do not exist (a model's slip, e.g. `after: ["r1_2"]` with no such step).
+/// Data still flows only through `{{id}}` templates, which are checked when the step runs.
+pub fn prune_unknown_deps(steps: &mut [Step]) -> Vec<String> {
+    let ids: HashSet<String> = steps.iter().map(|s| s.id.clone()).collect();
+    let mut dropped = Vec::new();
+    for s in steps.iter_mut() {
+        s.depends_on.retain(|d| {
+            let known = ids.contains(d);
+            if !known {
+                dropped.push(format!("{} -> {d}", s.id));
+            }
+            known
+        });
+    }
+    dropped
+}
+
+/// A request that changes something (create, write, delete…) must be planned with a tool that does.
+/// `allowed` is what the planner was offered; the problem names the tools it should have used.
+pub fn missing_effect(steps: &[Step], registry: &ToolRegistry, allowed: &[String]) -> Option<String> {
+    let effect: Vec<&String> = allowed.iter().filter(|n| registry.meta(n).map(|m| m.side_effects).unwrap_or(false)).collect();
+    if effect.is_empty() || steps.iter().any(|s| s.kind == StepKind::Agent || s.tool.as_ref().map(|t| effect.contains(&t)).unwrap_or(false)) {
+        return None;
+    }
+    Some(format!(
+        "the request asks to change something but no step does it; add a step using {}",
+        effect.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" or ")
+    ))
 }
 
 fn substitute_ids(v: &Value, rename: &dyn Fn(&str) -> String) -> Value {
@@ -159,7 +201,7 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
                 None => errs.push(format!("step {}: unknown tool '{name}'", s.id)),
                 Some(m) => {
                     if !allowed.iter().any(|a| a == name) {
-                        errs.push(format!("step {}: tool '{name}' is not available for this task", s.id));
+                        errs.push(format!("step {}: tool '{name}' is not available for this task; use only: {}", s.id, allowed.join(", ")));
                     }
                     // arguments that contain templates are validated at run time
                     let has_template = !template_refs(&s.args).is_empty();
@@ -265,6 +307,33 @@ mod tests {
         let steps = parse_plan(&v, "g", PlanSource::Replan, "r1_", &r).unwrap();
         assert_eq!(steps[0].id, "r1_s1");
         assert_eq!(steps[1].depends_on, vec!["r1_s1", "s9"]);
+    }
+
+    #[test]
+    fn replan_ids_that_already_carry_the_prefix_are_not_prefixed_twice() {
+        let r = registry();
+        let v = json!({"steps": [
+            {"id": "r1_1", "tool": "fs_list", "args": {"path": "."}},
+            {"id": "r1_2", "tool": null, "after": ["r1_1", "r1_9"], "args": {}}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Replan, "r1_", &r).unwrap();
+        assert_eq!((steps[0].id.as_str(), steps[1].id.as_str()), ("r1_1", "r1_2"));
+        assert_eq!(steps[1].depends_on, vec!["r1_1", "r1_9"]);
+        assert_eq!(prune_unknown_deps(&mut steps), vec!["r1_2 -> r1_9"]);
+        assert_eq!(steps[1].depends_on, vec!["r1_1"]);
+        validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+    }
+
+    #[test]
+    fn a_changing_request_needs_a_changing_step() {
+        let r = registry();
+        let allowed = vec!["fs_write".to_string(), "fs_list".to_string()];
+        let list = parse_plan(&json!({"steps": [{"id": "s1", "tool": "fs_list", "args": {"path": "."}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        assert!(missing_effect(&list, &r, &allowed).unwrap().contains("fs_write"));
+        let write =
+            parse_plan(&json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a", "content": "b"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        assert!(missing_effect(&write, &r, &allowed).is_none());
+        assert!(missing_effect(&list, &r, &["fs_list".to_string()]).is_none(), "nothing offered could change anything");
     }
 
     #[test]

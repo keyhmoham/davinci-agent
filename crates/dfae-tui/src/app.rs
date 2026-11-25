@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
+    Chat,
     Timeline,
     Plan,
     Team,
@@ -20,9 +21,10 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 7] = [Tab::Timeline, Tab::Plan, Tab::Team, Tab::Context, Tab::Tokens, Tab::Memory, Tab::Tools];
+    pub const ALL: [Tab; 8] = [Tab::Chat, Tab::Timeline, Tab::Plan, Tab::Team, Tab::Context, Tab::Tokens, Tab::Memory, Tab::Tools];
     pub fn title(self) -> &'static str {
         match self {
+            Tab::Chat => "Chat",
             Tab::Timeline => "Timeline",
             Tab::Plan => "Plan",
             Tab::Team => "Team",
@@ -148,7 +150,7 @@ impl App {
             selected: 0,
             detail: None,
             events: vec![],
-            tab: Tab::Timeline,
+            tab: Tab::Chat,
             input: InputBox::default(),
             mode: ModeRequest::Auto,
             delegate: None,
@@ -303,7 +305,7 @@ impl App {
             }
             KeyCode::Tab => self.tab = Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()],
             KeyCode::BackTab => self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()],
-            KeyCode::Char(c @ '1'..='7') if self.input.text.is_empty() && key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char(c @ '1'..='8') if self.input.text.is_empty() && key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::ALL[(c as usize) - ('1' as usize)];
             }
             KeyCode::Up => {
@@ -567,6 +569,9 @@ mod tests {
             role: None,
             parent_id: parent.map(String::from),
             agents: 0,
+            asked: String::new(),
+            answer: None,
+            error: None,
         }
     }
 
@@ -608,10 +613,11 @@ mod tests {
     #[test]
     fn tabs_and_quit_keys() {
         let mut app = App::new("http://x");
+        assert_eq!(app.tab, Tab::Chat, "the conversation is the home view");
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Timeline);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Plan);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.tab, Tab::Team);
         app.handle_key(key(KeyCode::BackTab));
         app.handle_key(key(KeyCode::BackTab));
         app.handle_key(key(KeyCode::BackTab));
@@ -650,6 +656,9 @@ mod tests {
             role: None,
             parent_id: None,
             agents: 0,
+            asked: String::new(),
+            answer: None,
+            error: None,
         }];
         let tid = rec.task_id.clone();
         app.apply_detail(rec);
