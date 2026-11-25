@@ -268,7 +268,7 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
         ));
         if m.external_min_complexity > 0.0 {
             out.push(format!(
-                "POLICY: work of complexity {:.2} or more that does not bind to tools outright is medium or complex: with an external model available it is planned by it and carried out by the local system",
+                "POLICY: planning is always done by the external model (when one exists) and carried out by the local system. Choose escalated for any request that needs a plan (several dependent steps, building or serving something, results that decide the next step; complexity {:.2} or more is a hint). Choose assisted only for one quick action or a reply that needs no plan.",
                 m.external_min_complexity
             ));
         }

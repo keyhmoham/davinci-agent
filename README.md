@@ -23,12 +23,19 @@ docker compose run --rm tui      # the terminal UI
 
 ## Plan with the best model, act with the local ones
 
-With an external model configured (`STRONG_*`), the work of a medium or complex task is split into two phases that never mix:
+**Planning is always the external model's, and the decision model decides whether a request needs planning at all.** For every request it
+chooses between three handlings: *direct* (the request binds to tools outright), *quick* (one action or a reply that the local triple —
+SLM + decision model + extractor — handles alone: one step, no plan, no external call) and *needs a plan* (several dependent steps,
+something to build and run or serve, work whose next step depends on results). A quick step that turns out not to be enough fails with its
+actual result and the external model re-plans. With no external model configured the self-hosted one has to plan; with one configured it
+never does — if the external model cannot be reached the task fails with the reason (`DFAE_PLAN_FALLBACK=slm` lets the local model plan
+instead). Conversation is a reply, not a plan: the local models answer it. A task that needs a plan is split into two phases that never mix:
 
 1. **Planning** — the external model writes a *brief plan*: a few steps, each an **intent** in one sentence (every concrete path, name, pattern
    or text in it), an optional tool, the steps it depends on, and what the result must show (`expect`). It writes no tool arguments, so the paid
-   output stays short. It is used by default for every task the decision model rates medium or higher
-   (`DFAE_EXTERNAL_MIN_COMPLEXITY`, default 0.3) that does not bind deterministically — and for conversation of that complexity.
+   output stays short. It is used for every request the decision model says needs a plan
+   (`DFAE_EXTERNAL_MIN_COMPLEXITY`, default 0.3, is only the complexity at which the built-in rules — the fallback when the decision model is
+   down — say so).
 2. **Acting** — the program drives the self-hosted triple, step by step, right before each step runs (so it sees the real results of earlier steps):
    GLiNER and the rules read the sentence for paths, names and quoted text; the tools' own patterns and the entities bind what they can; the
    decision model chooses the tool when the planner left it open and later judges the result against `expect`; the SLM fills in what is still
@@ -52,8 +59,8 @@ Every request takes the cheapest path that can do the job:
 | Mode | Components | Generative tokens | Used when |
 |---|---|---|---|
 | **Direct** | decision model + code + tools | **0** external | the request binds to tools deterministically ("what is 12*(3+4)", "list the files in ./ and what time is it", a replayed learned skill) |
-| **Assisted** | + SLM | 0 external (SLM tokens are free); planning + reasoning steps only | planning, writing, analysis, unusual arguments |
-| **Escalated** | + stronger model | the only paid mode: lean prompts, a call budget | the SLM's plan is invalid, repeated failures, or high complexity (and a stronger model is configured) |
+| **Assisted** (quick) | + SLM | 0 external (SLM tokens are free); one step, no plan | one quick action or a reply the local models handle alone (with no external model configured: the SLM also plans) |
+| **Escalated** (plan) | + external model | the only paid mode: a brief plan, re-plans, hard steps | the decision model says the request needs a plan (and an external model is configured) |
 
 Requests that split into sub-tasks are handled by a **team of subagents** that forms automatically
 (see [Teams](#teams-subagents-swarm-and-dispatch)); each agent picks its own mode, so a deterministic
@@ -317,6 +324,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `DFAE_MAX_STEPS`, `_MAX_MODEL_CALLS`, `_MAX_TOOL_CALLS`, `_MAX_REPLANS`, `_MAX_SECONDS`, `_MAX_CHILDREN` | per-task budgets |
 | `DFAE_REPAIR` | `off` disables deterministic repair |
 | `DFAE_LAZY_CONTEXT` | `on` enables lazy upstream context (`NEED <step>` expansion); off by default |
+| `DFAE_PLAN_FALLBACK` | `slm`: let the self-hosted model plan when the external one cannot be reached (default: the task fails with the reason) |
 | `DFAE_PLAN_FORMAT` | `json` makes the external planner write JSON instead of compact plan lines |
 | `DFAE_PLAN_PREFIX` | `narrow`/`off`: per-task tool list in the user message; `always`: send the cacheable prefix on every planner call; default: prefix only while the provider's cache is warm |
 | `STRONG_PROMPT_CACHE` | `on` declares that an OpenAI-compatible external endpoint caches repeated prompt prefixes (Anthropic and `api.openai.com` are known to) |

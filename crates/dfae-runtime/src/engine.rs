@@ -660,6 +660,11 @@ impl Inner {
         }
     }
 
+    /// Who writes and revises plans: the external model whenever there is one; the self-hosted one only when there is no other.
+    pub(crate) fn planner_tier(&self, mode: ExecMode) -> Option<Tier> {
+        if self.models.has(Tier::Strong) { Some(Tier::Strong) } else { self.pick_tier(mode) }
+    }
+
     /// Would reasoning in this mode go to the external (paid) model? Self-hosted models are free.
     pub(crate) fn is_external(&self, mode: ExecMode) -> bool {
         self.pick_tier(mode) == Some(Tier::Strong)

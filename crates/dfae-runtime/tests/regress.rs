@@ -113,8 +113,11 @@ async fn placeholders_a_small_model_invents_are_sent_back_not_written_into_the_p
 }
 
 #[tokio::test]
-async fn when_the_external_model_is_down_the_self_hosted_one_plans_and_answers() {
-    let r = rig(true, |c| c.thresholds.external_min_complexity = 0.01);
+async fn when_the_external_model_is_down_the_self_hosted_one_plans_only_if_the_deployment_allows_it() {
+    let r = rig(true, |c| {
+        c.thresholds.external_min_complexity = 0.01;
+        c.economy.plan_fallback_slm = true;
+    });
     r.strong.push_err("connection refused");
     r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a.txt", "content": "hi"}}]}).to_string());
     let t = run(&r, "Create a file a.txt that says hi, and keep it tidy and short").await;
@@ -126,7 +129,7 @@ async fn when_the_external_model_is_down_the_self_hosted_one_plans_and_answers()
 }
 
 #[tokio::test]
-async fn a_conversation_the_external_model_cannot_answer_is_answered_locally() {
+async fn a_conversation_is_answered_locally_whether_or_not_the_external_model_is_up() {
     let r = rig(true, |c| c.thresholds.external_min_complexity = 0.01);
     r.strong.push_err("HTTP 503 overloaded");
     r.slm.push("A mutex admits one thread at a time.");

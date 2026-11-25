@@ -833,7 +833,7 @@ impl Inner {
                     return Some(label);
                 }
                 let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
-                let tier = if action == Escalate { Tier::Strong } else { self.pick_tier(mode).unwrap_or(Tier::Slm) };
+                let tier = if action == Escalate { Tier::Strong } else { self.planner_tier(mode).unwrap_or(Tier::Slm) };
                 if !self.models.has(tier) {
                     return Some(label);
                 }

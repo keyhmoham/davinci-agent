@@ -92,6 +92,9 @@ pub struct EconomyConfig {
     /// Off by default: the planner pays for the reply in (five-times-priced) output tokens even when a local model would
     /// have written an equally good one for free. For deployments whose self-hosted model writes poor answers.
     pub plan_report: bool,
+    /// Planning is always the external model's. When it cannot be reached the task fails with the reason — unless
+    /// `DFAE_PLAN_FALLBACK=slm`, which lets the self-hosted model plan instead.
+    pub plan_fallback_slm: bool,
     /// The final answer is composed by the self-hosted model and checked against the evidence; the external model
     /// is asked only when that check fails.
     pub answer_local_first: bool,
@@ -225,6 +228,7 @@ impl Config {
                 plan_lines: !matches!(env("DFAE_PLAN_FORMAT").as_deref(), Some("json")),
                 plan_prefix: !matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("narrow" | "off")),
                 plan_prefix_always: matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("always")),
+                plan_fallback_slm: matches!(env("DFAE_PLAN_FALLBACK").as_deref(), Some("slm")),
                 plan_report: matches!(env("DFAE_PLAN_REPORT").as_deref(), Some("on" | "true" | "1")),
                 answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
                 workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),

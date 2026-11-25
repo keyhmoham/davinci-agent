@@ -123,9 +123,8 @@ impl Inner {
 
         // ---- 4b. conversation: nothing to run, so nothing to plan ----------------------
         if !is_agent && calls.is_none() && skill.is_none() && !routing.needs_tools && req.mode == ModeRequest::Auto {
-            // a conversational reply of medium or higher complexity is written by the external model too
-            let paid = self.models.has(Tier::Strong) && routing.complexity >= self.cfg.thresholds.external_min_complexity;
-            return self.run_chat(ctx, &goal, false, if paid { ExecMode::Escalated } else { ExecMode::Assisted }).await;
+            // a reply needs no plan: the local models answer it (planning is what the external model is for)
+            return self.run_chat(ctx, &goal, false, ExecMode::Assisted).await;
         }
 
         // ---- 5. mode ---------------------------------------------------------
@@ -603,6 +602,7 @@ impl Inner {
         let mut tstate = base_state.clone();
         tstate.tools = self.scoped_briefs(ctx);
         let picked = self.note(ctx, self.decider.select_tools(tstate).await).await;
+        let top_tool = picked.first().map(|(n, _)| n.clone());
         let mut allowed: Vec<String> = picked.into_iter().map(|(n, _)| n).collect();
         // every tool listed is prompt text: a paid model gets the six best, a self-hosted one all that were judged relevant
         if self.pick_tier(mode) == Some(Tier::Strong) {
@@ -633,6 +633,21 @@ impl Inner {
             return Ok((planner::chat_plan(goal, true), ExecMode::Assisted));
         }
         *ctx.allowed.lock() = allowed.clone();
+
+        // The decision model said this needs no plan: one step, made here without asking anyone to plan it. The best-fitting
+        // tool (or none: the local model writes the reply) is the step; the local system binds its arguments just before it
+        // runs. If that is not enough, the step fails and the external model re-plans with the actual result in hand.
+        if mode == ExecMode::Assisted && self.models.has(Tier::Strong) && !is_member {
+            let mut step = match top_tool.filter(|t| ctx.in_scope(t)) {
+                Some(t) => Step::tool("s1", &t, goal, json!({})),
+                None => Step::reasoning("s1", goal),
+            };
+            step.brief = true;
+            return Ok((
+                Plan { goal: goal.into(), steps: vec![step], source: PlanSource::Quick, revision: 0, estimate: None, report: None },
+                ExecMode::Assisted,
+            ));
+        }
 
         let budget = ctx.rec.lock().await.budget.clone();
         let mut tier = self
@@ -673,7 +688,7 @@ impl Inner {
                 Err(e) => {
                     last_err = e;
                     // the external model cannot be reached (down, rate-limited): the self-hosted one plans instead
-                    if tier == Tier::Strong && self.models.has(Tier::Slm) && last_err.contains("model request failed") {
+                    if tier == Tier::Strong && self.models.has(Tier::Slm) && self.cfg.economy.plan_fallback_slm && last_err.contains("model request failed") {
                         self.emit(
                             ctx,
                             EventKind::Warning { message: format!("the external model is unavailable ({last_err}); the self-hosted model plans instead") },
@@ -695,7 +710,12 @@ impl Inner {
                 }
             }
         }
-        Err(format!("could not produce a valid plan: {last_err}"))
+        let hint = if self.models.has(Tier::Strong) && self.models.has(Tier::Slm) && !self.cfg.economy.plan_fallback_slm {
+            " (planning is always the external model's; DFAE_PLAN_FALLBACK=slm lets the local model plan when it cannot be reached)"
+        } else {
+            ""
+        };
+        Err(format!("could not produce a valid plan: {last_err}{hint}"))
     }
 
     /// Generate → parse → validate, with a single repair round naming the problems.
@@ -856,7 +876,7 @@ impl Inner {
             return Ok(false);
         }
         let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
-        let Some(tier) = self.pick_tier(mode) else { return Ok(false) };
+        let Some(tier) = self.planner_tier(mode) else { return Ok(false) };
         let added =
             self.replan(ctx, tier, goal, "the evidence collected so far does not show the request is fully accomplished; add the missing steps", None).await?;
         Ok(added)

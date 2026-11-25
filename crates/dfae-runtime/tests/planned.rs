@@ -42,6 +42,15 @@ impl DecisionProvider for Picky {
 }
 
 fn rig(picky: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
+    rig_with(picky, true, tweak)
+}
+
+/// A deployment with no external model: the self-hosted one has to plan as well.
+fn rig_local(picky: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
+    rig_with(picky, false, tweak)
+}
+
+fn rig_with(picky: bool, with_strong: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
     let ws = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
@@ -59,7 +68,7 @@ fn rig(picky: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
         extractor: Arc::new(HybridExtractor::new(None)),
         config: cfg,
         store,
-        models: ModelGateway::new(Some(Arc::new(slm.clone())), Some(Arc::new(strong.clone()))),
+        models: ModelGateway::new(Some(Arc::new(slm.clone())), with_strong.then(|| Arc::new(strong.clone()) as Arc<dyn LanguageModel>)),
         tools: Arc::new(reg),
         policy,
     });
@@ -200,9 +209,8 @@ async fn a_result_that_misses_the_planners_expectation_goes_back_to_the_external
 }
 
 #[tokio::test]
-async fn without_an_external_model_nothing_changes_and_below_the_threshold_neither() {
-    // threshold above any complexity: the self-hosted models handle it alone, with their own concrete plan
-    let r = rig(false, |c| c.thresholds.external_min_complexity = 2.0);
+async fn without_an_external_model_the_self_hosted_ones_plan_with_a_concrete_plan() {
+    let r = rig_local(false, |_| {});
     std::fs::write(r.ws.path().join("config.toml"), "port = 8080\n").unwrap();
     r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {"path": "config.toml"}}, {"id": "s2", "tool": null, "do": "say the port", "after": ["s1"]}]}).to_string());
     r.slm.push("8080");
@@ -213,20 +221,58 @@ async fn without_an_external_model_nothing_changes_and_below_the_threshold_neith
 }
 
 #[tokio::test]
-async fn a_conversation_of_medium_complexity_is_answered_by_the_external_model_and_small_talk_is_not() {
+async fn a_reply_needs_no_plan_so_the_local_models_answer_it_whatever_its_complexity() {
     let r = rig(false, |_| {});
     let t = run(&r, "hi").await;
     assert_eq!((t.status, r.strong.calls(), r.slm.calls()), (TaskStatus::Completed, 0, 0), "small talk costs nothing");
-    r.strong.push("A mutex admits one thread; a semaphore admits N. Use a mutex for exclusive access, a semaphore for pools.");
+    r.slm.push("A mutex admits one thread; a semaphore admits N.");
     let t = run(
         &r,
         "Explain in detail how a mutex differs from a semaphore, when to use each one, and which pitfalls such as deadlock and priority inversion to avoid",
     )
     .await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!(t.mode, Some(ExecMode::Escalated), "{:?}", t.route);
-    assert_eq!((r.strong.calls(), r.slm.calls()), (1, 0));
+    assert_eq!((r.strong.calls(), r.slm.calls()), (0, 1), "planning is the external model's job; a reply is not planned");
     assert!(t.final_answer.as_deref().unwrap().contains("semaphore admits N"));
+}
+
+#[tokio::test]
+async fn a_quick_action_is_one_step_the_local_models_carry_out_without_a_plan_from_the_external_model() {
+    let oracle = |a: &str| (DecisionKind::SelectMode, "mode", Answer::choice(a, 0.95, &[(a, 0.95)]), "tell me the first line of notes.txt");
+    let r = oracle_rig_with_strong(vec![oracle("assisted")]);
+    std::fs::write(r.ws.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
+    let t = say(&r, "q", "tell me the first line of notes.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Quick);
+    assert_eq!(t.plan.as_ref().unwrap().steps.len(), 1);
+    assert_eq!(r.strong.calls(), 0, "no plan was asked of the external model");
+    assert!(t.final_answer.as_deref().unwrap().contains("first line"), "{:?}", t.final_answer);
+}
+
+#[tokio::test]
+async fn when_the_decision_model_says_it_needs_planning_the_external_model_plans_it() {
+    let oracle = |a: &str| (DecisionKind::SelectMode, "mode", Answer::choice(a, 0.95, &[(a, 0.95)]), "tell me the first line of notes.txt");
+    let r = oracle_rig_with_strong(vec![oracle("escalated")]);
+    std::fs::write(r.ws.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
+    r.strong.push(&json!({"steps": [{"id": "s1", "do": "read notes.txt", "tool": "fs_read"}]}).to_string());
+    let t = say(&r, "p", "tell me the first line of notes.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Strong);
+    assert_eq!(r.strong.calls(), 1);
+}
+
+#[tokio::test]
+async fn planning_is_never_handed_to_the_local_model_when_the_external_one_cannot_be_reached() {
+    let r = rig(false, |c| c.thresholds.external_min_complexity = 0.01);
+    std::fs::write(r.ws.path().join("config.toml"), "port = 8080\n").unwrap();
+    r.strong.push_err("HTTP 502: bad gateway");
+    r.strong.push_err("HTTP 502: bad gateway");
+    r.slm.push(&json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {"path": "config.toml"}}]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read config.toml and tell me which port the service listens on, then explain what to change to use 9090").await;
+    assert_eq!(t.status, TaskStatus::Failed, "{:?}", t.final_answer);
+    let e = t.error.unwrap_or_default();
+    assert!(e.contains("502") && e.contains("DFAE_PLAN_FALLBACK=slm"), "{e}");
+    assert_eq!(r.slm.calls(), 0, "the local model did not plan");
 }
 
 async fn say(r: &Rig, session: &str, goal: &str) -> TaskRecord {
@@ -246,7 +292,7 @@ fn page() -> String {
 #[tokio::test]
 async fn code_shown_in_the_chat_can_be_saved_to_a_file_by_name_without_copying_it() {
     // the page was written into the chat; "save that code to index.html" must not need it re-typed
-    let r = rig(false, |c| c.thresholds.external_min_complexity = 2.0);
+    let r = rig_local(false, |_| {});
     r.slm.push(&format!("Here is a page:\n```html\n{}```", page()));
     let t = say(&r, "lp", "what does a minimal html page look like").await;
     assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Chat, "{:?}", t.route);
@@ -303,7 +349,7 @@ impl DecisionProvider for Oracle {
 }
 
 fn oracle_rig(answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>) -> Rig {
-    let mut r = rig(false, |c| c.thresholds.external_min_complexity = 2.0);
+    let mut r = rig_local(false, |_| {});
     let local = LocalDecider::new(Config::default().thresholds);
     let decider = Decider::new(Some(Arc::new(Oracle { local, answers })), Arc::new(Calibrator::new()), Config::default().thresholds);
     // same engine, different decision model
@@ -321,11 +367,42 @@ fn oracle_rig(answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>) 
         extractor: Arc::new(HybridExtractor::new(None)),
         config: cfg,
         store,
-        models: ModelGateway::new(Some(Arc::new(r.slm.clone())), Some(Arc::new(r.strong.clone()))),
+        models: ModelGateway::new(Some(Arc::new(r.slm.clone())), None),
         tools: Arc::new(reg),
         policy,
     });
     r
+}
+
+/// The oracle rig, with an external model configured.
+fn oracle_rig_with_strong(answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>) -> Rig {
+    let r = oracle_rig(answers.clone());
+    let local = LocalDecider::new(Config::default().thresholds);
+    let decider = Decider::new(Some(Arc::new(Oracle { local, answers })), Arc::new(Calibrator::new()), Config::default().thresholds);
+    let ws = r.ws.path().to_path_buf();
+    let mut cfg = Config::default();
+    cfg.workspace = ws.clone();
+    cfg.approvals = ApprovalMode::Never;
+    cfg.economy.plan_prefix_always = true;
+    let store = Arc::new(InMemoryStore::new());
+    let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws));
+    let mut reg = ToolRegistry::new();
+    register_native(&mut reg, policy.clone(), store.clone());
+    let strong = r.strong.clone().caching();
+    Rig {
+        engine: Engine::new(EngineDeps {
+            decider: Arc::new(decider),
+            extractor: Arc::new(HybridExtractor::new(None)),
+            config: cfg,
+            store,
+            models: ModelGateway::new(Some(Arc::new(r.slm.clone())), Some(Arc::new(strong.clone()))),
+            tools: Arc::new(reg),
+            policy,
+        }),
+        slm: r.slm,
+        strong,
+        ws: r.ws,
+    }
 }
 
 #[tokio::test]
@@ -412,16 +489,20 @@ async fn work_the_external_model_plans_is_one_plan_not_a_team_of_planners() {
     let r = rig(false, |c| c.thresholds.external_min_complexity = 0.01);
     r.strong.push(
         &json!({"steps": [
-            {"id": "s1", "do": "explain what a mutex is in two sentences", "tool": null},
-            {"id": "s2", "do": "explain what a semaphore is in two sentences", "tool": null}
+            {"id": "s1", "do": "read a.txt", "tool": "fs_read"},
+            {"id": "s2", "do": "summarise what a.txt says", "tool": null, "after": ["s1"]},
+            {"id": "s3", "do": "read b.txt", "tool": "fs_read"},
+            {"id": "s4", "do": "summarise what b.txt says", "tool": null, "after": ["s3"]}
         ]})
         .to_string(),
     );
+    std::fs::write(r.ws.path().join("a.txt"), "a mutex is a lock").unwrap();
+    std::fs::write(r.ws.path().join("b.txt"), "a semaphore counts permits").unwrap();
     r.slm.push("A mutex is a lock.");
     r.slm.push("A semaphore counts permits.");
     r.slm.push("A mutex is a lock; a semaphore counts permits.");
     // delegation is left on (the default): the decomposition exists, but each agent would pay for a plan of its own
-    let id = r.engine.submit(TaskRequest { goal: "Explain what a mutex is, and explain what a semaphore is".into(), ..Default::default() }).await.unwrap();
+    let id = r.engine.submit(TaskRequest { goal: "Read a.txt and summarise it, and read b.txt and summarise it".into(), ..Default::default() }).await.unwrap();
     let t = r.engine.wait(&id, Duration::from_secs(30)).await.unwrap();
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert!(t.team.is_none(), "no team: {:?}", t.team);
