@@ -348,6 +348,9 @@ pub enum PlanSource {
     Team,
     /// A conversational reply: one step, no planning call.
     Chat,
+    /// A quick action the decision model judged to need no plan: one step, made without a planning call, carried out by the
+    /// local models.
+    Quick,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

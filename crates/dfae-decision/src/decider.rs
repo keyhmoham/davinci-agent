@@ -214,9 +214,9 @@ impl Decider {
         };
         let mut reason = match mode {
             ExecMode::Direct => format!("deterministic tool binding · decision confidence {conf:.2}"),
-            ExecMode::Assisted => format!("needs planning or reasoning by the SLM · decision confidence {conf:.2}"),
+            ExecMode::Assisted => format!("quick action or reply: the local models handle it, no plan · decision confidence {conf:.2}"),
             ExecMode::Escalated => format!(
-                "medium or complex work (complexity {:.2}): the external model plans it, the local system carries it out · decision confidence {conf:.2}",
+                "needs a plan (complexity {:.2}): the external model plans it, the local system carries it out · decision confidence {conf:.2}",
                 facts.complexity
             ),
         };

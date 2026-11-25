@@ -20,10 +20,19 @@ struct Rig {
 }
 
 fn rig() -> Rig {
-    rig_with(false)
+    rig_full(false, true)
+}
+
+/// No external model: the self-hosted one plans as well.
+fn rig_local() -> Rig {
+    rig_full(false, false)
 }
 
 fn rig_with(condense: bool) -> Rig {
+    rig_full(condense, true)
+}
+
+fn rig_full(condense: bool, with_strong: bool) -> Rig {
     let ws = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
@@ -40,7 +49,7 @@ fn rig_with(condense: bool) -> Rig {
         extractor: Arc::new(HybridExtractor::new(None)),
         config: cfg,
         store,
-        models: ModelGateway::new(Some(Arc::new(slm.clone())), Some(Arc::new(strong.clone()))),
+        models: ModelGateway::new(Some(Arc::new(slm.clone())), with_strong.then(|| Arc::new(strong.clone()) as Arc<dyn LanguageModel>)),
         tools: Arc::new(reg),
         policy,
     });
@@ -69,13 +78,15 @@ fn big_file(r: &Rig) {
 
 #[tokio::test]
 async fn the_planner_prompt_is_generous_for_the_self_hosted_model_and_lean_for_the_paid_one() {
+    let rl = rig_local();
+    big_file(&rl);
+    rl.slm.push(&plan("big.log"));
+    rl.slm.push("summary");
+    let t = run(&rl, "Read big.log and summarise it", ModeRequest::Assisted).await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let local = rl.slm.requests.lock()[0].clone();
     let r = rig();
     big_file(&r);
-    r.slm.push(&plan("big.log"));
-    r.slm.push("summary");
-    let t = run(&r, "Read big.log and summarise it", ModeRequest::Assisted).await;
-    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    let local = r.slm.requests.lock()[0].clone();
     assert_eq!(local.system, prompts::PLAN_SYSTEM_LOCAL);
     assert!(
         local.system.contains("Examples") && local.messages[0].content.contains("params —"),
@@ -96,12 +107,14 @@ async fn the_planner_prompt_is_generous_for_the_self_hosted_model_and_lean_for_t
 
 #[tokio::test]
 async fn a_self_hosted_model_reads_the_whole_observation_the_paid_one_reads_a_summary() {
+    let rl = rig_local();
+    big_file(&rl);
+    rl.slm.push(&plan("big.log"));
+    rl.slm.push("ok");
+    run(&rl, "Read big.log and summarise it", ModeRequest::Assisted).await;
+    let local_step = rl.slm.requests.lock().iter().find(|q| q.purpose == "step").unwrap().messages[0].content.clone();
     let r = rig();
     big_file(&r);
-    r.slm.push(&plan("big.log"));
-    r.slm.push("ok");
-    run(&r, "Read big.log and summarise it", ModeRequest::Assisted).await;
-    let local_step = r.slm.requests.lock().iter().find(|q| q.purpose == "step").unwrap().messages[0].content.clone();
     r.strong.push(&brief("big.log"));
     r.strong.push("ok");
     run(&r, "Read big.log and summarise it", ModeRequest::Escalated).await;
@@ -112,7 +125,7 @@ async fn a_self_hosted_model_reads_the_whole_observation_the_paid_one_reads_a_su
 
 #[tokio::test]
 async fn self_hosted_calls_do_not_count_against_the_paid_budget() {
-    let r = rig();
+    let r = rig_local();
     big_file(&r);
     r.slm.push(&plan("big.log"));
     r.slm.push("summary");

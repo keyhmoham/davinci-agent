@@ -110,11 +110,11 @@ pub fn mode_request(state: DecisionState) -> DecisionRequest {
     q.insert(
         "mode".into(),
         Question::choice(
-            "Choose the execution mode. direct when the request binds to tools outright; escalated when it is medium or complex work (see POLICY) and an external model exists; otherwise assisted.",
+            "How should the request be handled? All planning is done by the external model, so decide whether the request needs a plan at all. direct when it binds to tools outright; escalated when it needs planning (see POLICY); assisted when it is one quick action or a reply that the local models can do alone.",
             [
                 ("direct", "deterministic tools only; arguments bind straight from the text; no language model"),
-                ("assisted", "a small language model must plan or write"),
-                ("escalated", "medium or complex work (at or above the POLICY complexity), or ambiguous or high-stakes work; the external model plans it and the local system carries it out"),
+                ("assisted", "quick: a single action or a reply the local models (small language model, extractor, decision model) handle alone, with no plan"),
+                ("escalated", "needs a plan: several dependent steps, something to build, write and run or serve, work whose next step depends on what earlier steps find, anything open-ended or high-stakes; the external model plans it and the local system carries it out"),
             ],
         ),
     );

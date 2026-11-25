@@ -41,9 +41,13 @@ place with phrase lists and regexes, and it answers exactly the same questions.
 
 ## Planning and acting (`planner.rs`, `implement.rs`, `executor.rs::run_step`)
 
-Mode selection has one hard rule on top of the decision model's answer: with an external model available, a request that does not bind
-deterministically, matches no skill and has `complexity ≥ DFAE_EXTERNAL_MIN_COMPLEXITY` is `escalated` (a user's explicit mode wins).
-`escalated` now means *the external model plans, the local system acts*:
+The decision model chooses the handling (`select_mode`): `direct` (binds to tools outright), `assisted` = *quick* (one action or a reply the
+local triple handles alone) or `escalated` = *needs a plan*. Code only enforces limits: `escalated` without an external model falls back to
+the SLM; a low-confidence `assisted` is escalated; a user's explicit mode wins. There is no complexity rule on top (the threshold only
+parameterises the built-in rules that stand in when the decision model is down). With an external model configured **all planning is
+its**: a quick request becomes one brief step (`PlanSource::Quick`: the best-fitting tool the decision model picked, or none for a reply)
+that the acting phase binds and runs; if it fails, the re-plan is the external model's; an unreachable external model fails the task
+unless `DFAE_PLAN_FALLBACK=slm`. Conversation is answered by the local models. `escalated` means *the external model plans, the local system acts*:
 
 * **Planning phase** (`stage_model_plan`, event `phase: planning`): the brief-plan prompt (see *The cost of planning* below); the reply is
   parsed by `parse_line_plan` / `parse_brief_plan`: every step is `brief`, `expect`/`strong` are read, arguments the planner did give are kept as hints. Plan
