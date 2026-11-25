@@ -1,12 +1,12 @@
 //! The decision contract.
 //!
 //! `Question`/`Answer` mirror the wire format of typed decision models such as
-//! Jev (`noul` yes/no probability, `choice`, `score`), so the Jev adapter is a
-//! thin pass-through. Engine-level decisions (route, mode, tools, recovery,
+//! typed decision models (`noul` yes/no probability, `choice`, `score`).
+//! Engine-level decisions (route, mode, tools, recovery,
 //! completion, escalation) are expressed as a set of questions over a compact,
 //! typed `DecisionState`, which a local rule-based decider can also answer —
 //! that is what makes the decision layer pluggable and gives a fallback when
-//! the hosted model is unavailable.
+//! the decision model is unavailable.
 
 use crate::{DecisionError, Risk};
 use async_trait::async_trait;
@@ -49,7 +49,7 @@ pub struct NoulCriteria {
     pub no: Option<String>,
 }
 
-/// A typed question (Jev wire format).
+/// A typed question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Question {
@@ -81,7 +81,7 @@ impl Question {
     }
 }
 
-/// A typed answer (Jev wire format).
+/// A typed answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Answer {
@@ -258,6 +258,8 @@ pub struct DecisionRequest {
 pub struct DecisionResponse {
     pub answers: BTreeMap<String, Answer>,
     pub provider: String,
+    /// The model that answered (empty for the local rules).
+    pub model: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub latency_ms: u64,
@@ -288,4 +290,8 @@ impl DecisionResponse {
 pub trait DecisionProvider: Send + Sync {
     fn name(&self) -> &str;
     async fn decide(&self, request: DecisionRequest) -> Result<DecisionResponse, DecisionError>;
+    /// `Some(true/false)` if the provider can tell whether its model is reachable and loaded.
+    async fn health(&self) -> Option<bool> {
+        None
+    }
 }

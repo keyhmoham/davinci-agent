@@ -329,11 +329,14 @@ impl Engine {
         comps.push(ComponentHealth { name: "memory".into(), status: if db { "ok" } else { "down" }.into(), detail: i.store.backend().into() });
         let ex = i.extractor.health().await;
         comps.push(ComponentHealth { name: "extractor".into(), status: if ex { "ok" } else { "down" }.into(), detail: i.extractor.name().into() });
-        comps.push(ComponentHealth {
-            name: "decision".into(),
-            status: "ok".into(),
-            detail: if i.decider.provider_name() == "jev" { "jev (hosted) + local fallback".into() } else { "local rules".into() },
-        });
+        let model = &i.cfg.decision.model;
+        let (dstatus, ddetail) = match i.decider.health().await {
+            Some(true) => ("ok", format!("{model} + local fallback")),
+            // decisions keep working on the local rules, so this is degraded, not down
+            Some(false) => ("down", format!("{model} unreachable or not pulled: using local rules")),
+            None => ("ok", "local rules".to_string()),
+        };
+        comps.push(ComponentHealth { name: "decision".into(), status: dstatus.into(), detail: ddetail });
         for (name, tier) in [("slm", Tier::Slm), ("strong", Tier::Strong)] {
             let (status, detail) = match i.models.health(tier).await {
                 Some(true) => ("ok", i.models.model_name(tier).unwrap_or_default()),
@@ -392,7 +395,7 @@ impl Engine {
             totals.baseline_tokens += l.baseline_tokens;
             totals.slm_calls += l.slm_calls;
             totals.strong_calls += l.strong_calls;
-            totals.jev_calls += l.jev_calls;
+            totals.decision_calls += l.decision_calls;
             totals.gliner_calls += l.gliner_calls;
             totals.cache_hits += l.cache_hits;
         }

@@ -18,13 +18,16 @@ fn env_bool(k: &str, d: bool) -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JevConfig {
-    /// `None` => the built-in local decision engine is used.
+pub struct DecisionConfig {
+    /// OpenAI-compatible endpoint of the self-hosted decision model (it must return
+    /// log-probabilities). `None` => the built-in local decision rules are used.
+    pub base_url: Option<String>,
+    pub model: String,
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
-    pub url: String,
-    pub model: String,
     pub timeout_ms: u64,
+    /// How many questions of one decision are asked at the same time.
+    pub parallel: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,7 +99,7 @@ pub struct Config {
     pub workspace: PathBuf,
     pub policy_path: Option<PathBuf>,
     pub gliner_url: Option<String>,
-    pub jev: JevConfig,
+    pub decision: DecisionConfig,
     pub slm: ModelConfig,
     pub strong: ModelConfig,
     pub budget: Budget,
@@ -124,11 +127,13 @@ impl Config {
             workspace: PathBuf::from(env_or("DFAE_WORKSPACE", "./workspace")),
             policy_path: env("DFAE_POLICY").map(PathBuf::from),
             gliner_url: env("GLINER_URL"),
-            jev: JevConfig {
-                api_key: env("JEV_API_KEY"),
-                url: env_or("JEV_URL", "https://api.aimlapi.com/v1/decisions"),
-                model: env_or("JEV_MODEL", "typesafe/jev-1.14"),
-                timeout_ms: env_parse("JEV_TIMEOUT_MS", 4000),
+            decision: DecisionConfig {
+                // `DECISION_PROVIDER=local` switches the model off even when a URL is set
+                base_url: env("DECISION_BASE_URL").filter(|_| env("DECISION_PROVIDER").map(|p| p != "local").unwrap_or(true)),
+                model: env_or("DECISION_MODEL", "qwen3:4b-instruct-2507-q8_0"),
+                api_key: env("DECISION_API_KEY"),
+                timeout_ms: env_parse("DECISION_TIMEOUT_MS", 10_000),
+                parallel: env_parse("DECISION_PARALLEL", 4),
             },
             slm: ModelConfig {
                 provider: slm_provider,
@@ -185,7 +190,7 @@ impl Default for Config {
         let mut c = Self::from_env();
         c.database_url = None;
         c.gliner_url = None;
-        c.jev.api_key = None;
+        c.decision.base_url = None;
         c.slm.provider = "none".into();
         c.strong.provider = "none".into();
         c.api_token = None;

@@ -799,7 +799,7 @@ fn draw_cognition(f: &mut Frame, area: Rect, app: &App) {
         .map(|r| {
             Row::new(vec![
                 Cell::from(r.kind.clone()),
-                Cell::from(Span::styled(r.provider.clone(), Style::new().fg(if r.provider.starts_with("jev") { VIOLET } else { DIM }))),
+                Cell::from(Span::styled(r.provider.clone(), Style::new().fg(if r.provider.starts_with("open-model") { VIOLET } else { DIM }))),
                 Cell::from(trunc(&kv_brief(&r.answers), 70)),
                 Cell::from(format!("{}ms", r.latency_ms)),
                 Cell::from(if r.tokens_in > 0 { format!("{}→{}", r.tokens_in, r.tokens_out) } else { "-".into() }),
@@ -1004,12 +1004,12 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
         bar("naive LLM agent (est.)", s.baseline_tokens, max, w, BAD),
         bar("generative: SLM", s.slm_tokens, max, w, WARN),
         bar("generative: strong model", s.strong_tokens, max, w, VIOLET),
-        bar("decision model (Jev)", s.decision_tokens, max, w, ACCENT),
+        bar("decision model", s.decision_tokens, max, w, ACCENT),
         Line::from(vec![
             label(" calls   "),
             Span::raw(format!(
-                "slm {} · strong {} · jev {} · extractor {} · cache hits {}",
-                s.slm_calls, s.strong_calls, s.jev_calls, s.gliner_calls, s.cache_hits
+                "slm {} · strong {} · decision {} · extractor {} · cache hits {}",
+                s.slm_calls, s.strong_calls, s.decision_calls, s.gliner_calls, s.cache_hits
             )),
         ]),
         Line::from(vec![
@@ -1047,7 +1047,7 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
                             Style::new().fg(match e.component {
                                 Component::Slm => WARN,
                                 Component::Strong => VIOLET,
-                                Component::Jev => ACCENT,
+                                Component::Decision => ACCENT,
                                 Component::Gliner => OK,
                             }),
                         )),

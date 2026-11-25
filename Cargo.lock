@@ -585,6 +585,7 @@ dependencies = [
  "axum",
  "chrono",
  "dfae-core",
+ "futures-util",
  "parking_lot",
  "regex",
  "reqwest",

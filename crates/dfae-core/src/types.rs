@@ -354,7 +354,7 @@ pub struct DecisionRecord {
     pub id: String,
     pub kind: String,
     pub ts: DateTime<Utc>,
-    /// `jev`, `local`, or `local-fallback`.
+    /// `open-model`, `local`, or `local-fallback`.
     pub provider: String,
     /// Compact map `question -> answer` (choice/score/probability).
     pub answers: Value,

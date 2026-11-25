@@ -1,9 +1,10 @@
 //! Decision layer: typed decisions over compact state.
 //!
-//! * [`JevProvider`] — adapter for the hosted Jev decision model
-//!   (`POST /v1/decisions`, typed `noul` / `choice` / `score` answers).
+//! * [`OpenModelProvider`] — a self-hosted open-weight instruct model served over an
+//!   OpenAI-compatible API; typed answers are read from the model's token
+//!   log-probabilities, so they are real probabilities and always schema-valid.
 //! * [`LocalDecider`] — deterministic, rule-based decider answering the same
-//!   questions; used when no Jev key is configured and as the fallback when
+//!   questions; used when no decision model is configured and as the fallback when
 //!   the hosted model errors or times out.
 //! * [`Calibrator`] — learns how far to trust each decision from verified
 //!   outcomes (decision accuracy on isolated questions does not guarantee
@@ -14,12 +15,12 @@
 
 mod calibrator;
 mod decider;
-mod jev;
 mod local;
+mod open;
 mod questions;
 
 pub use calibrator::Calibrator;
 pub use decider::*;
-pub use jev::JevProvider;
 pub use local::LocalDecider;
+pub use open::OpenModelProvider;
 pub use questions::*;

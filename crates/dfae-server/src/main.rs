@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(cfg.log_json);
     std::fs::create_dir_all(&cfg.workspace)?;
     tracing::info!(
-        decision = if cfg.jev.api_key.is_some() { "jev" } else { "local" },
+        decision = if cfg.decision.base_url.is_some() { "open-model" } else { "local" },
         slm = %cfg.slm.provider,
         strong = %cfg.strong.provider,
         gliner = cfg.gliner_url.is_some(),

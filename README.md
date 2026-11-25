@@ -1,7 +1,7 @@
 # DFAE — Decision-First Agentic Engine
 
 A token-frugal agent runtime written in Rust. **The runtime is the agent; models are
-specialised services inside it.** A typed decision model (Jev) routes, selects and judges;
+specialised services inside it.** A self-hosted open-weight decision model routes, selects and judges;
 GLiNER structures the input; a small language model (SLM) is called only when generation or
 flexible reasoning is actually needed; a stronger LLM is an escalation path, not the default
 brain. Execution, security, memory and verification are deterministic code.
@@ -132,7 +132,7 @@ that against splits justified only by parallelism. The TUI **Team** view shows a
 | Crate / service | Role |
 |---|---|
 | `dfae-core` | state model, plan schema, events, token accounting, decision contract, provider traits |
-| `dfae-decision` | Jev adapter · local rule-based decider (same typed questions) · calibrator · cache + fallback |
+| `dfae-decision` | open-model provider (typed answers from a self-hosted model's log-probabilities) · local rule-based decider (same typed questions) · calibrator · cache + fallback |
 | `dfae-extract` | GLiNER client · rule extractor · hybrid merge (structured rules win, semantic spans from GLiNER) |
 | `dfae-models` | OpenAI-compatible and Anthropic providers, tier gateway, JSON extraction + one repair retry |
 | `dfae-memory` | hash embedder · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
@@ -144,8 +144,12 @@ that against splits justified only by parallelism. The TUI **Team** view shows a
 
 ### The decision contract
 
-`Question`/`Answer` mirror Jev's wire format (`noul` probability, `choice`, `score`), so the
-adapter is a pass-through to `POST /v1/decisions`. The engine asks bounded questions
+`Question`/`Answer` are typed like a decision model's wire format (`noul` probability, `choice`, `score`).
+The self-hosted provider turns each question into a single-token multiple choice for an open-weight instruct
+model and reads the **probability mass of the answer tokens** from the first token's log-probabilities
+(`noul` = P(yes)/(P(yes)+P(no)); `choice` = lettered options; `score` = expected level), so answers are real
+probabilities and always schema-valid — one prompt and one generated token per question; all questions of a
+decision share the same state prefix, so prompt caching helps. The engine asks bounded questions
 (`route_task`, `select_mode`, `select_tools`, `assess_plan`, `assess_recovery`,
 `assess_completion`) over a compact typed state. Provider answers are **validated** (right type,
 choice within the offered options), then **hard rules** apply: a provider can never pick *direct*
@@ -155,7 +159,7 @@ policy denial. On any provider error the same questions are answered by the loca
 
 ### Security model
 
-The policy engine ([`config/policy.toml`](config/policy.toml)) is the boundary — neither Jev nor
+The policy engine ([`config/policy.toml`](config/policy.toml)) is the boundary — neither the decision model nor
 the SLM can override it. It runs when a plan is validated **and again on the final, template-resolved
 arguments** immediately before each tool executes (tools re-check too).
 
@@ -228,7 +232,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 
 | Variable | Effect |
 |---|---|
-| `JEV_API_KEY` | use the hosted Jev decision model (AI/ML API); empty = local rule-based decisions |
+| `DECISION_MODEL` | open-weight decision model pulled into Ollama (`qwen3:4b-instruct-2507-q8_0` default); `DECISION_PROVIDER=local` turns it off |
 | `SLM_MODEL` | model pulled into Ollama (`qwen2.5:3b` default; `1.5b` faster, `7b` smarter) |
 | `STRONG_PROVIDER` / `STRONG_API_KEY` / `STRONG_MODEL` | optional escalation model (`anthropic` or `openai`-compatible) |
 | `DFAE_API_TOKEN` | bearer token for the API |
@@ -247,7 +251,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 
 | Missing | Behaviour |
 |---|---|
-| Jev key | local rule-based decisions (same typed questions, visible in the *Cognition* tab) |
+| decision model (not pulled yet / unreachable / `DECISION_PROVIDER=local`) | local rule-based decisions (same typed questions, visible in the *Cognition* tab) |
 | GLiNER model (still downloading) | rule extraction (paths, URLs, versions, expressions, constraints, …) |
 | SLM | everything that binds deterministically; others fail with a message saying so |
 | stronger model | no escalation; SLM failures end in an honest failure |
@@ -271,13 +275,13 @@ scripts/bench.sh                             # token/mode table over examples/ta
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
 | Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |
 | Token economy payoff on a *real* model | **unmeasured** — priors come from the shipped prompts; savings per avoided repair (~300–500 tokens) are estimates; lazy context may cost more than it saves for some workloads |
-| Quality of automatic splits with a *real* SLM/Jev | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
+| Quality of automatic splits with a *real* SLM/decision model | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
 | Conversation (small talk, chat turns, session history, "it"/"that file"/"my city" resolution), file-creation phrasings, planner-slip recovery | verified (`crates/dfae-runtime/tests/chat.rs`) and with the real server |
 | `web_search` / `http_get` | parsers unit-tested on fixtures; **run live from the build sandbox**: DuckDuckGo search + page read worked once and was bot-blocked later (Wikipedia answered instead); `http_get` on `wttr.in/<city>?format=3` returned the weather. Whether a *real SLM* plans weather lookups well is **untested**. Third-party services change — treat as best effort |
 | Postgres store, audit chain | verified against PostgreSQL 16 (`real[]` fallback path) |
 | HTTP API + SSE + auth, TUI rendering and key handling | verified (integration tests; TUI also driven in a real terminal) |
 | GLiNER service with the real model, called by the Rust engine | verified manually (extraction of the blueprint example) |
-| Jev adapter | built to the documented `/v1/decisions` contract and tested against a **fake** server; **never run against the live API** (no key available) — validate with your key before relying on it |
+| Open decision model | the provider, prompts, probability extraction, fallback and health are tested against a **fake** OpenAI-compatible server returning logprobs; **never run against a real model here** (no Ollama/GPU in the build sandbox). How accurate `qwen3:4b-instruct-2507` is on these questions — and whether it beats the local rules — is **unmeasured**: compare on your own requests (the *Cognition* tab shows each decision and its provider) |
 | OpenAI-compatible / Anthropic providers | wire-format tested against fake servers; not run against real services |
 | SLM plan quality (`qwen2.5:3b` etc.) | **untested** — prompts are compact and validated/repaired, but real-model reliability must be measured on your tasks |
 | pgvector path | written, **untested** (extension unavailable here); the `real[]` fallback is what was tested |

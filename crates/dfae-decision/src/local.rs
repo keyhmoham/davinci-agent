@@ -1,4 +1,4 @@
-//! Deterministic decision engine answering the same typed questions as Jev.
+//! Deterministic decision engine answering the same typed questions as a decision model.
 //!
 //! Used when no hosted decision model is configured and as the fallback when
 //! it is unavailable. It is intentionally simple and inspectable: lexicons,
@@ -401,7 +401,14 @@ impl DecisionProvider for LocalDecider {
     async fn decide(&self, request: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
         let started = Instant::now();
         let answers = self.answer(&request);
-        Ok(DecisionResponse { answers, provider: "local".into(), input_tokens: 0, output_tokens: 0, latency_ms: started.elapsed().as_millis() as u64 })
+        Ok(DecisionResponse {
+            answers,
+            provider: "local".into(),
+            model: String::new(),
+            input_tokens: 0,
+            output_tokens: 0,
+            latency_ms: started.elapsed().as_millis() as u64,
+        })
     }
 }
 

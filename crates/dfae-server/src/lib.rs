@@ -88,8 +88,8 @@ async fn info(State(s): State<AppState>) -> Json<Value> {
         "name": "dfae",
         "version": env!("CARGO_PKG_VERSION"),
         "config": {
-            "decision": if cfg.jev.api_key.is_some() { "jev" } else { "local" },
-            "jev_model": cfg.jev.model,
+            "decision": if cfg.decision.base_url.is_some() { "open-model" } else { "local" },
+            "decision_model": cfg.decision.model,
             "slm": { "provider": cfg.slm.provider, "model": cfg.slm.model },
             "strong": { "provider": cfg.strong.provider, "model": cfg.strong.model },
             "gliner": cfg.gliner_url.is_some(),
@@ -292,7 +292,7 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
          dfae_tokens{{kind=\"slm\"}} {}\ndfae_tokens{{kind=\"strong\"}} {}\ndfae_tokens{{kind=\"decision\"}} {}\n\
          dfae_teams {}\ndfae_agents {}\ndfae_team_cache_hits {}\n\
          dfae_dispatch_tasks{{state=\"running\"}} {}\ndfae_dispatch_tasks{{state=\"queued\"}} {}\ndfae_dispatch_agents{{state=\"running\"}} {}\ndfae_dispatch_agents_spawned {}\n\
-         dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"slm\"}} {}\ndfae_model_calls{{kind=\"strong\"}} {}\ndfae_model_calls{{kind=\"jev\"}} {}\n",
+         dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"slm\"}} {}\ndfae_model_calls{{kind=\"strong\"}} {}\ndfae_model_calls{{kind=\"decision\"}} {}\n",
         st.tasks,
         st.completed,
         st.failed,
@@ -314,7 +314,7 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
         t.saved_tokens,
         t.slm_calls,
         t.strong_calls,
-        t.jev_calls
+        t.decision_calls
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

@@ -4,7 +4,7 @@
 
 > The model proposes; the engine decides what is authorised, executes, observes and verifies.
 
-The runtime is the agent. Jev, GLiNER and the SLM are services it calls for *bounded* questions.
+The runtime is the agent. The decision model, GLiNER and the SLM are services it calls for *bounded* questions.
 No model owns control flow, permissions, or the claim that a task is done.
 
 ## Pipeline (`crates/dfae-runtime/src/pipeline.rs`)
@@ -95,7 +95,7 @@ Delegation is a **plan step kind** (`Agent`); an agent is a child `TaskRecord` r
    in parallel, how many wait on a deterministic one, how many change state, whether there is a join, whether a model exists).
    Local rule: split for parallel model work (≥2), fan-out with a join (≥2 free agents), a pipeline of ≥3 that separates
    read-only from state-changing work; don't split when one plan does as well or everything is already Direct-mode.
-   With Jev the same question is asked of the hosted model; either way the answer is calibrated on past outcomes.
+   With the decision model the same question is asked of it; either way the answer is calibrated on past outcomes.
 4. **Dispatch** — each agent routes itself, then **fixes its role** (`pick_role`: a deterministic binding that changes
    state → operator; risky/maintenance → operator; no tools needed → analyst; "verify/check…" → verifier; else researcher),
    narrows its tool scope, and waits for a worker slot (`Dispatcher::acquire_agent`: role pool, then global pool).
@@ -180,5 +180,5 @@ capped per profile and truncated; observations get a per-step share.
 
 ## Tokens
 
-Every model call (SLM, strong, Jev) is a `LedgerEntry` with provider-reported usage when available (otherwise
+Every model call (SLM, strong, decision model) is a `LedgerEntry` with provider-reported usage when available (otherwise
 estimated), emitted as an event and aggregated per task and globally. See `evaluation.md` for the baseline model.
