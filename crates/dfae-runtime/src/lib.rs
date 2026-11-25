@@ -8,6 +8,7 @@ mod answer;
 mod bootstrap;
 mod bus;
 mod dispatch;
+pub mod economy;
 mod engine;
 mod executor;
 mod pipeline;

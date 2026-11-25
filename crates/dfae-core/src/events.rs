@@ -94,6 +94,11 @@ pub enum EventKind {
     Ledger {
         summary: LedgerSummary,
     },
+    /// A step was repaired deterministically (no model call) and will be re-run.
+    Repaired {
+        step_id: String,
+        note: String,
+    },
     Warning {
         message: String,
     },

@@ -4,6 +4,9 @@ use dfae_core::*;
 use serde_json::{Value, json};
 use std::time::Duration;
 
+/// Smallest stable prefix worth marking for prompt caching.
+pub const CACHE_MIN_TOKENS: usize = 1024;
+
 /// Claude via the Messages API. The system prompt is sent as a cacheable
 /// block so the stable instruction prefix is billed at the cached rate.
 pub struct AnthropicModel {
@@ -31,11 +34,18 @@ impl LanguageModel for AnthropicModel {
         let system = if req.json { format!("{}\n\nRespond with a single JSON object and nothing else.", req.system) } else { req.system.clone() };
         let messages: Vec<Value> =
             req.messages.iter().map(|m| json!({"role": match m.role { Role::User => "user", Role::Assistant => "assistant" }, "content": m.content})).collect();
+        // Prompt caching only applies above a minimum prefix length (historically ~1,024 tokens
+        // for Sonnet-class models); below it `cache_control` is dead weight, so it is only sent
+        // when the stable prefix is long enough to be worth caching.
+        let mut block = json!({"type": "text", "text": system});
+        if tokens::estimate_tokens(&system) >= CACHE_MIN_TOKENS {
+            block["cache_control"] = json!({"type": "ephemeral"});
+        }
         let body = json!({
             "model": self.model,
             "max_tokens": req.max_tokens,
             "temperature": req.temperature,
-            "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+            "system": [block],
             "messages": messages,
         });
         let mut last = String::new();

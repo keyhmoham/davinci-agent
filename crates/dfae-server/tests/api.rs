@@ -124,4 +124,9 @@ async fn dispatch_and_team_fields_are_exposed() {
     assert!(m.contains("dfae_teams 0") && m.contains("dfae_dispatch_agents{state=\"running\"} 0"), "{m}");
     let info: Value = c.get(format!("{base}/v1/info")).send().await.unwrap().json().await.unwrap();
     assert_eq!(info["config"]["team"]["enabled"], true);
+    assert_eq!(info["config"]["economy"]["repair"], true);
+    assert_eq!(info["config"]["economy"]["lazy_context"], false, "lazy context is opt-in");
+    let cost: Value = c.get(format!("{base}/v1/cost")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(cost["plan"]["prior"], 330.0);
+    assert!(cost["step"]["estimate"].as_f64().unwrap() > 0.0);
 }

@@ -326,15 +326,17 @@ fn build_groups(groups: Vec<Vec<(String, bool)>>, synthesis: Option<String>) -> 
 }
 
 /// The coordinator's plan: one `Agent` step per sub-goal (+ a reasoning join).
-pub fn plan_from_decomposition(goal: &str, d: &Decomposition) -> Plan {
+pub fn plan_from_decomposition(goal: &str, d: &Decomposition, direct: &[bool]) -> Plan {
     let mut steps: Vec<Step> = d
         .subgoals
         .iter()
-        .map(|s| {
+        .zip(direct)
+        .map(|(s, free)| {
             let mut st = Step::reasoning(&s.id, &s.text);
             st.kind = StepKind::Agent;
             st.depends_on = s.depends_on.clone();
-            st.args = json!({});
+            // a hint for the cost model: a deterministic agent needs no model
+            st.args = json!({"direct": free});
             st
         })
         .collect();
@@ -343,11 +345,11 @@ pub fn plan_from_decomposition(goal: &str, d: &Decomposition) -> Plan {
         j.depends_on = d.subgoals.iter().map(|s| s.id.clone()).collect();
         steps.push(j);
     }
-    Plan { goal: goal.into(), steps, source: PlanSource::Team, revision: 0 }
+    Plan { goal: goal.into(), steps, source: PlanSource::Team, revision: 0, estimate: None }
 }
 
 /// Facts the decision layer judges the split on.
-pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool) -> TeamFacts {
+pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool, cost: &crate::economy::CostModel) -> TeamFacts {
     let is_direct = |id: &str| d.subgoals.iter().position(|s| s.id == id).map(|i| direct[i]).unwrap_or(false);
     let mut parallel_model = 0;
     let mut model_after_direct = 0;
@@ -361,6 +363,8 @@ pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool) ->
             model_after_direct += 1;
         }
     }
+    let model_parts = direct.iter().filter(|free| !**free).count();
+    let (flat, team) = cost.flat_vs_team(model_parts, d.synthesis.is_some());
     TeamFacts {
         subgoals: d.subgoals.iter().map(|s| tokens::truncate_tokens(&s.text, 14)).collect(),
         direct: direct.iter().filter(|b| **b).count(),
@@ -370,6 +374,8 @@ pub fn team_facts(d: &Decomposition, direct: &[bool], models_available: bool) ->
         mutating: d.subgoals.iter().filter(|s| MUTATE.contains(&first_word(&s.text).as_str())).count(),
         has_synthesis: d.synthesis.is_some(),
         models_available,
+        est_flat_tokens: flat,
+        est_team_tokens: team,
     }
 }
 
@@ -536,7 +542,7 @@ mod tests {
     #[test]
     fn plan_has_agent_steps_and_a_join() {
         let x = d("read a.txt, b.txt and summarize them").unwrap();
-        let p = plan_from_decomposition("g", &x);
+        let p = plan_from_decomposition("g", &x, &vec![true; x.subgoals.len()]);
         assert_eq!(p.source, PlanSource::Team);
         assert_eq!(p.steps.iter().filter(|s| s.kind == StepKind::Agent).count(), 2);
         let j = p.steps.last().unwrap();
@@ -560,6 +566,7 @@ mod tests {
             keywords: vec![],
             direct_patterns: vec![],
             cacheable: false,
+            contract: vec![],
         };
         assert_eq!(pick_role("write x", &r(Risk::Low, true, "x"), Some(&[meta(true)])), AgentRole::Operator);
         assert_eq!(pick_role("read x", &r(Risk::Low, true, "x"), Some(&[meta(false)])), AgentRole::Researcher);

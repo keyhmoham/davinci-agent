@@ -2,6 +2,7 @@
 //! checks, approval gating bound to exact arguments, post-condition checks,
 //! and decision-driven recovery (retry / replan / escalate / skip / fail).
 
+use crate::economy;
 use crate::engine::{Inner, TaskCtx};
 use crate::team::TeamShared;
 use crate::{planner, prompts};
@@ -279,21 +280,43 @@ impl Inner {
     ) -> Result<StepOutput, StepFailure> {
         let tier = self.pick_tier(mode).ok_or_else(|| StepFailure::new(ErrorKind::Policy, "no language model is configured for reasoning steps"))?;
         let ctx_text = self.context_text(ctx, false).await;
-        let inputs: String = deps
-            .iter()
-            .map(|(id, tool, summary, _)| dfae_core::safety::wrap_untrusted(&format!("{id} {}", tool.as_deref().unwrap_or("reasoning")), summary))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let user = format!("STEP: {}\n{ctx_text}\nINPUTS:\n{inputs}", step.description);
-        let text = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step")).await.map_err(|e| {
-            let kind = if e.contains("budget") { ErrorKind::Policy } else { ErrorKind::Transient };
-            StepFailure::new(kind, e)
-        })?;
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return Err(StepFailure::new(ErrorKind::Other, "the model returned an empty answer"));
+        // lazy context: short upstream summaries first; the model may ask for more (`NEED s1`)
+        let lazy_on = self.cfg.economy.lazy_context && !deps.is_empty();
+        let to_err = |e: String| StepFailure::new(if e.contains("budget") { ErrorKind::Policy } else { ErrorKind::Transient }, e);
+        let render = |expand: &[String]| -> String {
+            deps.iter()
+                .map(|(id, tool, summary, output)| {
+                    let body = if lazy_on {
+                        if expand.contains(id) { tokens::compress_text(output, 600) } else { tokens::truncate_tokens(summary, 40) }
+                    } else {
+                        summary.clone()
+                    };
+                    dfae_core::safety::wrap_untrusted(&format!("{id} {}", tool.as_deref().unwrap_or("reasoning")), &body)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let ids: Vec<String> = deps.iter().map(|d| d.0.clone()).collect();
+        let mut user = format!("STEP: {}\n{ctx_text}\nINPUTS:\n{}", step.description, render(&[]));
+        if lazy_on {
+            user.push_str(&economy::lazy::need_instruction(&ids));
         }
-        Ok(StepOutput { content: text, evidence: vec![] })
+        let mut text = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step")).await.map_err(to_err)?;
+        let mut evidence = Vec::new();
+        if lazy_on {
+            let need = economy::lazy::parse_need(&text, &ids);
+            if !need.is_empty() {
+                let user = format!("STEP: {}\n{ctx_text}\nINPUTS:\n{}", step.description, render(&need));
+                text = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step_expand")).await.map_err(to_err)?;
+                evidence.push(format!("context expanded on request: {}", need.join(", ")));
+            }
+        }
+        let text = text.trim().to_string();
+        // zero-cost output contract: junk is stopped here instead of feeding the next model call
+        if let Some(issue) = economy::contracts::model_output_issue(&text) {
+            return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
+        }
+        Ok(StepOutput { content: text, evidence })
     }
 
     async fn run_tool(
@@ -313,9 +336,10 @@ impl Inner {
         }
         // resolve {{sN}} templates against dependency outputs
         let outputs: HashMap<&str, &str> = deps.iter().map(|(id, _, _, out)| (id.as_str(), out.as_str())).collect();
-        let args = planner::substitute(&step.args, &|id| {
-            outputs.get(id).map(|o| tokens::compress_text(o, 800).chars().take(4000).collect::<String>().trim().to_string())
-        });
+        let args = economy::contracts::resolve_templates(&step.args, &outputs, &|o| {
+            tokens::compress_text(o, 800).chars().take(4000).collect::<String>().trim().to_string()
+        })
+        .map_err(|e| StepFailure::new(ErrorKind::InvalidArgs, e))?;
         meta.validate_args(&args).map_err(|e| StepFailure::new(ErrorKind::InvalidArgs, e))?;
 
         // ---- policy (authoritative, just-in-time, on the final arguments) ----
@@ -366,6 +390,12 @@ impl Inner {
         if !out.ok {
             let first = content.lines().next().unwrap_or("").chars().take(160).collect::<String>();
             return Err(StepFailure::new(ErrorKind::Other, format!("{name} reported failure (exit {}): {first}", out.exit_code.unwrap_or(-1))));
+        }
+        for c in &meta.contract {
+            let (pass, ev) = self.eval_check(c, &content);
+            if !pass {
+                return Err(StepFailure::new(ErrorKind::Other, format!("{name} output broke its contract: {} ({ev})", c.describe())));
+            }
         }
         for c in step.checks.iter().filter(|c| **c != Check::ExitOk) {
             let (pass, ev) = self.eval_check(c, &content);
@@ -475,6 +505,10 @@ impl Inner {
             (r.plan.as_ref().and_then(|p| p.step(id).cloned()), r.usage.clone(), r.budget.clone(), r.goal.clone(), r.entities.clone())
         };
         let Some(step) = step else { return Some(f.message) };
+        // argument and path problems are fixed by code, at zero token cost, before any decision is asked
+        if matches!(f.kind, ErrorKind::InvalidArgs | ErrorKind::NotFound) && self.repair_failed_step(ctx, &step, f.kind).await {
+            return None;
+        }
         let generative = self.models.has(Tier::Slm) || self.models.has(Tier::Strong);
         let mut st = self.decision_state(&goal, &entities);
         st.step_facts = Some(StepFacts {
@@ -623,7 +657,8 @@ impl Inner {
             m.extend(new_steps);
             m
         };
-        planner::validate_plan(&merged, &self.tools, &allowed, &budget).map_err(|e| e.join("; "))?;
+        let remaining = self.remaining_budget(ctx).await;
+        planner::validate_plan(&merged, &self.tools, &allowed, &remaining).map_err(|e| e.join("; "))?;
         let revised = {
             let mut r = ctx.rec.lock().await;
             let p = r.plan.as_mut().ok_or("no plan")?;

@@ -209,6 +209,12 @@ pub struct TeamFacts {
     pub has_synthesis: bool,
     /// A generative model exists for the sub-goals that need one.
     pub models_available: bool,
+    /// Learned-cost estimates (tokens) of doing the model-needing work as one plan
+    /// versus as a team: every agent pays its own planning call, one plan pays once.
+    #[serde(default)]
+    pub est_flat_tokens: u64,
+    #[serde(default)]
+    pub est_team_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

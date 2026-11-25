@@ -1,6 +1,6 @@
 //! Tool metadata, the `Tool` trait and execution context.
 
-use crate::{ErrorKind, Risk, ToolError};
+use crate::{Check, ErrorKind, Risk, ToolError};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -67,6 +67,10 @@ pub struct ToolMetadata {
     /// the result (invalidated whenever any team member performs a side effect).
     #[serde(default)]
     pub cacheable: bool,
+    /// Zero-cost post-conditions on this tool's output, checked after every call
+    /// so a malformed result never reaches a downstream model step.
+    #[serde(default)]
+    pub contract: Vec<Check>,
 }
 
 impl ToolMetadata {

@@ -41,5 +41,7 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     // models
     let models = ModelGateway::new(build_model(&config.slm), build_model(&config.strong));
 
-    Ok(Engine::new(EngineDeps { config, store, extractor, decider, models, tools: Arc::new(registry), policy }))
+    let engine = Engine::new(EngineDeps { config, store, extractor, decider, models, tools: Arc::new(registry), policy });
+    engine.restore().await;
+    Ok(engine)
 }

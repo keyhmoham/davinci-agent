@@ -416,6 +416,7 @@ mod tests {
             keywords: vec![],
             direct_patterns: vec![],
             cacheable: false,
+            contract: vec![],
         }
     }
 

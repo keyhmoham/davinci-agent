@@ -370,21 +370,23 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     ),
                 ]));
             }
-            EventKind::PlanCreated { plan } => push(
-                badge("plan", ACCENT),
-                format!(
-                    "{} step{} ({:?}) {}",
-                    plan.steps.len(),
-                    if plan.steps.len() == 1 { "" } else { "s" },
-                    plan.source,
-                    plan.steps
-                        .iter()
-                        .map(|s| s.tool.clone().unwrap_or_else(|| if s.kind == StepKind::Agent { "agent".into() } else { "reason".into() }))
-                        .collect::<Vec<_>>()
-                        .join(" → ")
-                ),
-                Style::new(),
-            ),
+            EventKind::PlanCreated { plan } => {
+                let route = plan
+                    .steps
+                    .iter()
+                    .map(|s| s.tool.clone().unwrap_or_else(|| if s.kind == StepKind::Agent { "agent".into() } else { "reason".into() }))
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                let price = plan.estimate.map(|e| format!("  · est. {} model calls ≈ {} tok", e.model_calls, fmt_tokens(e.tokens))).unwrap_or_default();
+                push(
+                    badge("plan", ACCENT),
+                    format!("{} step{} ({:?}) {route}{price}", plan.steps.len(), if plan.steps.len() == 1 { "" } else { "s" }, plan.source),
+                    Style::new(),
+                )
+            }
+            EventKind::Repaired { step_id, note } => {
+                push(badge("repair", OK), format!("{step_id}: {note} · fixed in code, no model call"), Style::new().fg(OK))
+            }
             EventKind::Queued { position } => push(badge("queued", WARN), format!("waiting for a free slot (position {position})"), Style::new().fg(WARN)),
             EventKind::TeamFormed { goals, reason } => {
                 push(badge("team", ACCENT), reason.clone(), Style::new().fg(ACCENT).bold());
@@ -632,7 +634,15 @@ fn draw_plan(f: &mut Frame, area: Rect, app: &App) {
     ];
     let title = Line::from(vec![
         Span::styled(" Plan ", Style::new().fg(ACCENT).bold()),
-        Span::styled(format!("{:?} · rev {} · W = parallel wave · Ctrl+↑/↓ select ", plan.source, plan.revision), Style::new().fg(DIM)),
+        Span::styled(
+            format!(
+                "{:?} · rev {}{} · W = parallel wave · Ctrl+↑/↓ select ",
+                plan.source,
+                plan.revision,
+                plan.estimate.map(|e| format!(" · est. {} calls ≈ {} tok", e.model_calls, fmt_tokens(e.tokens))).unwrap_or_default()
+            ),
+            Style::new().fg(DIM),
+        ),
     ]);
     f.render_widget(
         Table::new(rows, widths).header(Row::new(["", "id", "W", "tool", "args", "after", "try", "time"]).style(Style::new().fg(DIM))).block(block(title)),
@@ -930,8 +940,10 @@ fn bar(label_s: &str, value: u64, max: u64, width: usize, color: Color) -> Line<
 }
 
 fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
-    let [top, mid, bot] = Layout::vertical([Constraint::Length(9), Constraint::Min(4), Constraint::Length(7)]).areas(area);
+    let [top, mid, bot] = Layout::vertical([Constraint::Length(11), Constraint::Min(4), Constraint::Length(7)]).areas(area);
     let s = app.detail.as_ref().map(|d| d.ledger.summary()).unwrap_or_default();
+    let est = app.detail.as_ref().and_then(|d| d.plan.as_ref()).and_then(|p| p.estimate);
+    let repairs: u32 = app.detail.as_ref().and_then(|d| d.plan.as_ref()).map(|p| p.steps.iter().map(|s| s.repairs).sum()).unwrap_or(0);
     let w = top.width.saturating_sub(2) as usize;
     let max = s.baseline_tokens.max(s.generative_tokens).max(1);
     let lines = vec![
@@ -944,6 +956,15 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(format!(
                 "slm {} · strong {} · jev {} · extractor {} · cache hits {}",
                 s.slm_calls, s.strong_calls, s.jev_calls, s.gliner_calls, s.cache_hits
+            )),
+        ]),
+        Line::from(vec![
+            label(" economy "),
+            Span::raw(format!(
+                "plan priced at {} · {} step{} fixed in code (no model call)",
+                est.map(|e| format!("{} model calls ≈ {} tok", e.model_calls, fmt_tokens(e.tokens))).unwrap_or_else(|| "—".into()),
+                repairs,
+                if repairs == 1 { "" } else { "s" }
             )),
         ]),
     ];
@@ -1259,7 +1280,7 @@ mod tests {
         rec.entities.push(Entity { label: "file path".into(), text: "a.txt".into(), start: None, end: None, score: 1.0, source: "rules".into() });
         let mut s = Step::tool("s1", "fs_write", "write", serde_json::json!({"path": "a.txt", "content": "hi"}));
         s.status = StepStatus::WaitingApproval;
-        rec.plan = Some(Plan { goal: "g".into(), steps: vec![s, Step::reasoning("s2", "explain")], source: PlanSource::Direct, revision: 0 });
+        rec.plan = Some(Plan { goal: "g".into(), steps: vec![s, Step::reasoning("s2", "explain")], source: PlanSource::Direct, revision: 0, estimate: None });
         let now = chrono::Utc::now();
         rec.approvals.push(Approval {
             id: "ap1".into(),
@@ -1358,7 +1379,8 @@ mod tests {
         app.tab = Tab::Tools;
         assert!(render(&app, 120, 40).contains("fs_write(path:str*"));
         app.tab = Tab::Tokens;
-        assert!(render(&app, 120, 40).contains("naive LLM agent"));
+        let out = render(&app, 120, 40);
+        assert!(out.contains("naive LLM agent") && out.contains("economy") && out.contains("fixed in code"), "{out}");
     }
 
     fn team_app() -> App {
@@ -1377,7 +1399,7 @@ mod tests {
             c2.depends_on = vec!["c1".into()];
             let mut j = Step::reasoning("join", "summarize them");
             j.depends_on = vec!["c1".into(), "c2".into()];
-            d.plan = Some(Plan { goal: "g".into(), steps: vec![c1, c2, j], source: PlanSource::Team, revision: 0 });
+            d.plan = Some(Plan { goal: "g".into(), steps: vec![c1, c2, j], source: PlanSource::Team, revision: 0, estimate: None });
             d.team = Some(TeamInfo {
                 role: AgentRole::Coordinator,
                 link: None,

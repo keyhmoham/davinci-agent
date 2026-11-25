@@ -356,6 +356,13 @@ impl LocalDecider {
                     } else if f.model_after_direct > 0 && f.parallel_model == 0 {
                         p -= 0.15; // one plan does this as well, without the handoff
                     }
+                    // The learned cost model: every agent pays its own planning call, one plan
+                    // pays once. A split must be worth the extra tokens it is priced at.
+                    // (Not charged to a capability pipeline: its value is least privilege and
+                    // serialised side effects, not tokens.)
+                    if !capability_pipeline {
+                        p -= (f.est_team_tokens.saturating_sub(f.est_flat_tokens) as f64 / 4000.0).min(0.2);
+                    }
                     p.clamp(0.0, 0.95)
                 };
                 out.insert("split".into(), Answer::noul(p));
@@ -431,6 +438,8 @@ mod tests {
         DecisionState {
             request: "x".into(),
             team_facts: Some(TeamFacts {
+                est_flat_tokens: 0,
+                est_team_tokens: 0,
                 subgoals: vec!["g".into(); n],
                 direct,
                 dependent,
@@ -471,6 +480,28 @@ mod tests {
         let mut st = facts(2, 0, 0, 2, 0, 0, false);
         st.team_facts.as_mut().unwrap().models_available = false;
         assert!(split_p(st) < 0.1);
+    }
+
+    #[test]
+    fn the_priced_cost_of_extra_planning_calls_counts_against_a_split() {
+        let base = facts(2, 0, 0, 2, 0, 0, false);
+        let free = split_p(base.clone());
+        let mut priced = base;
+        // two model agents: 2 x (plan + step) versus plan + 2 x step
+        priced.team_facts.as_mut().unwrap().est_flat_tokens = 630;
+        priced.team_facts.as_mut().unwrap().est_team_tokens = 960;
+        let costly = split_p(priced);
+        assert!(costly < free && free - costly < 0.1, "{free} -> {costly}: a modest penalty, not a veto");
+        assert!(costly >= 0.6, "parallelism still justifies it");
+        let mut huge = facts(2, 0, 0, 2, 0, 0, false);
+        huge.team_facts.as_mut().unwrap().est_flat_tokens = 600;
+        huge.team_facts.as_mut().unwrap().est_team_tokens = 9000;
+        assert!(split_p(huge) < 0.6, "a split priced far above the flat plan is refused");
+        // ...but a pipeline that separates read-only from state-changing work is worth its cost
+        let mut pipeline = facts(3, 0, 2, 0, 0, 1, false);
+        pipeline.team_facts.as_mut().unwrap().est_flat_tokens = 780;
+        pipeline.team_facts.as_mut().unwrap().est_team_tokens = 1440;
+        assert!(split_p(pipeline) >= 0.6);
     }
 
     #[test]

@@ -98,10 +98,17 @@ async fn anthropic_request_shape_and_cache_control() {
     assert_eq!(r.usage.prompt_tokens, 120, "cached input tokens are counted");
     let (body, key) = seen.0.lock().unwrap().clone().unwrap();
     assert_eq!(key.as_deref(), Some("sk-test|2023-06-01"));
-    assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
+    assert!(body["system"][0].get("cache_control").is_none(), "a short prefix is below the provider's minimum: no dead cache_control");
     assert!(body["system"][0]["text"].as_str().unwrap().starts_with("SYS"));
     assert!(body["system"][0]["text"].as_str().unwrap().contains("JSON"));
     assert_eq!(body["messages"][0]["role"], "user");
+
+    // a long stable prefix is worth caching
+    let mut long = req(false);
+    long.system = "stable instructions ".repeat(400);
+    m.generate(long).await.unwrap();
+    let (body, _) = seen.0.lock().unwrap().clone().unwrap();
+    assert_eq!(body["system"][0]["cache_control"], json!({"type": "ephemeral"}));
 }
 
 mod parking_lot_free {

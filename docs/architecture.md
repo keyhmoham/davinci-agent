@@ -30,6 +30,36 @@ No model owns control flow, permissions, or the claim that a task is done.
    answers are checked for ungrounded numbers/paths/URLs.
 10. **Learn** — calibration, episodic memory, validated fact promotion, skill crystallisation.
 
+## Token economy (`crates/dfae-runtime/src/economy/`)
+
+Zero-cost mechanisms, one module, one cost model. Inspired by the Dagwood preprint's compile-validate-repair idea;
+what was *not* adopted: the YAML representation (plans are already typed JSON at ~40 tokens/step), progressive
+expansion for the planner (it never sees a workflow), and the headline compression ratios (they compare against
+injecting every skill file, which this runtime never does).
+
+* **`cost.rs` — `CostModel`.** Per-purpose (`plan`, `plan_repair`, `replan`, `step`, `step_expand`, `answer`) running mean
+  of total tokens, blended with a measured prior (`(prior·3 + mean·n)/(3 + n)`, `n` capped at 50 so it keeps adapting),
+  updated from each finished task's *own* ledger entries and persisted (`kv: costmodel`). `estimate_plan` prices the
+  remaining work; `flat_vs_team` prices a split. `plan_model_calls` counts what the executor will spend: one per unfinished
+  reasoning step, plus the answer-composing call unless a single reasoning leaf *is* the answer.
+* **Budget gate.** `validate_plan` receives the *remaining* budget (`Inner::remaining_budget`) and reports
+  "the plan needs about N model calls but only M remain" like any other plan defect — so the existing one-shot repair
+  prompt tells the planner exactly what to fix, on every path (model plans, skills, replans, team plans).
+* **`repair.rs`.** `fix_args` (types, unknown args, required args from entities/defaults — only if the result validates)
+  and `relocate_path` (a *unique* match by name in a bounded workspace search). Applied by `repair_plan_args` right after a
+  plan is parsed and by `repair_failed_step` on `InvalidArgs`/`NotFound`, at most twice per step, without consuming the
+  step's retry budget, and never for policy/timeout/transient/tool failures. A repaired step still passes validation and
+  the policy engine.
+* **`contracts.rs`.** `resolve_templates` refuses to run a step whose `{{sN}}` input is missing or empty;
+  `model_output_issue` rejects empty (no alphanumerics), degenerate-repetition and prompt-echo outputs (a legitimately
+  short answer such as `4` passes); `ToolMetadata.contract` holds tool-declared post-conditions evaluated with the same
+  `Check` machinery as plan checks.
+* **`lazy.rs`.** Opt-in `NEED <step>` protocol, honoured only for short replies naming real dependencies.
+
+Rationale for the team-pricing rule: with default costs, `n` model agents cost `n·(plan+step)` against `plan + n·step`
+for one plan — `(n−1)` extra planning calls. The local decider subtracts up to 0.2 from a split's score in proportion to
+that excess, except for capability-separating pipelines, whose value is safety rather than tokens.
+
 ## Teams (`crates/dfae-runtime/src/{team,dispatch,agents}.rs`)
 
 Delegation is a **plan step kind** (`Agent`); an agent is a child `TaskRecord` run through the same pipeline.

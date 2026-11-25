@@ -122,7 +122,7 @@ mod tests {
     fn done_plan() -> Plan {
         let mut s1 = Step::tool("s1", "fs_read", "read /workspace/a.txt", json!({"path": "/workspace/a.txt"}));
         s1.status = StepStatus::Succeeded;
-        Plan { goal: "g".into(), steps: vec![s1], source: PlanSource::Slm, revision: 0 }
+        Plan { goal: "g".into(), steps: vec![s1], source: PlanSource::Slm, revision: 0, estimate: None }
     }
 
     #[test]
@@ -149,7 +149,7 @@ mod tests {
         let mut p = done_plan();
         p.steps[0].status = StepStatus::Failed;
         assert!(crystallize("g", &[], &p).is_none());
-        let p = Plan { goal: "g".into(), steps: vec![Step::reasoning("s1", "think")], source: PlanSource::Slm, revision: 0 };
+        let p = Plan { goal: "g".into(), steps: vec![Step::reasoning("s1", "think")], source: PlanSource::Slm, revision: 0, estimate: None };
         assert!(crystallize("g", &[], &p).is_none());
     }
 }

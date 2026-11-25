@@ -29,6 +29,7 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/info", get(info))
         .route("/v1/tools", get(tools))
         .route("/v1/dispatch", get(dispatch))
+        .route("/v1/cost", get(cost))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
@@ -95,11 +96,17 @@ async fn info(State(s): State<AppState>) -> Json<Value> {
             "database": cfg.database_url.is_some(),
             "budget": cfg.budget,
             "team": cfg.team,
+            "economy": cfg.economy,
             "thresholds": cfg.thresholds,
             "allow_auto_approve": cfg.allow_auto_approve,
         },
         "tools": s.engine.tools().iter().map(|t| json!({"name": t.name, "description": t.description, "risk": t.risk, "side_effects": t.side_effects, "signature": t.signature()})).collect::<Vec<_>>(),
     }))
+}
+
+/// What each kind of model call costs on this deployment (priors, observations, estimate in use).
+async fn cost(State(s): State<AppState>) -> Json<Value> {
+    Json(s.engine.cost())
 }
 
 /// Admission queue and per-role worker pools.

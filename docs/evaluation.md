@@ -25,6 +25,14 @@ each) accumulate in the history. This is a plausible but simple cost model; real
 search, history trimming). **"X% saved" is therefore model-relative.** A direct-mode task shows ~100% because it
 used zero generative tokens, which is real; the baseline it is compared with is hypothetical.
 
+## Estimates versus actuals
+
+Every accepted plan carries `estimate {model_calls, tokens}` (the *remaining* cost, priced by the learned cost model). Compare it
+with the task's ledger to see how well the model fits your deployment; `GET /v1/cost` shows each purpose's prior, observed mean,
+sample count and the estimate in use. The shipped priors come from the shipped prompts (planner system prompt ≈ 200 tokens,
+replanner ≈ 150, step ≈ 60, answer ≈ 70) and are replaced by evidence as it accumulates. Estimated savings from repair
+(~300–500 tokens per avoided repair/replan call) are derived from those numbers, not measured on a real model.
+
 ## Teams
 
 A coordinator's **baseline** models one naive agent doing *all* the work (every agent's steps in one history), not the sum of

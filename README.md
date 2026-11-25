@@ -44,8 +44,10 @@ Mechanisms that cut tokens (all implemented and tested):
 - **Observation compression** — tool output is redacted, de-duplicated and head/tail-elided
   before it re-enters a prompt; full output stays in state.
 - **No redundant calls** — a lone reasoning leaf *is* the answer (no synthesis call); decisions
-  and extractions are cached; stable system prompts enable provider prefix caching
-  (Anthropic `cache_control` is set).
+  and extractions are cached; system prompts are byte-stable so local KV-prefix caches
+  (llama.cpp / Ollama) stay warm. Anthropic `cache_control` is sent only when the stable prefix
+  clears the provider's minimum cacheable length (historically ~1,024 tokens for Sonnet-class
+  models); the shipped ~60–200-token prompts are below it, so hosted prompt caching does not apply to them.
 - **Skill learning** — a *verified* plan is generalised into a parameterised skill
   (procedural memory). A similar request later replays it with new entity values: no planning
   call, and no model at all if the plan has no reasoning step.
@@ -56,6 +58,21 @@ The TUI's **Tokens** view and the `ledger` on every task show actual generative 
 **estimated** baseline for a naive agent that re-sends the system prompt, every tool schema and
 the full raw history on each step (formula in [`docs/evaluation.md`](docs/evaluation.md)). The
 baseline is a model, not a measurement — benchmark against a real agent before quoting a number.
+
+## Token economy: zero-cost mechanisms that save tokens
+
+One layer (`crates/dfae-runtime/src/economy`) groups everything that spends no generative tokens to avoid
+spending some. It was shaped by the [Dagwood](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=7506739) preprint's
+"compile, validate, repair before asking the LLM" discipline, adapted to a runtime whose plans are already typed.
+
+| Mechanism | What it does | Saves |
+|---|---|---|
+| **Learned cost model** | Prices every accepted plan (`est. 2 model calls ≈ 410 tok`) from per-purpose costs learned from the ledger and persisted across restarts (`/v1/cost`). | Feeds the next three rows |
+| **Pre-execution budget gate** | An unaffordable plan is rejected *with the numbers* and sent back to the planner before any tool runs — not discovered mid-run. | Wasted tool runs and half-finished work |
+| **Team pricing** | The same model prices team vs one plan: splitting model work costs an extra planning call per agent, and that is charged against splits whose only benefit is parallelism (not against capability-separating pipelines). | Splits that cost more than they return |
+| **Deterministic repair** | Wrong types, unknown arguments, values the request itself supplies, and a file that lives one directory over are fixed *in code* — at plan-parse time and when a step fails (`InvalidArgs`/`NotFound`). Ambiguous paths are never guessed; policy denials are never repaired. | A repair or replan call (~300–500 tokens) each |
+| **Output contracts** | Empty or degenerate model output and echoed prompts are rejected at the step that produced them; a step never runs on an empty upstream result; tools declare output contracts (`calc` must return `… = n`, `http_get` must start `HTTP nnn`). | Downstream model calls on garbage |
+| **Lazy context** *(opt-in)* | `DFAE_LAZY_CONTEXT=on`: reasoning steps get ~40-token upstream summaries and may reply `NEED s1` for the full output. | Prompt size — **at the risk of an extra call; unmeasured with a real model, so off by default** |
 
 ## Teams: subagents, swarm and dispatch
 
@@ -93,8 +110,9 @@ UI all work on teams unchanged. A subagent is an ordinary child task running the
 
 **What teams buy you, honestly.** Parallelism, context isolation (each agent's prompt holds its own sub-goal and
 upstream summary), least privilege, and serialised side effects. Raw token savings appear when sub-goals replace
-*planned tool steps* with free deterministic agents (fan-out + join); a pipeline of model-only agents costs about
-what one plan would. The TUI **Team** view shows agents, roles, dependencies and the live worker pools.
+*planned tool steps* with free deterministic agents (fan-out + join). A pipeline of model-only agents costs *more*
+than one plan — every agent pays its own planning call (~330 tokens by default) — which is why the cost model charges
+that against splits justified only by parallelism. The TUI **Team** view shows agents, roles, dependencies and the live worker pools.
 
 ## Architecture
 
@@ -181,7 +199,7 @@ curl -N localhost:8080/v1/tasks/<id>/events   # SSE: replays history, then live
 
 `/health` (liveness) · `/v1/health` · `/v1/info` · `/v1/tasks` (POST/GET) · `/v1/tasks/{id}` ·
 `/v1/tasks/{id}/cancel` · `/v1/tasks/{id}/approvals/{aid}` · `/v1/tasks/{id}/events` ·
-`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/dispatch` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
+`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/dispatch` · `/v1/cost` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
 Set `DFAE_API_TOKEN` to require `Authorization: Bearer …` (everything except `/health`).
 
 ### Configuration
@@ -196,6 +214,8 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `DFAE_API_TOKEN` | bearer token for the API |
 | `DFAE_ALLOW_AUTO_APPROVE` | allow `auto_approve` requests (benchmarks only) |
 | `DFAE_MAX_STEPS`, `_MAX_MODEL_CALLS`, `_MAX_TOOL_CALLS`, `_MAX_REPLANS`, `_MAX_SECONDS`, `_MAX_CHILDREN` | per-task budgets |
+| `DFAE_REPAIR` | `off` disables deterministic repair |
+| `DFAE_LAZY_CONTEXT` | `on` enables lazy upstream context (`NEED <step>` expansion); off by default |
 | `DFAE_TEAM` | `off` disables automatic delegation |
 | `DFAE_MAX_CONCURRENT_TASKS` / `DFAE_MAX_QUEUED_TASKS` | admission control: tasks running at once / waiting before load shedding (8 / 64) |
 | `DFAE_MAX_AGENTS` / `DFAE_ROLE_SLOTS` | subagents running at once (8) / per-role pools (`researcher=4,operator=1,analyst=4,verifier=2`) |
@@ -216,7 +236,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 150+ tests, hermetic
+cargo test --workspace                       # 170+ tests, hermetic
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -226,9 +246,11 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 150+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 170+ unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
+| Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |
+| Token economy payoff on a *real* model | **unmeasured** — priors come from the shipped prompts; savings per avoided repair (~300–500 tokens) are estimates; lazy context may cost more than it saves for some workloads |
 | Quality of automatic splits with a *real* SLM/Jev | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
 | Postgres store, audit chain | verified against PostgreSQL 16 (`real[]` fallback path) |
 | HTTP API + SSE + auth, TUI rendering and key handling | verified (integration tests; TUI also driven in a real terminal) |

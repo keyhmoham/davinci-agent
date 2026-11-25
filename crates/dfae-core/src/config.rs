@@ -51,6 +51,17 @@ pub struct Thresholds {
     pub tool_min_relevance: f32,
 }
 
+/// Token-economy switches (the zero-cost mechanisms that save generative tokens).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EconomyConfig {
+    /// Fix bad arguments / missing paths deterministically before asking a model.
+    pub repair: bool,
+    /// Give reasoning steps short upstream summaries and let the model ask for
+    /// more (`NEED <step>`). Off by default: it trades a possible extra call for
+    /// smaller prompts and should be measured on your workload before enabling.
+    pub lazy_context: bool,
+}
+
 /// Team orchestration and dispatch limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamConfig {
@@ -91,6 +102,7 @@ pub struct Config {
     pub budget: Budget,
     pub thresholds: Thresholds,
     pub team: TeamConfig,
+    pub economy: EconomyConfig,
     pub max_parallel: usize,
     pub approval_ttl_secs: u64,
     pub log_json: bool,
@@ -147,6 +159,10 @@ impl Config {
                 skill_min_similarity: env_parse("DFAE_SKILL_MIN_SIM", 0.82),
                 escalate_below: env_parse("DFAE_ESCALATE_BELOW", 0.35),
                 tool_min_relevance: env_parse("DFAE_TOOL_MIN_REL", 0.5),
+            },
+            economy: EconomyConfig {
+                repair: !matches!(env("DFAE_REPAIR").as_deref(), Some("off" | "false" | "0")),
+                lazy_context: env_bool("DFAE_LAZY_CONTEXT", false),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),

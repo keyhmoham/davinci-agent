@@ -51,6 +51,7 @@ fn meta(name: &str, description: &str, category: &str, params: Vec<ParamSpec>) -
         keywords: vec![],
         direct_patterns: vec![],
         cacheable: false,
+        contract: vec![],
     }
 }
 
@@ -70,6 +71,7 @@ pub struct TimeNow;
 impl Tool for TimeNow {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta("time_now", "current date and time (UTC)", "system", vec![]);
+        m.contract = vec![Check::Matches { pattern: r"unix \d+".into() }];
         kw(&mut m, &["time", "date", "clock", "today", "now", "day"]);
         pats(&mut m, &[r"(?i)\b(?:current\s+(?:time|date)|what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?(?:time|date)|what\s+time\s+is\s+it|what\s+day\s+is\s+(?:it|today)|today'?s\s+date|time\s+now)\b".into()]);
         m
@@ -94,6 +96,7 @@ impl Tool for Calc {
             vec![ParamSpec::new("expression", ParamType::String, true, "arithmetic expression").hints(&["expression"])],
         );
         m.cacheable = true;
+        m.contract = vec![Check::Matches { pattern: r" = -?\d".into() }];
         kw(&mut m, &["calculate", "compute", "math", "arithmetic", "sum", "multiply", "divide", "evaluate"]);
         let f = "sqrt|abs|sin|cos|tan|ln|log|round|floor|ceil|pi";
         pats(
@@ -130,6 +133,7 @@ fn read_proc(p: &str) -> Option<String> {
 impl Tool for SystemInfo {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta("system_info", "host diagnostics: load, memory, uptime, disk", "system", vec![]);
+        m.contract = vec![Check::Contains { value: "host:".into() }];
         kw(&mut m, &["system", "memory", "cpu", "disk", "uptime", "load", "resources", "diagnostics", "health", "server", "status"]);
         pats(&mut m, &[r"(?i)\b(?:system\s+(?:info|information|status|health|resources|diagnostics)|disk\s+(?:usage|space)|memory\s+usage|cpu\s+(?:load|usage)|(?:server|system)\s+load|uptime|resource\s+usage|how\s+much\s+(?:disk|memory|ram))\b".into()]);
         m
@@ -182,6 +186,7 @@ impl Tool for FsList {
             ],
         );
         m.cacheable = true;
+        m.contract = vec![Check::Contains { value: "entries)".into() }];
         kw(&mut m, &["files", "directory", "folder", "list", "ls", "contents"]);
         let path = r"(?P<path>(?:\.{1,2}|~)?/[\w./\-]*|[\w\-]+/[\w./\-]*|\.)";
         pats(
@@ -502,6 +507,7 @@ impl Tool for HttpGet {
             "web",
             vec![ParamSpec::new("url", ParamType::String, true, "http(s) URL").hints(&["url"])],
         );
+        m.contract = vec![Check::Matches { pattern: r"^HTTP \d{3}".into() }];
         kw(&mut m, &["fetch", "download", "web", "url", "http", "website", "page", "internet", "browse"]);
         pats(
             &mut m,

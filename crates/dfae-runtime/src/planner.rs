@@ -51,7 +51,7 @@ pub fn plan_from_calls(goal: &str, calls: &[DirectCall]) -> Plan {
         }
         steps.push(s);
     }
-    Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0 }
+    Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None }
 }
 
 /// Parse a model-produced plan. `prefix` is prepended to every new step id
@@ -125,6 +125,13 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
     let mut errs = Vec::new();
     if steps.len() as u32 > budget.max_steps {
         errs.push(format!("plan has {} steps; the limit is {}", steps.len(), budget.max_steps));
+    }
+    // `budget.max_model_calls` is what is *left*: a plan that cannot be afforded is
+    // rejected now, with the numbers, so the planner can shrink it — not discovered
+    // half-way through execution after the tools have already run.
+    let needed = crate::economy::plan_model_calls(steps);
+    if needed > budget.max_model_calls {
+        errs.push(format!("the plan needs about {needed} model calls but only {} remain; use fewer reasoning steps", budget.max_model_calls));
     }
     let agent_steps = steps.iter().filter(|s| s.kind == StepKind::Agent).count() as u32;
     if agent_steps > budget.max_children {

@@ -76,7 +76,7 @@ impl Inner {
         let dec = team::decompose(goal, entities, &|fragment| bind_direct(&metas, fragment, entities).is_some())?;
         let direct: Vec<bool> = dec.subgoals.iter().map(|s| bind_direct(&metas, &s.text, entities).is_some()).collect();
         let models_available = self.models.has(Tier::Slm) || self.models.has(Tier::Strong);
-        let facts = team::team_facts(&dec, &direct, models_available);
+        let facts = team::team_facts(&dec, &direct, models_available, &self.cost);
         let confidence = if force {
             1.0
         } else {
@@ -87,8 +87,9 @@ impl Inner {
         if confidence < SPLIT_THRESHOLD || (!models_available && (facts.direct < direct.len() || facts.has_synthesis)) {
             return None;
         }
-        let plan = team::plan_from_decomposition(goal, &dec);
-        let budget = ctx.rec.lock().await.budget.clone();
+        let mut plan = team::plan_from_decomposition(goal, &dec, &direct);
+        plan.estimate = Some(self.cost.estimate_plan(&plan));
+        let budget = self.remaining_budget(ctx).await;
         if let Err(errs) = crate::planner::validate_plan(&plan.steps, &self.tools, &[], &budget) {
             self.emit(ctx, EventKind::Warning { message: format!("team plan rejected ({}); planning as one task", errs.join("; ")) }).await;
             return None;

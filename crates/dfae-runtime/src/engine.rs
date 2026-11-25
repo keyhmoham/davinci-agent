@@ -92,6 +92,7 @@ pub(crate) struct Inner {
     pub policy: Arc<PolicyEngine>,
     pub bus: EventBus,
     pub dispatcher: Dispatcher,
+    pub cost: crate::economy::CostModel,
     pub live: Mutex<HashMap<String, Arc<TaskCtx>>>,
 }
 
@@ -137,6 +138,7 @@ impl Engine {
         Self {
             inner: Arc::new(Inner {
                 dispatcher: Dispatcher::new(&deps.config.team),
+                cost: crate::economy::CostModel::new(),
                 cfg: deps.config,
                 store: deps.store,
                 extractor: deps.extractor,
@@ -148,6 +150,18 @@ impl Engine {
                 live: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// Load learned state (the cost model) from the store. Call once at startup.
+    pub async fn restore(&self) {
+        if let Ok(Some(v)) = self.inner.store.kv_get("costmodel").await {
+            self.inner.cost.load(&v);
+        }
+    }
+
+    /// What each kind of model call costs here: priors, observations, the estimate in use.
+    pub fn cost(&self) -> Value {
+        self.inner.cost.snapshot()
     }
 
     pub fn config(&self) -> &Config {
@@ -468,6 +482,16 @@ impl Inner {
         }
         self.emit(ctx, EventKind::Decision { record: d.record }).await;
         d.value
+    }
+
+    /// The task's budget as it stands *now*: model calls already spent are gone.
+    /// Plans are validated against this, so an unaffordable plan is rejected
+    /// before any of its tools run.
+    pub(crate) async fn remaining_budget(&self, ctx: &Arc<TaskCtx>) -> Budget {
+        let r = ctx.rec.lock().await;
+        let mut b = r.budget.clone();
+        b.max_model_calls = b.max_model_calls.saturating_sub(r.usage.model_calls);
+        b
     }
 
     pub(crate) async fn take_model_call(&self, ctx: &Arc<TaskCtx>, n: u32) -> Result<(), String> {

@@ -251,6 +251,9 @@ pub struct Step {
     /// Class of the failure (drives recovery; survives delegation).
     #[serde(default)]
     pub error_kind: Option<crate::ErrorKind>,
+    /// Deterministic repairs applied to this step (no model involved).
+    #[serde(default)]
+    pub repairs: u32,
     #[serde(default)]
     pub evidence: Vec<String>,
     #[serde(default)]
@@ -281,6 +284,7 @@ impl Step {
             summary: None,
             error: None,
             error_kind: None,
+            repairs: 0,
             evidence: vec![],
             started_at: None,
             finished_at: None,
@@ -314,6 +318,16 @@ pub struct Plan {
     pub source: PlanSource,
     #[serde(default)]
     pub revision: u32,
+    /// What finishing this plan is expected to cost (set when the plan is accepted).
+    #[serde(default)]
+    pub estimate: Option<CostEstimate>,
+}
+
+/// Expected *remaining* generative cost of a plan, priced by the learned cost model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CostEstimate {
+    pub model_calls: u32,
+    pub tokens: u64,
 }
 
 impl Plan {

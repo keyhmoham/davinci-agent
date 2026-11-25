@@ -102,7 +102,13 @@ fn describe(e: &Event) -> Option<String> {
         EventKind::Extraction { entities, backend, .. } => format!("extract   {} entities via {backend}", entities.len()),
         EventKind::Decision { record } => format!("decide    {} via {}", record.kind, record.provider),
         EventKind::Mode { mode, reason, .. } => format!("mode      {} — {reason}", format!("{mode:?}").to_uppercase()),
-        EventKind::PlanCreated { plan } => format!("plan      {} steps ({:?})", plan.steps.len(), plan.source),
+        EventKind::PlanCreated { plan } => format!(
+            "plan      {} steps ({:?}){}",
+            plan.steps.len(),
+            plan.source,
+            plan.estimate.map(|e| format!(" · est. {} model calls ≈ {} tok", e.model_calls, e.tokens)).unwrap_or_default()
+        ),
+        EventKind::Repaired { step_id, note } => format!("repair    {step_id}: {note} (no model call)"),
         EventKind::TeamFormed { goals, reason } => format!("team      {} agents — {reason}", goals.iter().filter(|g| !g.synth).count()),
         EventKind::AgentDone { step_id, role, status, generative_tokens, .. } => {
             format!("agent     {step_id} ({}) → {status:?}, {generative_tokens} generative tokens", role.as_str())

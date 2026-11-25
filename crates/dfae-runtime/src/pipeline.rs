@@ -160,7 +160,8 @@ impl Inner {
                 a.clone()
             };
             // direct / skill plans are re-validated like any other plan
-            if let Err(errs) = planner::validate_plan(&plan.steps, &self.tools, &allowed, &ctx.rec.lock().await.budget) {
+            let remaining = self.remaining_budget(ctx).await;
+            if let Err(errs) = planner::validate_plan(&plan.steps, &self.tools, &allowed, &remaining) {
                 return Err(format!("plan rejected: {}", errs.join("; ")));
             }
         }
@@ -173,6 +174,8 @@ impl Inner {
                 self.emit(ctx, EventKind::Warning { message: format!("decision layer doubts this plan (p={p:.2}); execution continues under policy") }).await;
             }
         }
+        let mut plan = plan;
+        plan.estimate = Some(self.cost.estimate_plan(&plan));
         ctx.rec.lock().await.plan = Some(plan.clone());
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
@@ -489,10 +492,10 @@ impl Inner {
             let mut req = self.gen_request(tier, prompts::PLAN_SYSTEM, user, if attempt == 0 { "plan" } else { "plan_escalated" });
             req.json = true;
             let source = if tier == Tier::Strong { PlanSource::Strong } else { PlanSource::Slm };
-            match self.try_plan(ctx, tier, req, goal, source, &allowed, &budget).await {
+            match self.try_plan(ctx, tier, req, goal, source, &allowed).await {
                 Ok(steps) => {
                     let _ = entities;
-                    return Ok((Plan { goal: goal.into(), steps, source, revision: 0 }, used_mode));
+                    return Ok((Plan { goal: goal.into(), steps, source, revision: 0, estimate: None }, used_mode));
                 }
                 Err(e) => {
                     last_err = e;
@@ -521,22 +524,28 @@ impl Inner {
         goal: &str,
         source: PlanSource,
         allowed: &[String],
-        budget: &Budget,
     ) -> Result<Vec<Step>, String> {
         let v = self.gen_json(ctx, tier, req.clone()).await?;
         let problems = match planner::parse_plan(&v, goal, source, "", &self.tools) {
-            Ok(steps) => match planner::validate_plan(&steps, &self.tools, allowed, budget) {
-                Ok(()) => return Ok(steps),
-                Err(errs) => errs,
-            },
+            Ok(mut steps) => {
+                // code fixes what code can fix (types, unknown arguments, values the request supplies)
+                self.repair_plan_args(ctx, &mut steps, goal).await;
+                let remaining = self.remaining_budget(ctx).await;
+                match planner::validate_plan(&steps, &self.tools, allowed, &remaining) {
+                    Ok(()) => return Ok(steps),
+                    Err(errs) => errs,
+                }
+            }
             Err(e) => vec![e],
         };
         req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
         req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
         req.purpose = "plan_repair".into();
         let v2 = self.gen_json(ctx, tier, req).await?;
-        let steps = planner::parse_plan(&v2, goal, source, "", &self.tools)?;
-        planner::validate_plan(&steps, &self.tools, allowed, budget).map_err(|e| e.join("; "))?;
+        let mut steps = planner::parse_plan(&v2, goal, source, "", &self.tools)?;
+        self.repair_plan_args(ctx, &mut steps, goal).await;
+        let remaining = self.remaining_budget(ctx).await;
+        planner::validate_plan(&steps, &self.tools, allowed, &remaining).map_err(|e| e.join("; "))?;
         Ok(steps)
     }
 
@@ -677,6 +686,9 @@ impl Inner {
             self.decider.record_outcome(DecisionKind::RouteTask, &r.task_type, success);
         }
         let _ = self.store.kv_set("calibration", self.decider.calibrator.snapshot()).await;
+
+        // 1b. the cost model learns what this task's model calls cost
+        self.learn_costs(rec).await;
 
         // 2. episodic memory (failures are kept too: they are the most useful lessons)
         let answer = tokens::truncate_tokens(rec.final_answer.as_deref().unwrap_or(""), 60);
