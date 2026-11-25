@@ -98,9 +98,11 @@ fn bind_clause(metas: &[ToolMetadata], clause: &str, entities: &[Entity]) -> Opt
             // texts already bound to a parameter are not offered to another one (a quoted file name is not the content)
             let mut used: Vec<String> = Vec::new();
             for p in &m.params {
-                // file content is a literal: only whitespace is trimmed
-                let from_group =
-                    caps.name(&p.name).map(|g| if p.name == "content" { g.as_str().trim().to_string() } else { clean(g.as_str()) }).filter(|s| !s.is_empty());
+                // file content and edit strings are literals: only whitespace is trimmed
+                let from_group = caps
+                    .name(&p.name)
+                    .map(|g| if matches!(p.name.as_str(), "content" | "old_string" | "new_string") { g.as_str().trim().to_string() } else { clean(g.as_str()) })
+                    .filter(|s| !s.is_empty());
                 if let Some(raw) = from_group {
                     match coerce(p, &raw) {
                         Some(v) => {
@@ -209,6 +211,27 @@ mod tests {
         assert_eq!(c[0].args, json!({"path": "notes/a.md", "content": "# Title"}));
         // no content given: not bindable, so a model gets it
         assert!(bind_direct(&metas(), "create a file named test.txt", &[ent("file path", "test.txt")]).is_none());
+    }
+
+    #[test]
+    fn binds_file_management_and_editing_phrasings() {
+        assert_eq!(one("create a directory named build/out"), ("fs_mkdir".into(), json!({"path": "build/out"})));
+        assert_eq!(one("mkdir -p data/raw").1, json!({"path": "data/raw"}));
+        assert_eq!(one("move old.txt to archive/old.txt"), ("fs_move".into(), json!({"from": "old.txt", "to": "archive/old.txt"})));
+        assert_eq!(one("rename a.md to b.md").0, "fs_move");
+        assert_eq!(one("copy config.toml to config.bak"), ("fs_copy".into(), json!({"from": "config.toml", "to": "config.bak"})));
+        assert_eq!(one("delete notes/old.txt"), ("fs_delete".into(), json!({"path": "notes/old.txt"})));
+        assert_eq!(one("remove the directory build").1, json!({"path": "build"}));
+        assert_eq!(one("find files matching **/*.rs"), ("fs_glob".into(), json!({"pattern": "**/*.rs", "path": "."})));
+        let c = bind_direct(&metas(), r#"replace "foo()" with "bar()" in src/lib.rs"#, &[]).expect("bound");
+        assert_eq!(
+            (c[0].tool.as_str(), &c[0].args),
+            ("fs_edit", &json!({"path": "src/lib.rs", "old_string": "foo()", "new_string": "bar()"})),
+            "edit strings are verbatim"
+        );
+        // vague requests are not guessed: a model plans them
+        assert!(bind("delete the old stuff").is_none());
+        assert!(bind("refactor the module").is_none());
     }
 
     #[test]

@@ -40,7 +40,9 @@ pub struct Ledger {
     pub baseline_tokens: u64,
 }
 
+/// `#[serde(default)]`: a client built before a field was added or renamed must still read the summary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LedgerSummary {
     pub slm_tokens: u64,
     pub strong_tokens: u64,
@@ -151,5 +153,15 @@ mod tests {
         assert_eq!(s.generative_tokens, 150);
         assert_eq!(s.saved_tokens, 850);
         assert!((s.saved_pct - 85.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn summaries_from_older_or_newer_servers_still_parse() {
+        // an older server's field names and missing fields
+        let old: LedgerSummary = serde_json::from_value(serde_json::json!({"slm_tokens": 5, "jev_calls": 2})).unwrap();
+        assert_eq!((old.slm_tokens, old.decision_calls, old.cache_hits), (5, 2, 0));
+        // a newer server's extra fields
+        let new: LedgerSummary = serde_json::from_value(serde_json::json!({"decision_calls": 3, "something_new": true})).unwrap();
+        assert_eq!(new.decision_calls, 3);
     }
 }

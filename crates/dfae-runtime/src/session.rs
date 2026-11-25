@@ -121,18 +121,18 @@ pub fn small_talk(goal: &str, can: &str) -> Option<String> {
     let greeted = GREETING.find(goal);
     let rest = greeted.map(|m| &goal[m.end()..]).unwrap_or(goal).trim();
     let rest = rest.trim_matches(|c: char| c == '.' || c == ',' || c.is_whitespace());
-    let intro = format!("I'm DFAE. I can chat and answer questions, and I can use tools: {can}. What would you like to do?");
+    let intro = format!("I'm DFAE: I chat and use tools ({can}). What do you need?");
     if rest.is_empty() {
         return greeted.map(|_| format!("Hi! {intro}"));
     }
     if HOW_ARE_YOU.is_match(rest) {
-        return Some("I'm doing well, thanks for asking! How can I help you today?".into());
+        return Some("Doing well, thanks. What do you need?".into());
     }
     if THANKS.is_match(rest) {
-        return Some("You're welcome! Anything else?".into());
+        return Some("You're welcome.".into());
     }
     if BYE.is_match(rest) {
-        return Some("Goodbye! I'll be here when you need me.".into());
+        return Some("Goodbye.".into());
     }
     if WHO.is_match(rest) {
         return Some(intro);
@@ -187,7 +187,7 @@ mod tests {
         let can = "files, shell";
         assert!(small_talk("hi", can).unwrap().starts_with("Hi! I'm DFAE"));
         assert!(small_talk("Hello!!", can).is_some());
-        assert!(small_talk("hi. tell me how are you ?", can).unwrap().contains("doing well"));
+        assert!(small_talk("hi. tell me how are you ?", can).unwrap().contains("oing well"));
         assert!(small_talk("how are you?", can).is_some());
         assert!(small_talk("thanks a lot!", can).unwrap().contains("welcome"));
         assert!(small_talk("bye", can).unwrap().contains("Goodbye"));

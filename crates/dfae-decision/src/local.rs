@@ -59,6 +59,14 @@ const TYPE_LEXICON: &[(&str, &[&str])] = &[
             "git",
             "commit",
             "debug",
+            "edit",
+            "modify",
+            "rename",
+            "replace",
+            "build",
+            "lint",
+            "install",
+            "dependency",
             "class",
             "module",
         ],
@@ -268,7 +276,8 @@ impl LocalDecider {
                 let c = self.complexity(s);
                 out.insert("complexity".into(), Answer::score(c * 2.0, 0.6));
                 let best_tool = self.tool_scores(s).iter().map(|(_, p)| *p).fold(0.0, f64::max);
-                let tool_type = matches!(tt.as_str(), "file_operations" | "system_diagnostics" | "calculation" | "maintenance" | "memory" | "research");
+                let tool_type =
+                    matches!(tt.as_str(), "file_operations" | "system_diagnostics" | "calculation" | "maintenance" | "memory" | "research" | "coding");
                 let needs = if tool_type { best_tool.max(0.7) } else { best_tool * 0.9 };
                 out.insert("needs_tools".into(), Answer::noul(needs));
                 let (r, rc) = self.risk(s);

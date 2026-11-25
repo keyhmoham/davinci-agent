@@ -25,6 +25,8 @@ pub async fn run_argv(argv: &[String], cwd: &Path, timeout: Duration, max_bytes:
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("LANG", "C.UTF-8")
+        .env("HOME", "/tmp")
+        .env("TERM", "dumb")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

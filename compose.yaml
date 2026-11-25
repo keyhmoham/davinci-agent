@@ -104,6 +104,8 @@ services:
       BRAVE_API_KEY: ${BRAVE_API_KEY:-}
       DFAE_API_TOKEN: ${DFAE_API_TOKEN:-}
       DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
+      # never (default): no tool call waits for a human. ask: risky calls wait for approval in the TUI.
+      DFAE_APPROVALS: ${DFAE_APPROVALS:-never}
       DFAE_REPAIR: ${DFAE_REPAIR:-}
       DFAE_LAZY_CONTEXT: ${DFAE_LAZY_CONTEXT:-}
       DFAE_TEAM: ${DFAE_TEAM:-}
@@ -122,7 +124,8 @@ services:
     mem_limit: ${DFAE_MEM_LIMIT:-2g}
     pids_limit: 512
     tmpfs:
-      - /tmp
+      # scratch space for the shell: HOME, build and package caches (exec, because compilers and scripts run from here)
+      - /tmp:exec,size=1g
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true

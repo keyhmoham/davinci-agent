@@ -1,5 +1,15 @@
 # Security
 
+## Read this first: the agent runs without asking
+
+By default (`DFAE_APPROVALS=never`) **no tool call waits for a human** and the agent never asks for confirmation. The policy still
+refuses what it forbids; it does not ask about it. In the shipped container policy the `shell` tool is a **full bash**
+(`shell.mode = "sandbox"`), so the container is the security boundary: read-only root filesystem, all capabilities dropped,
+`no-new-privileges`, unprivileged user, memory and pid limits, API on loopback. The workspace volume is writable by design and the
+container has network egress: a prompt injection that gets past the (heuristic) detector can make the agent read or change anything in
+the workspace and send it anywhere the container can reach. Do not mount anything you cannot lose into `/workspace`, keep the API token
+set if the API is exposed, and use `DFAE_APPROVALS=ask` (and `shell.mode = "allowlist"`) when that is not acceptable.
+
 ## Boundary
 
 The **policy engine** (`crates/dfae-tools/src/policy.rs`, configured by `config/policy.toml`) is the only
@@ -14,9 +24,10 @@ before execution on the final arguments** (templates resolved); (3) again **insi
 | Surface | Control |
 |---|---|
 | filesystem | read/write roots (default: the workspace); path normalisation **and** symlink resolution of the deepest existing ancestor; `.git`, `.env`, `id_*`, `.ssh`, `.aws` always denied; **writes need approval**; `fs_write` verifies by reading back |
-| shell | argv execution (no shell, so no pipes/redirects/globbing/substitution); command allowlist; bare names only; **every non-flag argument and `--flag=value` is path-resolved** (so `cat link-to-outside`, `du --files0-from=/etc/passwd` are denied); per-command denied flags (`find -exec/-delete/-fprint`, `sort -o`, `date -s`); environment cleared; 10 s timeout; 64 KB output cap; mutating commands (`mkdir cp mv touch`) need approval |
+| shell (`mode = "sandbox"`, container only) | a full bash in the workspace; `cwd` must stay inside it; timeout (default 120 s, max `max_timeout_secs`), output cap; background jobs killed with the process; no per-command rules — the container is the boundary |
+| shell (`mode = "allowlist"`, the built-in default) | argv execution (no shell, so no pipes/redirects/globbing/substitution); command allowlist; bare names only; **every non-flag argument and `--flag=value` is path-resolved** (so `cat link-to-outside`, `du --files0-from=/etc/passwd` are denied); per-command denied flags (`find -exec/-delete/-fprint`, `sort -o`, `date -s`); environment cleared; 10 s timeout; 64 KB output cap; mutating commands (`mkdir cp mv touch`) need approval |
 | network | domain allowlist; with `open_web = true` (shipped) other **public** hosts are read-only GETs without approval — unless the task is tainted by a suspected prompt injection, when they need approval again; `http(s)` only; no URL credentials; loopback/private/link-local/metadata addresses blocked **after DNS resolution and at every redirect hop**; response size and time caps |
-| approvals | bound to `sha256(tool|canonical-args)`; expire; re-verified before running; API can require a bearer token |
+| approvals | **off by default (`DFAE_APPROVALS=never`)**; with `ask`: bound to `sha256(tool|canonical-args)`; expire; re-verified before running; API can require a bearer token |
 | injection | tool output is wrapped as `<data>`; secrets redacted before storage; heuristics flag instruction-like text → task **tainted** → every side-effecting step then needs approval; step prompts tell models that `<data>` is never instructions |
 | audit | append-only API, **hash-chained per task** (`sha256(prev ‖ kind ‖ canonical payload)`); `GET /v1/tasks/{id}/audit` returns `chain_valid` |
 | runtime | unprivileged user, read-only root filesystem, all capabilities dropped, `no-new-privileges`, memory and pid limits, API bound to loopback |

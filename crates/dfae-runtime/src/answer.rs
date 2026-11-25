@@ -155,7 +155,7 @@ impl Inner {
         } else {
             templated_answer(&snapshot, None)
         };
-        let mut text = text;
+        let mut text = if from_model { crate::style::compact(&text) } else { text };
         let mut unverified = Vec::new();
         // a conversational reply has no tool evidence to be checked against
         if from_model && plan.source != PlanSource::Chat {

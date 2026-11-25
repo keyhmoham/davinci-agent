@@ -17,6 +17,17 @@ fn env_bool(k: &str, d: bool) -> bool {
     env(k).map(|s| matches!(s.to_lowercase().as_str(), "1" | "true" | "yes" | "on")).unwrap_or(d)
 }
 
+/// Whether a tool call can wait for a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalMode {
+    /// Risky calls (writes, mutating commands, unlisted hosts…) wait for a human decision.
+    #[default]
+    Ask,
+    /// Nothing waits for anyone: a call the policy allows runs, one it forbids is refused.
+    Never,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionConfig {
     /// OpenAI-compatible endpoint of the self-hosted decision model (it must return
@@ -97,6 +108,8 @@ pub struct Config {
     #[serde(skip_serializing)]
     pub api_token: Option<String>,
     pub allow_auto_approve: bool,
+    /// `DFAE_APPROVALS=ask` brings the human approval step back (default: never ask).
+    pub approvals: ApprovalMode,
     #[serde(skip_serializing)]
     pub database_url: Option<String>,
     pub workspace: PathBuf,
@@ -126,6 +139,7 @@ impl Config {
             bind: env_or("DFAE_BIND", "0.0.0.0:8080"),
             api_token: env("DFAE_API_TOKEN"),
             allow_auto_approve: env_bool("DFAE_ALLOW_AUTO_APPROVE", false),
+            approvals: if env("DFAE_APPROVALS").map(|v| v.eq_ignore_ascii_case("ask")).unwrap_or(false) { ApprovalMode::Ask } else { ApprovalMode::Never },
             database_url: env("DATABASE_URL"),
             workspace: PathBuf::from(env_or("DFAE_WORKSPACE", "./workspace")),
             policy_path: env("DFAE_POLICY").map(PathBuf::from),
@@ -201,6 +215,7 @@ impl Default for Config {
         c.database_url = None;
         c.gliner_url = None;
         c.decision.base_url = None;
+        c.approvals = ApprovalMode::Ask; // the approval machinery is what the hermetic tests exercise
         c.slm.provider = "none".into();
         c.strong.provider = "none".into();
         c.api_token = None;

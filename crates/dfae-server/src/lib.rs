@@ -99,6 +99,7 @@ async fn info(State(s): State<AppState>) -> Json<Value> {
             "economy": cfg.economy,
             "thresholds": cfg.thresholds,
             "allow_auto_approve": cfg.allow_auto_approve,
+            "approvals": cfg.approvals,
         },
         "tools": s.engine.tools().iter().map(|t| json!({"name": t.name, "description": t.description, "risk": t.risk, "side_effects": t.side_effects, "signature": t.signature()})).collect::<Vec<_>>(),
     }))

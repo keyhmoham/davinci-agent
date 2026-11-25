@@ -54,6 +54,20 @@ pub fn plan_from_calls(goal: &str, calls: &[DirectCall]) -> Plan {
     Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None }
 }
 
+/// Tools a planner needs next to `tool` to use it properly.
+pub fn companions(tool: &str) -> &'static [&'static str] {
+    match tool {
+        "fs_edit" => &["fs_read", "fs_search", "fs_glob"],
+        "fs_write" => &["fs_read"],
+        "fs_delete" | "fs_move" | "fs_copy" => &["fs_list", "fs_glob"],
+        "shell" => &["shell_output", "shell_kill"],
+        "shell_output" | "shell_kill" => &["shell"],
+        "fs_search" => &["fs_read"],
+        "fs_glob" => &["fs_read"],
+        _ => &[],
+    }
+}
+
 /// A conversational reply: one reasoning step, no planning call. `gap` marks a request that
 /// needs a capability none of the tools has, so the reply says so honestly.
 pub fn chat_plan(goal: &str, gap: bool) -> Plan {
@@ -137,6 +151,14 @@ pub fn prune_unknown_deps(steps: &mut [Step]) -> Vec<String> {
         });
     }
     dropped
+}
+
+/// "patch it if necessary", "propose a fix": a change that may not happen is not a change that is missing.
+pub fn is_conditional(goal: &str) -> bool {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:if\s+(?:necessary|needed|required|any|appropriate|possible|applicable)|when\s+(?:necessary|needed)|as\s+needed|propose|suggest|draft|recommend|should\s+i)\b").unwrap()
+    });
+    RE.is_match(goal)
 }
 
 /// A request that changes something (create, write, delete…) must be planned with a tool that does.
@@ -322,6 +344,11 @@ mod tests {
         assert_eq!(prune_unknown_deps(&mut steps), vec!["r1_2 -> r1_9"]);
         assert_eq!(steps[1].depends_on, vec!["r1_1"]);
         validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+    }
+
+    #[test]
+    fn conditional_changes_are_not_required() {
+        assert!(is_conditional("patch it if necessary") && is_conditional("propose a fix for the bug") && !is_conditional("create a file named a.txt"));
     }
 
     #[test]

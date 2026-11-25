@@ -552,6 +552,20 @@ impl Inner {
                 allowed.push(c.tool.clone());
             }
         }
+        // tools that are only useful together: a model that edits must be able to read and find, one that
+        // starts a background job must be able to read its output and stop it
+        if !allowed.is_empty() {
+            for name in allowed.clone() {
+                for friend in planner::companions(&name) {
+                    // background-job tools only exist for a shell that can start jobs
+                    let relevant =
+                        !friend.starts_with("shell_") || self.tools.meta("shell").map(|m| m.params.iter().any(|p| p.name == "background")).unwrap_or(false);
+                    if relevant && self.tools.meta(friend).is_some() && ctx.in_scope(friend) && !allowed.iter().any(|a| a == friend) {
+                        allowed.push((*friend).to_string());
+                    }
+                }
+            }
+        }
         // no tool fits: this is a conversation (or a request we have no tool for) — answer it, don't plan it
         let is_member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
         if allowed.is_empty() && !is_member {
@@ -640,7 +654,9 @@ impl Inner {
         let remaining = self.remaining_budget(ctx).await;
         planner::validate_plan(&steps, &self.tools, &allowed, &remaining)?;
         if expect_effect {
-            let changes = ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && r.risk != Risk::Low).unwrap_or(false);
+            let member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
+            let changes =
+                !member && !planner::is_conditional(goal) && ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && r.risk != Risk::Low).unwrap_or(false);
             if changes && let Some(p) = planner::missing_effect(&steps, &self.tools, &allowed) {
                 return Err(vec![p]);
             }
