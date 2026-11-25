@@ -570,7 +570,13 @@ fn chat_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             (Some(a), _) if !a.is_empty() => (a.clone(), if t.status == TaskStatus::Failed { WARN } else { Color::Reset }),
             (_, TaskStatus::WaitingForApproval) => ("waiting for your approval (a to approve, d to deny)".to_string(), WARN),
             (_, s) if s.is_terminal() => (t.error.clone().unwrap_or_else(|| format!("{s:?}")), BAD),
-            _ => (format!("{} working…", spinner(app)), DIM),
+            _ => {
+                let phase = t.status.to_string().replace('_', " ");
+                // a silent model is the usual reason a reply takes long: say where to look
+                let slow = t.created_at.map(|c| (chrono::Utc::now() - c).num_seconds() > 20).unwrap_or(false);
+                let hint = if slow { " — slow; the model may still be loading (see the header dots, or ./dfae status)" } else { "" };
+                (format!("{} {phase}…{hint}", spinner(app)), DIM)
+            }
         };
         for (i, l) in wrap_text(&text, width.saturating_sub(6)).into_iter().enumerate() {
             let lead = if i == 0 { Span::styled("   ◆ ", Style::new().fg(OK).bold()) } else { Span::raw("     ") };
@@ -1413,7 +1419,7 @@ mod tests {
         let text: Vec<String> = chat_lines(&app, 60).iter().map(|l| l.spans.iter().map(|s| s.content.to_string()).collect::<String>()).collect();
         let joined = text.join("\n");
         assert!(joined.find("hi").unwrap() < joined.find("read it").unwrap(), "{joined}");
-        assert!(joined.contains("Hi! I'm DFAE.") && joined.contains("working…"), "{joined}");
+        assert!(joined.contains("Hi! I'm DFAE.") && joined.contains("running…"), "{joined}");
         assert!(!joined.contains("secret") && !joined.contains("resolved"), "the user's own words are shown, not the rewritten request: {joined}");
     }
 

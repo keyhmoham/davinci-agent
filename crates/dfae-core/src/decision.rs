@@ -27,6 +27,21 @@ pub enum DecisionKind {
 }
 
 impl DecisionKind {
+    pub const ALL: [DecisionKind; 8] = [
+        Self::RouteTask,
+        Self::SelectMode,
+        Self::SelectTools,
+        Self::AssessPlan,
+        Self::AssessRecovery,
+        Self::AssessCompletion,
+        Self::AssessEscalation,
+        Self::AssessDecomposition,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == s.trim())
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RouteTask => "route_task",

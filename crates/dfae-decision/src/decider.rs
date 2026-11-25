@@ -53,13 +53,33 @@ pub struct Decider {
     pub calibrator: Arc<Calibrator>,
     thresholds: Thresholds,
     cache: Mutex<HashMap<String, DecisionResponse>>,
+    /// The decisions the primary provider makes; the others use the local rules.
+    model_kinds: std::collections::HashSet<DecisionKind>,
 }
 
 const CACHE_CAP: usize = 512;
+/// A decision model is asked about at most this many tools (the ones the local scorer ranks highest);
+/// the rest keep their local score. Each asked tool is one more model call.
+const MODEL_TOOL_CANDIDATES: usize = 4;
 
 impl Decider {
     pub fn new(primary: Option<Arc<dyn DecisionProvider>>, calibrator: Arc<Calibrator>, thresholds: Thresholds) -> Self {
-        Self { primary, local: LocalDecider::new(thresholds.clone()), calibrator, thresholds, cache: Mutex::new(HashMap::new()) }
+        Self {
+            primary,
+            local: LocalDecider::new(thresholds.clone()),
+            calibrator,
+            thresholds,
+            cache: Mutex::new(HashMap::new()),
+            model_kinds: DecisionKind::ALL.into_iter().collect(),
+        }
+    }
+
+    /// Restrict the primary provider to these decisions (`["all"]` or an empty list = every kind).
+    pub fn with_model_kinds(mut self, kinds: &[String]) -> Self {
+        if !kinds.is_empty() && !kinds.iter().any(|k| k == "all") {
+            self.model_kinds = kinds.iter().filter_map(|k| DecisionKind::parse(k)).collect();
+        }
+        self
     }
 
     pub fn provider_name(&self) -> &str {
@@ -78,7 +98,7 @@ impl Decider {
         let (resp, note, from_cache) = if let Some(c) = cached {
             (c, Some("cache".to_string()), true)
         } else {
-            let (resp, note) = match &self.primary {
+            let (resp, note) = match self.primary.as_ref().filter(|_| self.model_kinds.contains(&req.kind)) {
                 Some(p) => match p.decide(req.clone()).await {
                     Ok(r) => (r, None),
                     Err(e) => {
@@ -152,7 +172,26 @@ impl Decider {
             let (_, record, entry) = self.decide(tools_request(state)).await;
             return Decided { value: vec![], record, entry };
         }
-        let (r, record, entry) = self.decide(tools_request(state)).await;
+        let mut req = tools_request(state);
+        // rank by the local scorer; a decision model is asked only about the best few
+        let local_all = self.local.answer(&req);
+        if self.primary.is_some() && self.model_kinds.contains(&DecisionKind::SelectTools) && req.questions.len() > MODEL_TOOL_CANDIDATES {
+            let mut ranked: Vec<(String, f64)> = local_all
+                .iter()
+                .filter_map(|(k, a)| match a {
+                    Answer::Noul { noul } => Some((k.clone(), *noul)),
+                    _ => None,
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.cmp(&b.0)));
+            let keep: std::collections::HashSet<String> = ranked.into_iter().take(MODEL_TOOL_CANDIDATES).map(|(k, _)| k).collect();
+            req.questions.retain(|k, _| keep.contains(k));
+        }
+        let (mut r, record, entry) = self.decide(req).await;
+        // tools the model was not asked about keep their local relevance
+        for (k, a) in local_all {
+            r.answers.entry(k).or_insert(a);
+        }
         let mut scored: Vec<(String, f32)> = r
             .answers
             .iter()

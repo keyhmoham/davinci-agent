@@ -36,8 +36,12 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     if let Ok(Some(v)) = store.kv_get("calibration").await {
         calibrator.load(&v);
     }
-    let primary: Option<Arc<dyn DecisionProvider>> = OpenModelProvider::new(&config.decision).map(|p| Arc::new(p) as Arc<dyn DecisionProvider>);
-    let decider = Arc::new(Decider::new(primary, calibrator, config.thresholds.clone()));
+    let open = OpenModelProvider::new(&config.decision).map(Arc::new);
+    if let Some(p) = &open {
+        p.start_warmup(); // load the model in the background; decisions use the local rules until it answers
+    }
+    let primary: Option<Arc<dyn DecisionProvider>> = open.map(|p| p as Arc<dyn DecisionProvider>);
+    let decider = Arc::new(Decider::new(primary, calibrator, config.thresholds.clone()).with_model_kinds(&config.decision.kinds));
     // models
     let models = ModelGateway::new(build_model(&config.slm), build_model(&config.strong));
 

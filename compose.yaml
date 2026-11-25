@@ -43,7 +43,7 @@ services:
       # the SLM and the decision model stay loaded; decisions ask a few questions at once
       OLLAMA_KEEP_ALIVE: 24h
       OLLAMA_MAX_LOADED_MODELS: "2"
-      OLLAMA_NUM_PARALLEL: "4"
+      OLLAMA_NUM_PARALLEL: "2"
     volumes:
       - ollama:/root/.ollama
     healthcheck:
@@ -62,7 +62,7 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
       SLM_MODEL: ${SLM_MODEL:-qwen2.5:3b}
-      DECISION_MODEL: ${DECISION_MODEL:-qwen3:4b-instruct-2507-q8_0}
+      DECISION_MODEL: ${DECISION_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
       DECISION_PROVIDER: ${DECISION_PROVIDER:-}
     entrypoint:
       - /bin/sh
@@ -87,7 +87,7 @@ services:
       # decision model: an open-weight model in the ollama service, answering typed questions through
       # token log-probabilities. DECISION_PROVIDER=local => built-in decision rules only.
       DECISION_BASE_URL: ${DECISION_BASE_URL:-http://ollama:11434/v1}
-      DECISION_MODEL: ${DECISION_MODEL:-qwen3:4b-instruct-2507-q8_0}
+      DECISION_MODEL: ${DECISION_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
       DECISION_PROVIDER: ${DECISION_PROVIDER:-}
       DECISION_API_KEY: ${DECISION_API_KEY:-}
       # small language model
