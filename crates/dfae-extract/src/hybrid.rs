@@ -45,12 +45,15 @@ impl EntityExtractor for HybridExtractor {
         let (semantic, backend) = match &self.semantic {
             Some(g) => match g.extract(request.clone()).await {
                 Ok(r) => {
+                    if self.warned.swap(false, Ordering::Relaxed) {
+                        tracing::info!("semantic extractor is available again");
+                    }
                     let b = format!("{}+rules", r.backend);
                     (r.entities, b)
                 }
                 Err(e) => {
                     if !self.warned.swap(true, Ordering::Relaxed) {
-                        tracing::warn!(error = %e, "semantic extractor unavailable; using rules only");
+                        tracing::warn!(error = %e, "semantic extractor unavailable (a GLiNER service that has just started is still loading its model: `docker compose logs gliner`); using rules only");
                     }
                     (vec![], "rules(fallback)".to_string())
                 }

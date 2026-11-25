@@ -343,6 +343,17 @@ impl Engine {
         }
     }
 
+    /// `(tier, reason)` for every configured language model that cannot be used right now.
+    pub async fn model_problems(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (name, tier) in [("slm", Tier::Slm), ("external model", Tier::Strong)] {
+            if let Some(why) = self.inner.models.diagnose(tier).await {
+                out.push((name.to_string(), why));
+            }
+        }
+        out
+    }
+
     pub async fn health(&self) -> HealthReport {
         let i = &self.inner;
         let mut comps = Vec::new();
@@ -361,9 +372,14 @@ impl Engine {
         for (name, tier) in [("slm", Tier::Slm), ("strong", Tier::Strong)] {
             let (status, detail) = match i.models.health(tier).await {
                 Some(true) => ("ok", i.models.model_name(tier).unwrap_or_default()),
-                Some(false) => {
-                    ("down", format!("{} (unreachable, or the model is not available on the server)", i.models.model_name(tier).unwrap_or_default()))
-                }
+                Some(false) => (
+                    "down",
+                    format!(
+                        "{}: {}",
+                        i.models.model_name(tier).unwrap_or_default(),
+                        i.models.diagnose(tier).await.unwrap_or_else(|| "unreachable, or the model is not available on the server".into())
+                    ),
+                ),
                 None => ("off", "not configured".into()),
             };
             comps.push(ComponentHealth { name: name.into(), status: status.into(), detail });

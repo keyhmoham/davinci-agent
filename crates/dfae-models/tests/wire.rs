@@ -174,3 +174,25 @@ async fn a_schema_is_sent_and_a_server_that_rejects_it_gets_plain_json_instead()
     assert_eq!(bodies.lock().unwrap().len(), 3);
     assert_eq!(bodies.lock().unwrap()[2]["response_format"], json!({"type": "json_object"}));
 }
+
+#[tokio::test]
+async fn diagnosis_says_what_is_wrong_not_just_that_something_is() {
+    // a refused key
+    let app = Router::new().route("/v1/models", get(|| async { (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad key"}))) }));
+    let base = serve(app).await;
+    let m = OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", Some("nope".into()), Duration::from_secs(5));
+    let why = m.diagnose().await.unwrap_err();
+    assert!(why.contains("401") && why.contains("key was refused"), "{why}");
+    // a server that lists other models
+    let app = Router::new().route("/v1/models", get(|| async { Json(json!({"data": [{"id": "other-model"}]})) }));
+    let base = serve(app).await;
+    let m = OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", None, Duration::from_secs(5));
+    let why = m.diagnose().await.unwrap_err();
+    assert!(why.contains("gpt-x") && why.contains("other-model"), "{why}");
+    // a gateway with no listing is not declared down
+    let base = serve(Router::new()).await;
+    assert!(OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", None, Duration::from_secs(5)).diagnose().await.is_ok());
+    // nothing listening
+    let why = OpenAiCompat::new("http://127.0.0.1:9/v1", "m", None, Duration::from_secs(2)).diagnose().await.unwrap_err();
+    assert!(why.contains("cannot reach"), "{why}");
+}

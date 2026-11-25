@@ -69,6 +69,11 @@ pub trait LanguageModel: Send + Sync {
     async fn health(&self) -> bool {
         true
     }
+    /// Why is this model not usable right now? `Ok` when it is. Providers say what is wrong ("HTTP 401", "model X is not
+    /// listed by the server") instead of just "down".
+    async fn diagnose(&self) -> Result<(), String> {
+        if self.health().await { Ok(()) } else { Err("not reachable".into()) }
+    }
     /// Does this provider bill a long repeated prompt prefix at a fraction (prompt caching)?
     fn caches_prompts(&self) -> bool {
         false

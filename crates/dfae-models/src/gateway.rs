@@ -46,6 +46,15 @@ impl ModelGateway {
         }
     }
 
+    /// Why a tier is not usable (`None` when it is, or is not configured).
+    pub async fn diagnose(&self, tier: Tier) -> Option<String> {
+        let m = match tier {
+            Tier::Slm => self.slm.as_ref(),
+            Tier::Strong => self.strong.as_ref(),
+        }?;
+        m.diagnose().await.err()
+    }
+
     pub fn model_name(&self, tier: Tier) -> Option<String> {
         match tier {
             Tier::Slm => self.slm.as_ref().map(|m| m.name().to_string()),
@@ -75,7 +84,14 @@ impl ModelGateway {
         let est_prompt = tokens::estimate_tokens(&req.system) as u64 + req.messages.iter().map(|m| tokens::estimate_tokens(&m.content) as u64).sum::<u64>();
         let purpose = req.purpose.clone();
         let started = Instant::now();
-        let resp = model.generate(req).await?;
+        let resp = match model.generate(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                // the task's events say a call failed; the server log says why
+                tracing::warn!(tier = ?tier, model = model.name(), purpose = %purpose, error = %e, "model call failed");
+                return Err(e);
+            }
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         let (p, c, cached) = if resp.usage.prompt_tokens + resp.usage.completion_tokens > 0 {
             (resp.usage.prompt_tokens, resp.usage.completion_tokens, resp.usage.cached_tokens.min(resp.usage.prompt_tokens))
