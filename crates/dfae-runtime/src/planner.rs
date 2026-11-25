@@ -184,8 +184,10 @@ pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str,
 }
 
 static LINE_STEP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<id>[A-Za-z][A-Za-z0-9_]*)\s+(?P<tool>[A-Za-z_][A-Za-z0-9_]*|-)(?P<meta>(?:\s+(?:after=[A-Za-z0-9_,]*|strong))*)\s*:\s*(?P<do>.*)$")
-        .unwrap()
+    Regex::new(
+        r"^(?P<id>[A-Za-z][A-Za-z0-9_]*)[.)]?\s+\[?(?P<tool>[A-Za-z_][A-Za-z0-9_]*|-)\]?(?P<meta>(?:\s+(?:after=[A-Za-z0-9_,]*|strong))*)\s*:\s*(?P<do>.*)$",
+    )
+    .unwrap()
 });
 
 /// Parse the compact line format of a brief plan into the same JSON shape `parse_brief_plan` reads:
@@ -210,7 +212,8 @@ pub fn parse_line_plan(text: &str) -> Result<Value, String> {
     let mut in_report = false;
     for raw in text.lines() {
         let line = raw.trim_end();
-        let t = line.trim();
+        // a model may bullet its lines
+        let t = line.trim().trim_start_matches(['-', '*', '•']).trim_start();
         if t.is_empty() || t.starts_with("```") {
             continue;
         }
@@ -225,7 +228,7 @@ pub fn parse_line_plan(text: &str) -> Result<Value, String> {
             in_report = true;
             continue;
         }
-        let indented = line.starts_with(char::is_whitespace);
+        let indented = line.starts_with(char::is_whitespace) && !LINE_STEP.is_match(t);
         if indented || lower.starts_with("expect:") {
             let Some(last) = steps.last_mut() else { continue };
             if let Some(rest) = lower.strip_prefix("expect:") {
@@ -798,6 +801,16 @@ mod line_format_tests {
         let v = parse_line_plan(r#"{"steps":[{"id":"s1","tool":"fs_read","do":"read a.txt"}],"report":"{{s1}}"}"#).unwrap();
         assert!(v["report"].is_string());
         assert!(parse_line_plan("Sure, here is my plan: first read the file").is_err());
+    }
+
+    #[test]
+    fn small_variations_in_how_a_model_writes_the_lines_are_tolerated() {
+        let v = parse_line_plan("- s1. [fs_read]: read a.txt\n* s2) - after=s1: count the words\n   expect: a number").unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].tool.as_deref(), Some("fs_read"));
+        assert_eq!(steps[1].depends_on, vec!["s1"]);
+        assert_eq!(steps[1].expect.as_deref(), Some("a number"));
     }
 
     #[test]

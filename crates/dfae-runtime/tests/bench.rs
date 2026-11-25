@@ -375,3 +375,17 @@ async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
     assert!(per_task[1..].iter().all(|t| *t == 0), "the rest are replayed from the skill: {per_task:?}");
     assert_eq!(strong.calls(), 1);
 }
+
+#[test]
+fn plan_lines_are_a_smaller_output_than_the_same_plan_in_json() {
+    let (mut json_tokens, mut line_tokens) = (0, 0);
+    for sc in scenarios() {
+        json_tokens += tokens::estimate_tokens(&render(&sc, false, false));
+        line_tokens += tokens::estimate_tokens(&render(&sc, true, false));
+    }
+    eprintln!(
+        "\nplan output tokens for the six benchmark plans: json {json_tokens}, lines {line_tokens} ({:.0}% fewer)",
+        100.0 * (json_tokens - line_tokens) as f64 / json_tokens as f64
+    );
+    assert!(line_tokens * 10 < json_tokens * 7, "lines {line_tokens} vs json {json_tokens}");
+}
