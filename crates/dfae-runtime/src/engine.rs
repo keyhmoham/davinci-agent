@@ -335,7 +335,9 @@ impl Engine {
         for (name, tier) in [("slm", Tier::Slm), ("strong", Tier::Strong)] {
             let (status, detail) = match i.models.health(tier).await {
                 Some(true) => ("ok", i.models.model_name(tier).unwrap_or_default()),
-                Some(false) => ("down", i.models.model_name(tier).unwrap_or_default()),
+                Some(false) => {
+                    ("down", format!("{} (unreachable, or the model is not available on the server)", i.models.model_name(tier).unwrap_or_default()))
+                }
                 None => ("off", "not configured".into()),
             };
             comps.push(ComponentHealth { name: name.into(), status: status.into(), detail });

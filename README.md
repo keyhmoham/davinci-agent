@@ -13,6 +13,9 @@ docker compose run --rm tui      # the terminal UI
 ```
 
 > First start downloads the GLiNER model (~600 MB) and the SLM (`qwen2.5:3b`, ~2 GB).
+> Until the SLM download finishes, requests fail with `model 'qwen2.5:3b' not found` and `./dfae status` shows `slm: down`.
+> `./dfae` (TUI) and `./dfae ask` wait for it; with plain `docker compose up`, watch `docker compose logs -f ollama-pull`
+> (re-run a failed pull with `docker compose run --rm ollama-pull`). If you use a different model name, set `SLM_MODEL` in `.env`.
 > The engine answers immediately and degrades gracefully while they load (see
 > [What works without what](#what-works-without-what)).
 

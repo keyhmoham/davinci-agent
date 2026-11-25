@@ -44,7 +44,7 @@ async fn openai_compat_request_shape_usage_and_retry() {
     }
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
-        .route("/v1/models", get(|| async { Json(json!({"data": []})) }))
+        .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "qwen-test"}]})) }))
         .with_state((hits.clone(), seen.clone()));
     let base = serve(app).await;
     let m = OpenAiCompat::new(&format!("{base}/v1"), "qwen-test", Some("k123".into()), Duration::from_secs(5));
@@ -115,4 +115,19 @@ mod parking_lot_free {
     use serde_json::Value;
     #[derive(Default)]
     pub struct Cell(pub std::sync::Mutex<Option<(Value, Option<String>)>>);
+}
+
+#[tokio::test]
+async fn a_server_without_the_model_is_unhealthy_and_the_error_says_what_to_do() {
+    let app = Router::new()
+        .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "other:latest"}]})) }))
+        .route("/v1/chat/completions", post(|| async { (StatusCode::NOT_FOUND, Json(json!({"error": {"message": "model 'qwen2.5:3b' not found"}}))) }));
+    let base = serve(app).await;
+    let m = OpenAiCompat::new(&format!("{base}/v1"), "qwen2.5:3b", None, Duration::from_secs(5));
+    assert!(!m.health().await, "reachable but the model is not pulled");
+    let err = m.generate(req(false)).await.unwrap_err().to_string();
+    assert!(err.contains("not found") && err.contains("ollama-pull"), "{err}");
+    // Ollama lists untagged models as `name:latest`
+    let m = OpenAiCompat::new(&format!("{base}/v1"), "other", None, Duration::from_secs(5));
+    assert!(m.health().await);
 }

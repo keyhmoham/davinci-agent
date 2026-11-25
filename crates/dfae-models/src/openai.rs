@@ -58,7 +58,15 @@ impl LanguageModel for OpenAiCompat {
             };
             let status = resp.status();
             if !status.is_success() {
-                last = format!("HTTP {status}: {}", resp.text().await.unwrap_or_default().chars().take(300).collect::<String>());
+                let body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+                last = format!("HTTP {status}: {body}");
+                if status == reqwest::StatusCode::NOT_FOUND && body.contains("not found") {
+                    last.push_str(&format!(
+                        " — the model server does not have '{}'. With the bundled Ollama it may still be downloading or the pull failed: \
+                         `docker compose logs -f ollama-pull` (retry: `docker compose run --rm ollama-pull`)",
+                        self.model
+                    ));
+                }
                 if is_retryable(status) {
                     continue;
                 }
@@ -80,6 +88,18 @@ impl LanguageModel for OpenAiCompat {
         if let Some(k) = &self.key {
             rb = rb.bearer_auth(k);
         }
-        matches!(rb.send().await, Ok(r) if r.status().is_success())
+        let Ok(resp) = rb.send().await else { return false };
+        if !resp.status().is_success() {
+            return false;
+        }
+        // A server that is up but lacks the configured model (Ollama before the pull finishes) is not healthy.
+        match resp.json::<Value>().await.ok().and_then(|v| v["data"].as_array().cloned()) {
+            Some(models) => {
+                let norm = |m: &str| m.strip_suffix(":latest").unwrap_or(m).to_string();
+                let want = norm(&self.model);
+                models.iter().filter_map(|m| m["id"].as_str()).any(|id| norm(id) == want)
+            }
+            None => true, // not a listing we understand: do not guess
+        }
     }
 }
