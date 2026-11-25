@@ -107,7 +107,7 @@ async fn medium_tasks_are_planned_by_the_external_model_and_carried_out_by_the_l
     );
     // acting phase: the SLM writes the reasoning step and fills in the one argument rules cannot (the content)
     r.slm.push("8080");
-    r.slm.push(&json!({"content": "{{s2}}"}).to_string());
+    r.slm.push("8080");
     // the answer is written locally and checked against the evidence; the external model is not asked for it
     r.slm.push("Wrote 8080 to ports.txt.");
     let t = run(&r, GOAL).await;
@@ -472,14 +472,15 @@ async fn an_expectation_about_files_is_checked_by_code_and_a_miss_goes_back_to_t
 async fn a_file_cut_off_by_the_token_limit_is_caught_by_a_parser_and_rewritten_locally() {
     let r = rig(false, |_| {});
     r.strong.push(&json!({"steps": [{"id": "s1", "do": "write data.json with the settings", "tool": "fs_write"}]}).to_string());
-    r.slm.push(&json!({"path": "data.json", "content": "{\"settings\": {\"port\": 80"}).to_string());
+    // the file's content is written as plain text; the first version is cut off (a code fence around it is tolerated)
+    r.slm.push("```json\n{\"settings\": {\"port\": 80\n```");
     // asked again with the parser's complaint, the local model gets it right
-    r.slm.push(&json!({"path": "data.json", "content": "{\"settings\": {\"port\": 80}}"}).to_string());
+    r.slm.push("{\"settings\": {\"port\": 80}}");
     let t = run(&r, "Write the settings into data.json").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(std::fs::read_to_string(r.ws.path().join("data.json")).unwrap(), "{\"settings\": {\"port\": 80}}");
     // the second bind request carried the complaint; the external model was asked for the plan only
-    let binds: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "bind").map(|q| q.messages[0].content.clone()).collect();
+    let binds: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "content").map(|q| q.messages[0].content.clone()).collect();
     assert!(binds.len() >= 2 && binds[1].contains("malformed") && binds[1].contains("invalid JSON"), "{binds:?}");
     assert_eq!(r.strong.calls(), 1, "no re-plan: a parser error is the local model's to fix");
 }

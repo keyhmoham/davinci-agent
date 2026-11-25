@@ -93,6 +93,18 @@ impl ModelGateway {
             }
         };
         let latency_ms = started.elapsed().as_millis() as u64;
+        // A model server with a small context window silently drops the start of a long prompt — the instructions — and
+        // the model then "does not understand" its task. The server's own count of the prompt gives it away.
+        if resp.usage.prompt_tokens >= 1000 && (est_prompt as f64) > resp.usage.prompt_tokens as f64 * 1.6 {
+            tracing::warn!(
+                tier = ?tier,
+                model = model.name(),
+                purpose = %purpose,
+                sent_about = est_prompt,
+                server_read = resp.usage.prompt_tokens,
+                "the model server read far fewer prompt tokens than were sent: its context window is too small and the start of the prompt (the instructions) was dropped; for Ollama set OLLAMA_CONTEXT_LENGTH=16384"
+            );
+        }
         let (p, c, cached) = if resp.usage.prompt_tokens + resp.usage.completion_tokens > 0 {
             (resp.usage.prompt_tokens, resp.usage.completion_tokens, resp.usage.cached_tokens.min(resp.usage.prompt_tokens))
         } else {
