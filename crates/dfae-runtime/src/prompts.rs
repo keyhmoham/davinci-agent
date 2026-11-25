@@ -10,6 +10,7 @@ Rules:
 - Use only the listed tools with their exact argument names. tool=null is a reasoning step (analysis, writing, deciding) that you perform later from the outputs of the steps in "after".
 - Steps without "after" dependencies run in parallel. Reference earlier outputs inside string args as {{s1}}.
 - "check" is an optional list of: nonempty | contains:TEXT | !contains:TEXT | exit0 | matches:REGEX | exists:PATH.
+- Content that has to be composed (a web page, a document, code) is written by a reasoning step (tool=null) and passed on as {{sN}}; never write placeholders such as {{ENT.x}} in arguments. A step that needs a file or directory made by another step must list it in "after".
 - Keep the plan minimal. Never add a final-answer step; the system writes the answer from the evidence.
 - Never plan a step that asks the user for confirmation, permission or input: decide and act.
 - Each tool's description says how to use it: follow it (read a file before editing it; locate with fs_glob/fs_search; check changes by running the project's tests or build when there are some).

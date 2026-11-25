@@ -470,7 +470,18 @@ impl Inner {
         if paid {
             req.max_tokens = req.max_tokens.min(400); // a paid reply is kept short; a self-hosted one is not cut off
         }
-        let text = self.generate_text(ctx, tier, req).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?;
+        let text = match self.generate_text(ctx, tier, req.clone()).await {
+            Ok(t) => t,
+            // the external model cannot be reached: the self-hosted one answers instead of the user getting an error
+            Err(e) if paid && self.models.has(Tier::Slm) && e.contains("model request failed") => {
+                self.emit(ctx, EventKind::Warning { message: format!("the external model is unavailable ({e}); the self-hosted model answers instead") }).await;
+                let mut local = self.gen_request(Tier::Slm, prompts::CHAT_SYSTEM, String::new(), "chat");
+                local.messages = req.messages.clone();
+                local.temperature = 0.6;
+                self.generate_text(ctx, Tier::Slm, local).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?
+            }
+            Err(e) => return Err(StepFailure::new(ErrorKind::Transient, e)),
+        };
         let text = crate::style::compact(&text);
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
@@ -821,26 +832,51 @@ impl Inner {
         let user = prompts::replan_user(&sigs, &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
         let mut req = self.gen_request(tier, if brief { prompts::BRIEF_REPLAN_SYSTEM } else { prompts::REPLAN_SYSTEM }, user, "replan");
         req.json = true;
-        let v = self.gen_json(ctx, tier, req).await?;
-        let new_steps = if brief {
-            planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?
-        } else {
-            planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?
-        };
-        if new_steps.is_empty() {
-            return Ok(false);
+        // Like the first plan, a re-plan gets one repair round: what was wrong with it is told to the model.
+        let mut merged: Option<Vec<Step>> = None;
+        let mut last_problem = String::new();
+        for attempt in 0..2 {
+            let v = self.gen_json(ctx, tier, req.clone()).await?;
+            let parsed = if brief {
+                planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
+            } else {
+                planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
+            };
+            let problems: Vec<String> = match parsed {
+                Err(e) => vec![e],
+                Ok(mut new_steps) => {
+                    if new_steps.is_empty() {
+                        return Ok(false);
+                    }
+                    self.repair_plan_args(ctx, &mut new_steps, goal).await;
+                    let mut all: Vec<Step> = {
+                        let r = ctx.rec.lock().await;
+                        let plan = r.plan.as_ref().ok_or("no plan")?;
+                        plan.steps.iter().filter(|s| kept_ids.contains(&s.id)).cloned().collect()
+                    };
+                    all.extend(new_steps);
+                    self.admit_readonly_tools(ctx, &all).await;
+                    planner::prune_unknown_deps(&mut all);
+                    planner::infer_dependencies(&mut all, &self.tools);
+                    let allowed_now = ctx.allowed.lock().clone();
+                    let remaining = self.remaining_budget(ctx).await;
+                    match planner::validate_plan(&all, &self.tools, &allowed_now, &remaining) {
+                        Ok(()) => {
+                            merged = Some(all);
+                            break;
+                        }
+                        Err(errs) => errs,
+                    }
+                }
+            };
+            last_problem = problems.join("; ");
+            if attempt == 0 {
+                req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
+                req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
+                req.purpose = "replan_repair".into();
+            }
         }
-        let merged: Vec<Step> = {
-            let r = ctx.rec.lock().await;
-            let plan = r.plan.as_ref().ok_or("no plan")?;
-            let mut m: Vec<Step> = plan.steps.iter().filter(|s| kept_ids.contains(&s.id)).cloned().collect();
-            m.extend(new_steps);
-            m
-        };
-        let mut merged = merged;
-        planner::prune_unknown_deps(&mut merged);
-        let remaining = self.remaining_budget(ctx).await;
-        planner::validate_plan(&merged, &self.tools, &allowed, &remaining).map_err(|e| e.join("; "))?;
+        let merged = merged.ok_or(last_problem)?;
         let revised = {
             let mut r = ctx.rec.lock().await;
             let p = r.plan.as_mut().ok_or("no plan")?;

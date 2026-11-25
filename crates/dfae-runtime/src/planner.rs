@@ -30,6 +30,34 @@ pub fn template_refs(v: &Value) -> Vec<String> {
     out
 }
 
+static ANY_BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^{}]*)\}\}").unwrap());
+
+/// `{{…}}` in string values that is not a reference the system can resolve (`{{s1}}`, `{{prev_code}}`): a small model's
+/// invented placeholder such as `{{ENT.location}}`, which would otherwise be written literally into a file.
+pub fn malformed_placeholders(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for c in ANY_BRACES.captures_iter(s) {
+                    let inner = c[1].trim();
+                    let ident = !inner.is_empty()
+                        && inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if !ident {
+                        out.push(c[0].to_string());
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    walk(v, &mut out);
+    out
+}
+
 /// Substitute `{{id}}` templates using `lookup`.
 pub fn substitute(v: &Value, lookup: &dyn Fn(&str) -> Option<String>) -> Value {
     match v {
@@ -83,14 +111,20 @@ pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, regis
     let strip = |id: &str| -> String { if prefix.is_empty() { id.to_string() } else { id.strip_prefix(prefix).unwrap_or(id).to_string() } };
     let raw_ids: Vec<String> =
         arr.iter().enumerate().map(|(i, s)| s.get("id").and_then(|x| x.as_str()).map(&strip).unwrap_or_else(|| format!("s{}", i + 1))).collect();
-    let new_ids: HashSet<&String> = raw_ids.iter().collect();
+    // A re-plan's steps are numbered in order (`r1_1`, `r1_2`…) whatever ids the model wrote, so a model that repeats an
+    // id or mixes `s2` with `r1_s2` can never produce duplicates. References resolve to the first step of that name.
+    let new_ids: Vec<String> = raw_ids.iter().enumerate().map(|(i, raw)| if prefix.is_empty() { raw.clone() } else { format!("{prefix}{}", i + 1) }).collect();
+    let mut by_raw: HashMap<&str, &String> = HashMap::new();
+    for (raw, new) in raw_ids.iter().zip(&new_ids) {
+        by_raw.entry(raw.as_str()).or_insert(new);
+    }
     let rename = |id: &str| -> String {
         let bare = strip(id);
-        if new_ids.contains(&bare) { format!("{prefix}{bare}") } else { id.to_string() }
+        by_raw.get(bare.as_str()).map(|n| (*n).clone()).unwrap_or_else(|| id.to_string())
     };
     let mut steps = Vec::new();
     for (i, s) in arr.iter().enumerate() {
-        let id = format!("{prefix}{}", raw_ids[i]);
+        let id = new_ids[i].clone();
         let tool = s.get("tool").and_then(|t| t.as_str()).map(str::trim).filter(|t| !t.is_empty() && *t != "null" && *t != "none");
         let desc = s.get("do").or_else(|| s.get("description")).or_else(|| s.get("action")).and_then(|d| d.as_str()).unwrap_or("").to_string();
         let args = s.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -147,6 +181,112 @@ pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str,
         s.strong = raw.get("strong").and_then(|b| b.as_bool()).unwrap_or(false);
     }
     Ok(steps)
+}
+
+static PATHLIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\w.\-]+(?:/[\w.\-]+)+/?|[\w\-]+\.[A-Za-z0-9]{1,6}\b").unwrap());
+
+fn norm_path(p: &str) -> String {
+    p.trim().trim_start_matches("./").trim_end_matches('/').to_string()
+}
+
+fn path_tokens(text: &str) -> Vec<String> {
+    PATHLIKE.find_iter(text).map(|m| norm_path(m.as_str())).filter(|p| !p.is_empty() && !p.starts_with("http")).collect()
+}
+
+fn string_values(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| string_values(x, out)),
+        Value::Object(m) => m.values().for_each(|x| string_values(x, out)),
+        _ => {}
+    }
+}
+
+fn overlaps(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// What a step makes (paths it writes) and what it touches (paths it names anywhere: arguments, working directory,
+/// command line, or — for a step not yet implemented — its sentence).
+fn paths_of(step: &Step) -> (Vec<String>, Vec<String>) {
+    let mut texts = vec![step.description.clone()];
+    string_values(&step.args, &mut texts);
+    let mut uses: Vec<String> = texts.iter().flat_map(|t| path_tokens(t)).collect();
+    // arguments that are paths by name count even when they look like a bare word ("public")
+    for k in ["path", "cwd", "dir", "directory", "from", "to"] {
+        if let Some(p) = step.args.get(k).and_then(|v| v.as_str()).map(norm_path).filter(|p| !p.is_empty() && !p.contains("{{")) {
+            uses.push(p);
+        }
+    }
+    let arg = |k: &str| step.args.get(k).and_then(|v| v.as_str()).map(norm_path).filter(|p| !p.is_empty());
+    let writes: Vec<String> = match step.tool.as_deref() {
+        Some("fs_write" | "fs_edit" | "fs_mkdir" | "fs_delete") => arg("path").into_iter().collect(),
+        Some("fs_move") => arg("from").into_iter().chain(arg("to")).collect(),
+        Some("fs_copy") => arg("to").into_iter().collect(),
+        _ => vec![],
+    };
+    // a step that has not been given arguments yet makes whatever its sentence names
+    let writes =
+        if writes.is_empty() && step.brief && matches!(step.tool.as_deref(), Some("fs_write" | "fs_edit" | "fs_mkdir" | "fs_delete" | "fs_move" | "fs_copy")) {
+            path_tokens(&step.description)
+        } else {
+            writes
+        };
+    (writes, uses)
+}
+
+/// A planner (above all a small one) forgets to say that serving a directory must wait until the directory exists.
+/// Code knows which steps change things and which paths each step names, so it adds the missing "after"s:
+/// * steps that change things run in plan order, one after another (a shell command can change anything);
+/// * a step that names a path an earlier step writes waits for that step.
+///
+/// Dependencies only point backwards, and never close a cycle. Returns what was added, for the log.
+pub fn infer_dependencies(steps: &mut [Step], registry: &ToolRegistry) -> Vec<String> {
+    let effect: Vec<bool> =
+        steps.iter().map(|s| s.kind == StepKind::Tool && s.tool.as_deref().and_then(|t| registry.meta(t)).map(|m| m.side_effects).unwrap_or(false)).collect();
+    let paths: Vec<(Vec<String>, Vec<String>)> = steps.iter().map(paths_of).collect();
+    let reaches = |steps: &[Step], from: usize, target: &str| -> bool {
+        // does `from` (transitively) depend on the step named `target`?
+        let mut stack = vec![steps[from].id.clone()];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id == target {
+                return true;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(s) = steps.iter().find(|s| s.id == id) {
+                stack.extend(s.depends_on.iter().cloned());
+            }
+        }
+        false
+    };
+    let mut notes = Vec::new();
+    let mut prev_effect: Option<usize> = None;
+    for i in 0..steps.len() {
+        let mut wanted: Vec<(usize, &str)> = Vec::new();
+        if effect[i] {
+            if let Some(p) = prev_effect {
+                wanted.push((p, "steps that change things run in order"));
+            }
+            prev_effect = Some(i);
+        }
+        for j in 0..i {
+            if effect[j] && paths[j].0.iter().any(|w| paths[i].1.iter().any(|u| overlaps(w, u))) {
+                wanted.push((j, "it uses what that step writes"));
+            }
+        }
+        for (j, why) in wanted {
+            let dep = steps[j].id.clone();
+            if steps[i].depends_on.contains(&dep) || reaches(steps, j, &steps[i].id) || reaches(steps, i, &dep) {
+                continue;
+            }
+            notes.push(format!("{} now waits for {dep} ({why})", steps[i].id));
+            steps[i].depends_on.push(dep);
+        }
+    }
+    notes
 }
 
 /// Drop dependencies on steps that do not exist (a model's slip, e.g. `after: ["r1_2"]` with no such step).
@@ -229,6 +369,14 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
                 Some(m) => {
                     if !allowed.iter().any(|a| a == name) {
                         errs.push(format!("step {}: tool '{name}' is not available for this task; use only: {}", s.id, allowed.join(", ")));
+                    }
+                    let bad = malformed_placeholders(&s.args);
+                    if !bad.is_empty() {
+                        errs.push(format!(
+                            "step {} ({name}): {} is not a reference the system can fill in; write the real text, or use {{{{<step id>}}}} for an earlier step's result",
+                            s.id,
+                            bad.join(", ")
+                        ));
                     }
                     // arguments that contain templates are validated at run time; a brief step has none yet
                     let has_template = !template_refs(&s.args).is_empty();
@@ -335,8 +483,80 @@ mod tests {
             {"id": "s2", "tool": null, "after": ["s1", "s9"]}
         ]});
         let steps = parse_plan(&v, "g", PlanSource::Replan, "r1_", &r).unwrap();
-        assert_eq!(steps[0].id, "r1_s1");
-        assert_eq!(steps[1].depends_on, vec!["r1_s1", "s9"]);
+        assert_eq!(steps[0].id, "r1_1");
+        assert_eq!(steps[1].depends_on, vec!["r1_1", "s9"]);
+    }
+
+    #[test]
+    fn a_step_that_uses_what_another_writes_waits_for_it() {
+        // the container's shell: a full bash, which can change anything
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::from_toml("[shell]\nmode = \"sandbox\"\n").unwrap(), std::env::temp_dir()));
+        let mut r = ToolRegistry::new();
+        register_native(&mut r, policy, Arc::new(InMemoryStore::new()));
+        // the screenshot case: write the page, then serve its directory — the model forgot the "after"
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_write", "args": {"path": "public/earth.html", "content": "<html></html>"}},
+            {"id": "s2", "tool": "shell", "args": {"command": "python3 -m http.server 8000", "cwd": "public"}},
+            {"id": "s3", "tool": "fs_read", "args": {"path": "other.txt"}},
+            {"id": "s4", "tool": "fs_read", "args": {"path": "./public/earth.html"}}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Slm, "", &r).unwrap();
+        let notes = infer_dependencies(&mut steps, &r);
+        let deps = |id: &str| steps.iter().find(|s| s.id == id).unwrap().depends_on.clone();
+        assert_eq!(deps("s2"), vec!["s1"], "{notes:?}");
+        assert!(deps("s3").is_empty(), "an unrelated read stays parallel");
+        assert_eq!(deps("s4"), vec!["s1"], "a read of the written file waits for the write");
+        assert!(notes.iter().any(|n| n.starts_with("s2 now waits for s1")));
+        // idempotent, and never a cycle
+        assert!(infer_dependencies(&mut steps, &r).is_empty());
+        validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+        // changes happen one after another in plan order
+        let mut two = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}}, {"id": "b", "tool": "fs_write", "args": {"path": "y.txt", "content": "2"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        infer_dependencies(&mut two, &r);
+        assert_eq!(two[1].depends_on, vec!["a"]);
+        // an intent that has no arguments yet is judged by its sentence
+        let mut brief = parse_brief_plan(&json!({"steps": [{"id": "s1", "do": "write the page to public/index.html", "tool": "fs_write"}, {"id": "s2", "do": "serve the public directory", "tool": "shell"}]}), "g", PlanSource::Strong, "", &r).unwrap();
+        infer_dependencies(&mut brief, &r);
+        assert_eq!(brief[1].depends_on, vec!["s1"]);
+        // a model's own dependency that would make a cycle is left alone
+        let mut cyc = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}, "after": ["b"]}, {"id": "b", "tool": "fs_write", "args": {"path": "x.txt", "content": "2"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        infer_dependencies(&mut cyc, &r);
+        assert!(find_cycle(&cyc).is_none());
+    }
+
+    #[test]
+    fn invented_placeholders_are_rejected_not_written_into_files() {
+        let r = registry();
+        let steps = parse_plan(
+            &json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a.html", "content": "<p>{{ENT.location}} and {{ENT.person}}</p>"}}]}),
+            "g",
+            PlanSource::Slm,
+            "",
+            &r,
+        )
+        .unwrap();
+        let errs = validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("{{ENT.location}}") && e.contains("real text")), "{errs:?}");
+        // real references are fine
+        assert!(malformed_placeholders(&json!({"a": "{{s1}} and {{ prev_code }}", "b": ["no braces"]})).is_empty());
+        assert_eq!(malformed_placeholders(&json!({"a": "{{}}"})), vec!["{{}}"]);
+    }
+
+    #[test]
+    fn a_replan_with_repeated_or_mixed_ids_never_has_duplicates() {
+        let r = registry();
+        // the screenshot case: the model wrote both `r1_s2` and `s2`, twice over
+        let v = json!({"steps": [
+            {"id": "r1_s1", "tool": "fs_write", "args": {"path": "a.html", "content": "x"}},
+            {"id": "r1_s2", "tool": "fs_list", "args": {"path": "."}, "after": ["r1_s1"]},
+            {"id": "s2", "tool": null, "do": "report", "after": ["r1_s2"]},
+            {"id": "r1_s2", "tool": null, "do": "again", "after": ["s2"]}
+        ]});
+        let steps = parse_plan(&v, "g", PlanSource::Replan, "r1_", &r).unwrap();
+        let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["r1_1", "r1_2", "r1_3", "r1_4"]);
+        validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+        assert_eq!(steps[2].depends_on, vec!["r1_2"]);
     }
 
     #[test]

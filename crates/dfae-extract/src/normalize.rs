@@ -16,7 +16,11 @@ pub fn normalize_entities(mut es: Vec<Entity>) -> Vec<Entity> {
         e.text =
             e.text.trim().trim_start_matches(['"', '\'', '`', '(', '[']).trim_end_matches([',', ';', ':', '!', '?', '"', '\'', '`', ')', ']', '.']).to_string();
     }
+    // a zero-shot model sometimes labels a pronoun or a single letter ("i" → person); that is noise, not an entity
+    const NOISE: &[&str] =
+        &["i", "me", "my", "mine", "you", "your", "he", "she", "it", "we", "us", "they", "them", "this", "that", "these", "those", "here", "there"];
     es.retain(|e| !e.text.is_empty() && !e.label.is_empty());
+    es.retain(|e| e.label == "quoted" || (e.text.chars().count() >= 2 && !NOISE.contains(&e.text.to_lowercase().as_str())));
     let mut out: Vec<Entity> = Vec::new();
     for e in es {
         if let Some(existing) = out.iter_mut().find(|x| x.label == e.label && x.text.eq_ignore_ascii_case(&e.text)) {
@@ -72,6 +76,19 @@ mod tests {
 
     fn e(label: &str, text: &str, s: usize, t: usize, score: f32) -> Entity {
         Entity { label: label.into(), text: text.into(), start: Some(s), end: Some(t), score, source: "t".into() }
+    }
+
+    #[test]
+    fn pronouns_and_single_letters_are_not_entities() {
+        let m = normalize_entities(vec![
+            e("person", "i", 0, 1, 0.9),
+            e("person", "Keyhan", 5, 11, 0.9),
+            e("location", "it", 12, 14, 0.8),
+            e("file path", "a", 0, 1, 0.9),
+            e("quoted", "I", 0, 1, 0.9),
+        ]);
+        let texts: Vec<&str> = m.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, ["Keyhan", "I"], "a quoted literal is whatever the user wrote");
     }
 
     #[test]

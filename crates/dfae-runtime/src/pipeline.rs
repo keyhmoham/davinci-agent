@@ -657,6 +657,17 @@ impl Inner {
                 }
                 Err(e) => {
                     last_err = e;
+                    // the external model cannot be reached (down, rate-limited): the self-hosted one plans instead
+                    if tier == Tier::Strong && self.models.has(Tier::Slm) && last_err.contains("model request failed") {
+                        self.emit(
+                            ctx,
+                            EventKind::Warning { message: format!("the external model is unavailable ({last_err}); the self-hosted model plans instead") },
+                        )
+                        .await;
+                        tier = Tier::Slm;
+                        used_mode = ExecMode::Assisted;
+                        continue;
+                    }
                     // one escalation to the stronger model, if there is one
                     if tier == Tier::Slm && self.models.has(Tier::Strong) {
                         self.emit(ctx, EventKind::Warning { message: format!("SLM plan failed ({last_err}); escalating the plan to the stronger model") })
@@ -710,7 +721,14 @@ impl Inner {
     async fn finish_plan(&self, ctx: &Arc<TaskCtx>, mut steps: Vec<Step>, goal: &str, expect_effect: bool) -> Result<Vec<Step>, Vec<String>> {
         self.repair_plan_args(ctx, &mut steps, goal).await;
         self.admit_readonly_tools(ctx, &steps).await;
-        let dropped = planner::prune_unknown_deps(&mut steps);
+        let mut dropped = planner::prune_unknown_deps(&mut steps);
+        // what the planner forgot to order, code knows: a step that uses a file waits for the step that writes it
+        let ordered = planner::infer_dependencies(&mut steps, &self.tools);
+        if !ordered.is_empty() {
+            self.emit(ctx, EventKind::Repaired { step_id: "plan".into(), note: format!("ordered steps the planner left parallel: {}", ordered.join("; ")) })
+                .await;
+        }
+        dropped.dedup();
         if !dropped.is_empty() {
             self.emit(
                 ctx,
@@ -734,7 +752,7 @@ impl Inner {
 
     /// A model that names a real, harmless tool the selector did not offer (it is read-only, needs no
     /// approval, and is inside this agent's scope) gets it, instead of a failed task and a repair call.
-    async fn admit_readonly_tools(&self, ctx: &Arc<TaskCtx>, steps: &[Step]) {
+    pub(crate) async fn admit_readonly_tools(&self, ctx: &Arc<TaskCtx>, steps: &[Step]) {
         for s in steps.iter().filter(|s| s.kind == StepKind::Tool) {
             let Some(name) = s.tool.as_deref() else { continue };
             let Some(m) = self.tools.meta(name) else { continue };

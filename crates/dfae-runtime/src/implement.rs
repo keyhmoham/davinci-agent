@@ -196,6 +196,13 @@ impl Inner {
         }
         let valid = |a: &Map<String, Value>| -> Result<(), String> {
             meta.validate_args(&Value::Object(a.clone()))?;
+            let bad = planner::malformed_placeholders(&Value::Object(a.clone()));
+            if !bad.is_empty() {
+                return Err(format!(
+                    "{} is not a value: write the real text, or {{{{<step id>}}}} / {{{{prev_code}}}} to use an earlier result",
+                    bad.join(", ")
+                ));
+            }
             // a `{{id}}` template may only name a step this one depends on
             for r in planner::template_refs(&Value::Object(a.clone())) {
                 if !step.depends_on.contains(&r) && !crate::session::ARTIFACT_NAMES.contains(&r.as_str()) {

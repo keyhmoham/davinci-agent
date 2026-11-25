@@ -184,6 +184,12 @@ async fn the_sandbox_shell_is_a_real_shell_with_exit_codes_timeouts_and_a_cwd() 
     e.run("shell", json!({"command": "echo made > made.txt"})).await.unwrap();
     assert_eq!(e.read("made.txt").trim(), "made");
     assert_eq!(e.run("shell", json!({"command": "ls", "cwd": "/"})).await.unwrap_err().kind, ErrorKind::Policy);
+    // a directory that does not exist (yet) is named as the problem, not reported as a failure to spawn the command
+    let missing = e.run("shell", json!({"command": "python3 -m http.server 8000", "cwd": "public"})).await.unwrap_err();
+    assert_eq!(missing.kind, ErrorKind::NotFound);
+    assert!(missing.message.contains("'public' does not exist") && missing.message.contains("after that step"), "{}", missing.message);
+    let bg = e.run("shell", json!({"command": "true", "cwd": "public", "background": true})).await.unwrap_err();
+    assert!(bg.message.contains("does not exist"), "{}", bg.message);
     assert_eq!(e.run("shell", json!({"command": "  "})).await.unwrap_err().kind, ErrorKind::Policy);
     let m = e.reg.meta("shell").unwrap();
     assert!(m.description.contains("background=true") && m.params.iter().any(|p| p.name == "timeout_secs"));

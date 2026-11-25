@@ -683,7 +683,19 @@ pub(crate) fn sandboxed(policy: &PolicyEngine) -> bool {
 
 pub(crate) fn resolve_cwd(policy: &PolicyEngine, input: &Value) -> Result<PathBuf, ToolError> {
     match input.get("cwd").and_then(|v| v.as_str()).filter(|c| !c.is_empty()) {
-        Some(c) => policy.guard().read_path(c),
+        Some(c) => {
+            let p = policy.guard().read_path(c)?;
+            // otherwise the OS answers "No such file or directory" about the command, which sends everyone looking for the wrong thing
+            if !p.is_dir() {
+                return Err(ToolError::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "the working directory '{c}' does not exist: create it first (fs_mkdir or the step that writes into it), and run this command after that step"
+                    ),
+                ));
+            }
+            Ok(p)
+        }
         None => Ok(policy.workspace().to_path_buf()),
     }
 }

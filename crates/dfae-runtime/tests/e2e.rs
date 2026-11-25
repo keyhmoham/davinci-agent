@@ -239,7 +239,7 @@ async fn failed_step_triggers_a_replan() {
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert_eq!(t.usage.replans, 1);
     assert_eq!(t.plan.as_ref().unwrap().revision, 1);
-    assert!(t.plan.as_ref().unwrap().steps.iter().any(|s| s.id == "r1_s1"));
+    assert!(t.plan.as_ref().unwrap().steps.iter().any(|s| s.id == "r1_1"), "re-plan steps are numbered in order");
     assert!(t.final_answer.unwrap().contains("present.txt"));
     assert!(r.engine.backlog(&t.task_id).iter().any(|e| matches!(e.kind, EventKind::PlanRevised { .. })));
 }
