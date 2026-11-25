@@ -164,6 +164,7 @@ impl Decider {
         routing.conditional = yes("conditional_change");
         routing.smalltalk = smalltalk;
         routing.role = role;
+        routing.feedback = pick("feedback").filter(|c| c != "none");
         Decided { value: routing, record, entry }
     }
 

@@ -104,6 +104,8 @@ pub(crate) struct Inner {
     /// Consecutive planner calls that sent the cacheable prefix and got no cache hit (see `prefix_enabled`).
     pub prefix_misses: std::sync::atomic::AtomicU32,
     pub prefix_policy: Mutex<crate::economy::prefix::PrefixPolicy>,
+    /// Shadow evaluation of the decision model: requests compared / questions agreed on / questions compared.
+    pub shadow: [std::sync::atomic::AtomicU64; 3],
 }
 
 /// The agent engine. Cheap to clone.
@@ -141,6 +143,14 @@ pub struct StatsReport {
     pub totals: LedgerSummary,
     pub memory: MemoryStats,
     pub decision_provider: String,
+    /// Shadow evaluation (off unless `DFAE_SHADOW_EVAL` > 0): requests the external model also decided, and how often
+    /// the decision model gave the same answer.
+    pub shadow_requests: u64,
+    pub shadow_agree: u64,
+    pub shadow_compared: u64,
+    /// External tokens (input-equivalents) per completed task, and per task whose result was verified.
+    pub effective_per_completed: f64,
+    pub effective_per_verified: f64,
 }
 
 impl Engine {
@@ -160,6 +170,7 @@ impl Engine {
                 live: Mutex::new(HashMap::new()),
                 prefix_misses: std::sync::atomic::AtomicU32::new(0),
                 prefix_policy: Mutex::new(Default::default()),
+                shadow: Default::default(),
             }),
         }
     }
@@ -408,11 +419,20 @@ impl Engine {
             totals.decision_calls += l.decision_calls;
             totals.gliner_calls += l.gliner_calls;
             totals.cache_hits += l.cache_hits;
+            totals.external_cached_tokens += l.external_cached_tokens;
+            totals.external_effective_tokens += l.external_effective_tokens;
+            for (k, v) in l.external_by_purpose {
+                *totals.external_by_purpose.entry(k).or_default() += v;
+            }
         }
         totals.external_tokens = totals.strong_tokens;
         totals.saved_tokens = totals.baseline_tokens.saturating_sub(totals.external_tokens);
         totals.saved_pct = if totals.baseline_tokens > 0 { 100.0 * totals.saved_tokens as f32 / totals.baseline_tokens as f32 } else { 0.0 };
+        s.effective_per_completed = if s.completed > 0 { totals.external_effective_tokens as f64 / s.completed as f64 } else { 0.0 };
+        s.effective_per_verified = if s.verified > 0 { totals.external_effective_tokens as f64 / s.verified as f64 } else { 0.0 };
         s.totals = totals;
+        let sh = &self.inner.shadow;
+        (s.shadow_requests, s.shadow_agree, s.shadow_compared) = (sh[0].load(Ordering::Relaxed), sh[1].load(Ordering::Relaxed), sh[2].load(Ordering::Relaxed));
         s.memory = self.inner.store.stats().await.unwrap_or_default();
         s
     }

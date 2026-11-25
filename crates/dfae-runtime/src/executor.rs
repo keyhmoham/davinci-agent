@@ -336,10 +336,10 @@ impl Inner {
                 }
                 if let Some(why) = verdict {
                     let problem = format!(
-                        "step {id} ({}) finished, but its result does not meet what was expected: \"{}\" ({why}). Its result was: {}. Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
+                        "step {id} ({}) found: {} — this does not meet what was expected: \"{}\" ({why}). Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
                         tokens::truncate_tokens(&step.description, 30),
+                        tokens::truncate_tokens(&out.content, 150),
                         step.expect.as_deref().unwrap_or(""),
-                        tokens::truncate_tokens(&out.content, 150)
                     );
                     ctx.checkpoints.lock().push(problem);
                     out.evidence.push(format!("expectation not met: {why}"));
@@ -855,6 +855,7 @@ impl Inner {
                 return Ok(false);
             }
             r.usage.replans += 1;
+            r.problems.push(tokens::truncate_tokens(problem, 60));
             (r.usage.replans, r.budget.clone())
         };
         self.set_status(ctx, TaskStatus::Recovering).await;

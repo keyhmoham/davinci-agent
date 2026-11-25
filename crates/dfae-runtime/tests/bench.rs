@@ -321,3 +321,57 @@ async fn the_optimised_flow_costs_far_fewer_external_tokens_for_the_same_outcome
     assert!(all.totals.calls < base.totals.calls, "fewer external calls");
     assert!(all.totals.effective < base.totals.effective, "fewer effective external tokens");
 }
+
+/// A stream of requests of one shape ("read <file> and tell me how many lines it has"): the first is planned by the
+/// external model, the rest replay the skill it left behind and cost the external model nothing.
+#[tokio::test]
+async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join("notes")).unwrap();
+    for i in 0..6 {
+        std::fs::write(ws.path().join(format!("notes/f{i}.md")), "x\n".repeat(i + 1)).unwrap();
+    }
+    let mut cfg = Config::default();
+    cfg.workspace = ws.path().to_path_buf();
+    cfg.approvals = ApprovalMode::Never;
+    cfg.thresholds.external_min_complexity = 0.01;
+    let strong = MeteredModel::new("strong", |req| match req.purpose.as_str() {
+        "plan" => {
+            let goal = &req.messages[0].content;
+            let file = goal.split_whitespace().find(|w| w.starts_with("notes/")).unwrap_or("notes/f0.md").trim_end_matches(['.', ',']).to_string();
+            Ok(format!("s1 fs_read: read {file}\ns2 - after=s1: count the lines of the file and state the number"))
+        }
+        other => Err(format!("unexpected external call: {other}")),
+    });
+    let slm = MeteredModel::new("slm", |req| match req.purpose.as_str() {
+        "step" => Ok("The file has some lines.".to_string()),
+        other => Err(format!("unexpected local call: {other}")),
+    });
+    let store = Arc::new(InMemoryStore::new());
+    let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf()));
+    let mut reg = ToolRegistry::new();
+    register_native(&mut reg, policy.clone(), store.clone());
+    let engine = Engine::new(EngineDeps {
+        decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
+        extractor: Arc::new(HybridExtractor::new(None)),
+        config: cfg,
+        store,
+        models: ModelGateway::new(Some(Arc::new(slm)), Some(Arc::new(strong.clone()))),
+        tools: Arc::new(reg),
+        policy,
+    });
+    let mut per_task = Vec::new();
+    for i in 0..6 {
+        let id = engine
+            .submit(TaskRequest { goal: format!("Read notes/f{i}.md and tell me how many lines it has"), delegate: Some(false), ..Default::default() })
+            .await
+            .unwrap();
+        let t = engine.wait(&id, Duration::from_secs(30)).await.unwrap();
+        assert_eq!(t.status, TaskStatus::Completed, "task {i}: {:?} / {:?}", t.error, t.final_answer);
+        per_task.push(t.ledger.summary().external_tokens);
+    }
+    eprintln!("\nexternal tokens per task for six requests of one shape: {per_task:?}");
+    assert!(per_task[0] > 0, "the first is planned by the external model");
+    assert!(per_task[1..].iter().all(|t| *t == 0), "the rest are replayed from the skill: {per_task:?}");
+    assert_eq!(strong.calls(), 1);
+}

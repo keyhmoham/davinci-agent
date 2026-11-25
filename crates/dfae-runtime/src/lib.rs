@@ -16,6 +16,7 @@ mod pipeline;
 pub mod planner;
 pub mod prompts;
 mod session;
+mod shadow;
 pub mod skills;
 mod style;
 mod syntax;

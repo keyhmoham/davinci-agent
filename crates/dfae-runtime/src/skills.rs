@@ -19,6 +19,17 @@ pub struct Skill {
     pub template: Plan,
     pub successes: u32,
     pub failures: u32,
+    /// The template is a plan of *intents* (written by the external model, steps carried out by the local system), not of
+    /// concrete calls: replaying it spends no external tokens and produces fresh content for the new request. Because the
+    /// intents are phrased for the request they came from, such a skill only matches a request that differs from the
+    /// original in its slot values.
+    #[serde(default)]
+    pub intent: bool,
+}
+
+/// A request reduced to its words, for the exact-shape match an intent skill requires.
+pub fn shape(masked: &str) -> String {
+    masked.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '{' && c != '}' && c != '_').filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
 const SKIP_LABELS: &[&str] = &["action", "constraint", "quoted", "deadline"];
@@ -77,7 +88,17 @@ pub fn crystallize(goal: &str, entities: &[Entity], plan: &Plan) -> Option<Skill
     let to_placeholder: Vec<(String, String)> = slots.iter().map(|(n, t)| (t.clone(), format!("{{{{slot:{n}}}}}"))).collect();
     let mut template = plan.clone();
     template.goal = String::new();
+    template.report = None;
+    // a plan the external model wrote as intents is kept as intents: what the local system generated while carrying it out
+    // (the page it wrote, the code it composed) belongs to that one request and is generated again for the next
+    let intent = plan.source == PlanSource::Strong && plan.steps.iter().all(|s| s.how.is_some());
     for s in &mut template.steps {
+        if intent {
+            s.args = serde_json::json!({});
+            s.brief = true;
+            s.how = None;
+            s.kind = if s.tool.is_some() { StepKind::Tool } else { StepKind::Reasoning };
+        }
         s.args = replace_in(&s.args, &to_placeholder);
         s.description = replace_in(&Value::String(s.description.clone()), &to_placeholder).as_str().unwrap_or_default().to_string();
         s.status = StepStatus::Pending;
@@ -89,7 +110,7 @@ pub fn crystallize(goal: &str, entities: &[Entity], plan: &Plan) -> Option<Skill
         s.started_at = None;
         s.finished_at = None;
     }
-    Some(Skill { masked_request: mask_request(goal, &slots), slots: slots.into_iter().map(|(n, _)| n).collect(), template, successes: 1, failures: 0 })
+    Some(Skill { masked_request: mask_request(goal, &slots), slots: slots.into_iter().map(|(n, _)| n).collect(), template, successes: 1, failures: 0, intent })
 }
 
 /// Instantiate a skill for a new request. Fails if a slot cannot be filled.

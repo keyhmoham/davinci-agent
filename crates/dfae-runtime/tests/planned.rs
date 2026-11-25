@@ -449,3 +449,119 @@ async fn a_reasoning_step_that_misses_its_expectation_is_rewritten_locally_befor
     assert!(steps[1].contains("PREVIOUS ANSWER WAS REJECTED"), "{}", steps[1]);
     assert_eq!(r.strong.calls(), 1, "the planner was not bothered");
 }
+
+#[tokio::test]
+async fn a_plan_of_intents_becomes_a_skill_that_costs_no_external_tokens_the_next_time() {
+    let r = rig(false, |c| c.thresholds.external_min_complexity = 0.01);
+    std::fs::create_dir_all(r.ws.path().join("notes")).unwrap();
+    std::fs::write(r.ws.path().join("notes/alpha.md"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(r.ws.path().join("notes/beta.md"), "one\ntwo\n").unwrap();
+    r.strong.push(
+        &json!({"steps": [
+            {"id": "s1", "do": "read notes/alpha.md", "tool": "fs_read"},
+            {"id": "s2", "do": "count the lines of the file and state the number", "tool": null, "after": ["s1"]}
+        ]})
+        .to_string(),
+    );
+    r.slm.push("The file has 3 lines.");
+    let t1 = run(&r, "Read notes/alpha.md and tell me how many lines it has").await;
+    assert_eq!(t1.status, TaskStatus::Completed, "{:?} / {:?}", t1.error, t1.final_answer);
+    assert_eq!(r.strong.calls(), 1);
+    // the same request about another file: the skill is replayed as intents, the local system writes the content afresh
+    r.slm.push("The file has 2 lines.");
+    let t2 = run(&r, "Read notes/beta.md and tell me how many lines it has").await;
+    assert_eq!(t2.status, TaskStatus::Completed, "{:?} / {:?}", t2.error, t2.final_answer);
+    assert_eq!(t2.plan.as_ref().unwrap().source, PlanSource::Skill, "{:?}", t2.mode_reason);
+    assert_eq!(r.strong.calls(), 1, "no external call for the replay");
+    assert!(t2.final_answer.as_deref().unwrap().contains("2 lines"), "{:?}", t2.final_answer);
+    assert_eq!(t2.plan.as_ref().unwrap().step("s1").unwrap().args["path"], "notes/beta.md");
+}
+
+#[tokio::test]
+async fn a_task_that_went_wrong_and_then_worked_leaves_a_lesson_that_is_remembered() {
+    let r = rig(true, |_| {});
+    std::fs::write(r.ws.path().join("config.toml"), "status = BAD\n").unwrap();
+    std::fs::write(r.ws.path().join("backup.toml"), "status = fine\n").unwrap();
+    r.strong.push(&json!({"steps": [{"id": "s1", "do": "read config.toml", "tool": "fs_read", "expect": "the status is fine"}]}).to_string());
+    r.strong.push(&json!({"steps": [{"id": "r1_1", "do": "read backup.toml", "tool": "fs_read", "expect": "the status is fine"}]}).to_string());
+    r.strong.push("The status is fine (from backup.toml).");
+    let t = run(&r, "Read config.toml and check that the status is fine, using backup.toml if the first one is not, and report which file you used").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let lessons = r
+        .engine
+        .store()
+        .retrieve(MemoryQuery { text: "check that the status is fine in config.toml".into(), kinds: vec![MemoryKind::Semantic], limit: 5, session_id: None })
+        .await
+        .unwrap();
+    let lesson = lessons
+        .iter()
+        .find(|m| m.item.text.starts_with("Lesson:"))
+        .unwrap_or_else(|| panic!("no lesson in {:?}", lessons.iter().map(|m| &m.item.text).collect::<Vec<_>>()));
+    assert!(lesson.item.text.contains("backup.toml") && lesson.item.text.contains("status = BAD"), "{}", lesson.item.text);
+    // and the next planner sees it: the first plan of a similar request starts from what worked
+    r.strong.push(&json!({"steps": [{"id": "s1", "do": "read backup.toml", "tool": "fs_read", "expect": "the status is fine"}]}).to_string());
+    r.strong.push("The status is fine (from backup.toml).");
+    let before = r.strong.calls();
+    run(&r, "Read config.toml and check that the status is fine, using backup.toml if the first one is not, and report which file you used").await;
+    let next_plan = r.strong.requests.lock()[before].clone();
+    assert!(next_plan.messages[0].content.contains("Lesson:"), "{}", next_plan.messages[0].content);
+}
+
+#[tokio::test]
+async fn a_user_who_says_the_result_was_wrong_teaches_the_system_something() {
+    let log = tempfile::NamedTempFile::new().unwrap();
+    let lp = log.path().to_path_buf();
+    let r = rig(false, move |c| c.decision_log = Some(lp));
+    std::fs::write(r.ws.path().join("config.toml"), "port = 8080\n").unwrap();
+    let first = say(&r, "chat-1", "Read config.toml").await;
+    assert_eq!(first.status, TaskStatus::Completed, "{:?}", first.error);
+    r.slm.push("Sorry, let me look again.");
+    let second = say(&r, "chat-1", "That's wrong, try again").await;
+    assert_eq!(second.route.as_ref().and_then(|x| x.feedback.as_deref()), Some("negative"), "{:?}", second.route);
+    let lessons = r
+        .engine
+        .store()
+        .retrieve(MemoryQuery { text: "Read config.toml did not satisfy the user".into(), kinds: vec![MemoryKind::Semantic], limit: 5, session_id: None })
+        .await
+        .unwrap();
+    assert!(
+        lessons.iter().any(|m| m.item.text.contains("did not satisfy the user") && m.item.text.contains("try again")),
+        "{:?}",
+        lessons.iter().map(|m| &m.item.text).collect::<Vec<_>>()
+    );
+    // the decisions behind the first answer are exported with the user's verdict, ready to train or evaluate with
+    let logged = std::fs::read_to_string(log.path()).unwrap();
+    assert!(logged.lines().any(|l| l.contains("rejected_by_user") && l.contains("Read config.toml")), "{logged}");
+    assert!(logged.lines().any(|l| l.contains("\"outcome\":\"completed\"")), "{logged}");
+}
+
+#[tokio::test]
+async fn shadow_evaluation_measures_the_decision_model_against_the_external_one_when_asked() {
+    let r = rig(false, |c| c.shadow_eval = 1.0);
+    std::fs::write(r.ws.path().join("config.toml"), "port = 8080\n").unwrap();
+    r.strong.push(
+        &json!({"task_type": "file_operations", "needs_tools": "yes", "changes_state": "no", "conditional_change": "no", "risk": "low", "smalltalk": "none", "feedback": "none", "role": "researcher"})
+            .to_string(),
+    );
+    r.strong.push(
+        &json!({"steps": [{"id": "s1", "do": "read config.toml", "tool": "fs_read"}, {"id": "s2", "do": "state the port", "tool": null, "after": ["s1"]}]})
+            .to_string(),
+    );
+    r.slm.push("The port is 8080.");
+    let t = run_as(&r, ModeRequest::Escalated, "Read config.toml and tell me the port").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let s = r.engine.stats().await;
+    assert_eq!(s.shadow_requests, 1);
+    assert!(s.shadow_compared >= 6 && s.shadow_agree >= 5, "agreed on {} of {}", s.shadow_agree, s.shadow_compared);
+    assert!(t.ledger.summary().external_by_purpose.get("shadow_eval").copied().unwrap_or(0) > 0, "the evaluation is visible as what it is");
+    // off by default: the same request costs the external model nothing for it
+    let r2 = rig(false, |_| {});
+    std::fs::write(r2.ws.path().join("config.toml"), "port = 8080\n").unwrap();
+    r2.strong.push(
+        &json!({"steps": [{"id": "s1", "do": "read config.toml", "tool": "fs_read"}, {"id": "s2", "do": "state the port", "tool": null, "after": ["s1"]}]})
+            .to_string(),
+    );
+    r2.slm.push("The port is 8080.");
+    run_as(&r2, ModeRequest::Escalated, "Read config.toml and tell me the port").await;
+    assert_eq!(r2.engine.stats().await.shadow_requests, 0);
+}

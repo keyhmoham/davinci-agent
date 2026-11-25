@@ -145,6 +145,12 @@ pub struct Config {
     pub thresholds: Thresholds,
     pub team: TeamConfig,
     pub economy: EconomyConfig,
+    /// Append every decision and what became of it to this JSONL file (`DFAE_DECISION_LOG`): the training and evaluation
+    /// set for the decision model (and for the thresholds around it).
+    pub decision_log: Option<PathBuf>,
+    /// Share of requests that the external model also answers the routing questions for, to measure the decision model
+    /// against it (`DFAE_SHADOW_EVAL`, 0..1; default 0 = off). It spends external tokens.
+    pub shadow_eval: f32,
     pub max_parallel: usize,
     pub approval_ttl_secs: u64,
     pub log_json: bool,
@@ -156,6 +162,10 @@ fn parse_slots(s: &str) -> std::collections::BTreeMap<String, usize> {
 }
 
 impl Config {
+    pub fn economy_shadow_on(&self) -> bool {
+        self.shadow_eval > 0.0
+    }
+
     pub fn from_env() -> Self {
         let slm_provider = env_or("SLM_PROVIDER", if env("SLM_BASE_URL").is_some() { "openai" } else { "none" });
         Self {
@@ -228,6 +238,8 @@ impl Config {
                 role_slots: parse_slots(&env_or("DFAE_ROLE_SLOTS", "researcher=4,operator=1,analyst=4,verifier=2")),
                 agent_timeout_secs: env_parse("DFAE_AGENT_TIMEOUT_SECS", 600),
             },
+            decision_log: env("DFAE_DECISION_LOG").map(PathBuf::from),
+            shadow_eval: env_parse("DFAE_SHADOW_EVAL", 0.0f32).clamp(0.0, 1.0),
             max_parallel: env_parse("DFAE_MAX_PARALLEL", 4),
             approval_ttl_secs: env_parse("DFAE_APPROVAL_TTL_SECS", 900),
             log_json: env_bool("DFAE_LOG_JSON", false),

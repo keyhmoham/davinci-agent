@@ -1035,7 +1035,7 @@ fn price_text(e: dfae_core::CostEstimate) -> String {
 }
 
 fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
-    let [top, mid, bot] = Layout::vertical([Constraint::Length(11), Constraint::Min(4), Constraint::Length(7)]).areas(area);
+    let [top, mid, bot] = Layout::vertical([Constraint::Length(12), Constraint::Min(4), Constraint::Length(7)]).areas(area);
     let s = app.detail.as_ref().map(|d| d.ledger.summary()).unwrap_or_default();
     let est = app.detail.as_ref().and_then(|d| d.plan.as_ref()).and_then(|p| p.estimate);
     let repairs: u32 = app.detail.as_ref().and_then(|d| d.plan.as_ref()).map(|p| p.steps.iter().map(|s| s.repairs).sum()).unwrap_or(0);
@@ -1052,6 +1052,19 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
                 "slm {} · strong {} · decision {} · extractor {} · cache hits {}",
                 s.slm_calls, s.strong_calls, s.decision_calls, s.gliner_calls, s.cache_hits
             )),
+        ]),
+        Line::from(vec![
+            label(" external "),
+            Span::raw({
+                let by: Vec<String> = s.external_by_purpose.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                format!(
+                    "{} tokens · {} from the provider's cache · {} effective · {}",
+                    s.external_tokens,
+                    s.external_cached_tokens,
+                    s.external_effective_tokens,
+                    if by.is_empty() { "—".to_string() } else { by.join(" · ") }
+                )
+            }),
         ]),
         Line::from(vec![
             label(" economy "),
@@ -1259,11 +1272,22 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let saved = app.stats.as_ref().map(|s| {
         (
             s["totals"]["saved_pct"].as_f64().unwrap_or(0.0),
-            s["totals"]["generative_tokens"].as_u64().unwrap_or(0),
+            s["totals"]["external_tokens"].as_u64().unwrap_or(0),
             s["totals"]["baseline_tokens"].as_u64().unwrap_or(0),
         )
     });
-    let right = saved.filter(|(_, _, b)| *b > 0).map(|(p, g, b)| format!("Σ {p:.0}% saved ({} vs ~{}) ", fmt_tokens(g), fmt_tokens(b))).unwrap_or_default();
+    let per_task = app.stats.as_ref().and_then(|s| s["effective_per_completed"].as_f64()).filter(|v| *v > 0.0);
+    let right = saved
+        .filter(|(_, _, b)| *b > 0)
+        .map(|(p, e, b)| {
+            format!(
+                "Σ external {} vs ~{} naive ({p:.0}% saved){} ",
+                fmt_tokens(e),
+                fmt_tokens(b),
+                per_task.map(|t| format!(" · ~{t:.0}/task")).unwrap_or_default()
+            )
+        })
+        .unwrap_or_default();
     let [l, r] = Layout::horizontal([Constraint::Min(10), Constraint::Length(right.chars().count() as u16 + 1)]).areas(area);
     f.render_widget(Paragraph::new(Span::styled(trunc(hints, l.width as usize), Style::new().fg(DIM))), l);
     f.render_widget(Paragraph::new(Span::styled(right, Style::new().fg(OK))).alignment(Alignment::Right), r);

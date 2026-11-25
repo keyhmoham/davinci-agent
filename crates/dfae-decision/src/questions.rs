@@ -61,6 +61,20 @@ pub fn route_request(state: DecisionState) -> DecisionRequest {
         ),
     );
     q.insert(
+        "feedback".into(),
+        Question::choice(
+            "Does the message judge the assistant's previous reply or result?",
+            [
+                ("none", "no: it is a new request or a plain follow-up"),
+                (
+                    "negative",
+                    "yes, it was wrong, incomplete or not what was asked (\"that's wrong\", \"try again\", \"it doesn't work\", \"not what I meant\")",
+                ),
+                ("positive", "yes, it was right or good (\"perfect\", \"that works\", \"great, thanks\")"),
+            ],
+        ),
+    );
+    q.insert(
         "role".into(),
         Question::choice(
             "Which kind of agent fits this work best?",

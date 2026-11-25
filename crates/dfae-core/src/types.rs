@@ -428,11 +428,25 @@ pub struct Routing {
     /// The kind of agent that fits the work: `researcher`, `operator`, `analyst`, `verifier`.
     #[serde(default)]
     pub role: Option<String>,
+    /// What the message says about the previous reply: `negative` ("that's wrong", "try again") or `positive`.
+    #[serde(default)]
+    pub feedback: Option<String>,
 }
 
 impl Routing {
     pub fn new(task_type: &str, complexity: f32, needs_tools: bool, risk: Risk, confidence: f32) -> Self {
-        Self { task_type: task_type.into(), complexity, needs_tools, risk, confidence, changes: false, conditional: false, smalltalk: None, role: None }
+        Self {
+            task_type: task_type.into(),
+            complexity,
+            needs_tools,
+            risk,
+            confidence,
+            changes: false,
+            conditional: false,
+            smalltalk: None,
+            role: None,
+            feedback: None,
+        }
     }
 }
 
@@ -581,6 +595,9 @@ pub struct TaskRecord {
     /// Team view: set on coordinators and on the agents they spawn.
     #[serde(default)]
     pub team: Option<TeamInfo>,
+    /// What went wrong before the plan was revised (one line each): the raw material of a lesson.
+    #[serde(default)]
+    pub problems: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -614,6 +631,7 @@ impl TaskRecord {
             final_answer: None,
             error: None,
             team: None,
+            problems: vec![],
             created_at: now,
             updated_at: now,
         }

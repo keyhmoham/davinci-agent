@@ -95,6 +95,12 @@ impl Inner {
         state.recent = ctx.base_ctx.lock().turns.iter().map(|(q, a)| format!("user: {q} → assistant: {a}")).collect();
         let routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
         ctx.rec.lock().await.route = Some(routing.clone());
+        if self.cfg.economy_shadow_on() && !is_member && crate::shadow::sampled(&ctx.id, self.cfg.shadow_eval) {
+            self.shadow_evaluate(ctx, &state, &routing).await;
+        }
+        if let Some(verdict) = routing.feedback.as_deref().filter(|_| !is_member) {
+            self.apply_feedback(ctx, verdict, &goal, &history).await;
+        }
 
         // ---- 3b. subagents -----------------------------------------------------
         let is_agent = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
@@ -562,12 +568,17 @@ impl Inner {
     async fn find_skill(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) -> Option<SkillMatch> {
         let slots = skills::slot_values(goal, entities);
         let masked = skills::mask_request(goal, &slots);
+        let masked_now = masked.clone();
         let cands = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 3, session_id: None }).await.ok()?;
         for c in cands {
             if c.similarity < self.cfg.thresholds.skill_min_similarity {
                 continue;
             }
             let Some(skill) = c.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) else { continue };
+            // a skill of intents is phrased for the request it came from: it applies only to the same request with other values
+            if skill.intent && skills::shape(&skill.masked_request) != skills::shape(&masked_now) {
+                continue;
+            }
             if let Some(plan) =
                 skills::instantiate(&skill, goal, entities).filter(|p| p.steps.iter().filter_map(|s| s.tool.as_deref()).all(|t| ctx.in_scope(t)))
             {
@@ -944,6 +955,126 @@ impl Inner {
     }
 
     /// Calibration, episodic memory, validated fact promotion, skill learning.
+    /// `Lesson: for "<request>": <what went wrong> — what worked: <the steps that finished>`, from a task that had to revise
+    /// its plan and then succeeded. Deterministic: it is built from what happened, not from what a model remembers of it.
+    fn lesson_from(&self, rec: &TaskRecord) -> Option<String> {
+        let problem = rec.problems.first()?;
+        let plan = rec.plan.as_ref()?;
+        let worked: Vec<String> = plan
+            .steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Succeeded)
+            .map(|s| format!("{} {}", s.tool.as_deref().unwrap_or("think"), tokens::truncate_tokens(&s.description, 16)))
+            .take(4)
+            .collect();
+        if worked.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "Lesson: for \"{}\": {} — what worked: {}",
+            tokens::truncate_tokens(&rec.goal, 20),
+            tokens::truncate_tokens(problem.split(" Adapt the remaining plan").next().unwrap_or(problem), 50),
+            worked.join("; ")
+        ))
+    }
+
+    /// Put the routing questions to the external model too and record how far the decision model agrees with it.
+    async fn shadow_evaluate(&self, ctx: &Arc<TaskCtx>, state: &DecisionState, routing: &Routing) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.models.has(Tier::Strong) {
+            return;
+        }
+        let user = crate::shadow::render(&dfae_decision::route_request(state.clone()));
+        let mut req = self.gen_request(Tier::Strong, crate::shadow::SHADOW_SYSTEM, user, "shadow_eval");
+        req.json = true;
+        req.max_tokens = req.max_tokens.min(300);
+        let Ok(theirs) = self.gen_json(ctx, Tier::Strong, req).await else { return };
+        let (agree, total, diffs) = crate::shadow::compare(routing, &theirs);
+        self.shadow[0].fetch_add(1, Relaxed);
+        self.shadow[1].fetch_add(agree as u64, Relaxed);
+        self.shadow[2].fetch_add(total as u64, Relaxed);
+        if let Some(path) = &self.cfg.decision_log
+            && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", crate::shadow::log_line(&ctx.id, &state.request, agree, total, &diffs));
+        }
+    }
+
+    /// A replayed skill worked or did not: count it, and drop a skill that fails more than it works.
+    async fn record_skill_outcome(&self, sid: &str, rec: &TaskRecord, success: bool) {
+        let masked = skills::mask_request(&rec.goal, &skills::slot_values(&rec.goal, &rec.entities));
+        if let Ok(found) = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 5, session_id: None }).await
+            && let Some(m) = found.into_iter().find(|m| m.item.id == sid)
+            && let Some(mut skill) = m.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok())
+        {
+            if success {
+                skill.successes += 1
+            } else {
+                skill.failures += 1
+            }
+            if skill.failures >= 2 && skill.failures > skill.successes {
+                let _ = self.store.delete(sid).await;
+            } else {
+                let _ = self.store.update_metadata(sid, json!({"skill": skill})).await;
+            }
+        }
+    }
+
+    /// The user's next message judged the previous result (`negative`: "that's wrong", "try again"; `positive`). Only the
+    /// user can say whether a result satisfied them, and the engine otherwise assumes it did: this corrects the
+    /// calibration of the decisions behind it, the skill that produced it, and leaves a lesson.
+    async fn apply_feedback(&self, ctx: &Arc<TaskCtx>, verdict: &str, said: &str, history: &[TaskRecord]) {
+        let _ = ctx;
+        let Some(prev) = history.iter().rev().find(|t| t.final_answer.is_some()) else { return };
+        let good = verdict == "positive";
+        if let Some(m) = prev.mode {
+            let key = match m {
+                ExecMode::Direct => "direct",
+                ExecMode::Assisted => "assisted",
+                ExecMode::Escalated => "escalated",
+            };
+            self.decider.record_outcome(DecisionKind::SelectMode, key, good);
+        }
+        if let Some(r) = &prev.route {
+            self.decider.record_outcome(DecisionKind::RouteTask, &r.task_type, good);
+        }
+        if let Some(sid) = &prev.skill_id {
+            // a replay the user rejected counts twice: the skill carries no judgement of its own
+            self.record_skill_outcome(sid, prev, good).await;
+            if !good {
+                self.record_skill_outcome(sid, prev, false).await;
+            }
+        }
+        if !good {
+            let text = format!(
+                "Lesson: the result for \"{}\" ({}) did not satisfy the user, who said: \"{}\"",
+                tokens::truncate_tokens(&prev.goal, 20),
+                tokens::truncate_tokens(prev.final_answer.as_deref().unwrap_or(""), 30),
+                tokens::truncate_tokens(said, 25)
+            );
+            let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.8);
+            it.metadata = json!({"source": "lesson", "task_id": prev.task_id, "feedback": "negative"});
+            let _ = self.store.store(it).await;
+        }
+        let _ = self.store.kv_set("calibration", self.decider.calibrator.snapshot()).await;
+        self.export_decisions(prev, if good { "confirmed_by_user" } else { "rejected_by_user" });
+    }
+
+    /// One JSON line per decision of a task, with what became of it (when a log file is configured).
+    pub(crate) fn export_decisions(&self, rec: &TaskRecord, outcome: &str) {
+        use std::io::Write;
+        let Some(path) = &self.cfg.decision_log else { return };
+        let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+        for d in &rec.decisions {
+            let line = json!({
+                "task_id": rec.task_id, "goal": rec.goal, "kind": d.kind, "provider": d.provider, "answers": d.answers,
+                "outcome": outcome, "status": rec.status, "mode": rec.mode, "ts": d.ts,
+            });
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
     async fn learn(&self, rec: &TaskRecord) {
         let verified = rec.verification.as_ref().map(|v| v.status == VerificationStatus::Verified).unwrap_or(false);
         let success = rec.status == TaskStatus::Completed && rec.verification.as_ref().map(|v| v.status != VerificationStatus::Failed).unwrap_or(false);
@@ -969,6 +1100,8 @@ impl Inner {
         }
         let _ = self.store.kv_set("calibration", self.decider.calibrator.snapshot()).await;
 
+        self.export_decisions(rec, if success { "completed" } else { "failed" });
+
         // 1b. the cost model learns what this task's model calls cost
         self.learn_costs(rec).await;
 
@@ -980,6 +1113,23 @@ impl Inner {
         item.session_id = Some(rec.session_id.clone());
         item.metadata = json!({"task_id": rec.task_id, "success": success, "mode": rec.mode});
         let _ = self.store.store(item).await;
+
+        // 2b. reflection: a task that went wrong and then worked leaves a one-line lesson for requests like it
+        if success && let Some(lesson) = self.lesson_from(rec) {
+            let dup = self
+                .store
+                .retrieve(MemoryQuery { text: lesson.clone(), kinds: vec![MemoryKind::Semantic], limit: 1, session_id: None })
+                .await
+                .ok()
+                .and_then(|r| r.into_iter().next())
+                .map(|r| r.similarity > 0.9)
+                .unwrap_or(false);
+            if !dup {
+                let mut it = MemoryItem::new(MemoryKind::Semantic, lesson, 0.75);
+                it.metadata = json!({"source": "lesson", "task_id": rec.task_id});
+                let _ = self.store.store(it).await;
+            }
+        }
 
         // 3. validated fact promotion: extractor output is only a candidate. It
         //    becomes semantic memory if the task was verified, the label is on
@@ -1013,22 +1163,7 @@ impl Inner {
 
         // 4. skills: replay bookkeeping, or crystallise a new one
         if let Some(sid) = &rec.skill_id {
-            let masked = skills::mask_request(&rec.goal, &skills::slot_values(&rec.goal, &rec.entities));
-            if let Ok(found) = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 5, session_id: None }).await
-                && let Some(m) = found.into_iter().find(|m| &m.item.id == sid)
-                && let Some(mut skill) = m.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok())
-            {
-                if success {
-                    skill.successes += 1
-                } else {
-                    skill.failures += 1
-                }
-                if skill.failures >= 2 && skill.failures > skill.successes {
-                    let _ = self.store.delete(sid).await;
-                } else {
-                    let _ = self.store.update_metadata(sid, json!({"skill": skill})).await;
-                }
-            }
+            self.record_skill_outcome(sid, rec, success).await;
         } else if verified
             && matches!(rec.mode, Some(ExecMode::Assisted) | Some(ExecMode::Escalated))
             && rec.usage.replans == 0

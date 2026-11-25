@@ -248,6 +248,22 @@ fn smalltalk_kind(req: &str) -> &'static str {
     }
 }
 
+static FEEDBACK_NEG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:that(?:'s| is| was)? (?:wrong|not right|incorrect|not what)|not what i (?:asked|meant|wanted)|try again|do it again|doesn'?t work|does not work|didn'?t work|still (?:fails|broken|wrong|not working)|you (?:got it wrong|missed)|it(?:'s| is) (?:broken|wrong))\b").unwrap()
+});
+static FEEDBACK_POS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(?:perfect|great|that works|works now|exactly|nice|awesome|well done|looks good)\b").unwrap());
+
+fn feedback_kind(req: &str) -> &'static str {
+    if FEEDBACK_NEG.is_match(req) {
+        "negative"
+    } else if FEEDBACK_POS.is_match(req) {
+        "positive"
+    } else {
+        "none"
+    }
+}
+
 static ARITH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d+(\.\d+)?\s*[-+*/^%x×÷]\s*\d+").unwrap());
 static CONJ: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b(and then|then|after that|afterwards|and|also|but|unless|if|before|after|while|otherwise)\b|[;,]").unwrap());
@@ -398,6 +414,8 @@ impl LocalDecider {
                 out.insert("conditional_change".into(), Answer::noul(if CONDITIONAL.is_match(&s.request) { 0.85 } else { 0.1 }));
                 let kind = smalltalk_kind(&s.request);
                 out.insert("smalltalk".into(), Answer::choice(kind, 0.9, &[(kind, 0.9)]));
+                let fb = feedback_kind(&s.request);
+                out.insert("feedback".into(), Answer::choice(fb, 0.8, &[(fb, 0.8)]));
                 let role = if r >= Risk::Moderate || tt == "maintenance" {
                     "operator"
                 } else if needs < 0.5 {
