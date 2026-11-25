@@ -52,7 +52,9 @@ impl EntityExtractor for GlinerClient {
             .await
             .map_err(|e| ExtractionError::Unavailable(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(ExtractionError::Unavailable(format!("HTTP {}", resp.status())));
+            let status = resp.status();
+            let detail = resp.json::<serde_json::Value>().await.ok().and_then(|v| v["detail"].as_str().map(String::from)).unwrap_or_default();
+            return Err(ExtractionError::Unavailable(format!("HTTP {status}{}", if detail.is_empty() { String::new() } else { format!(": {detail}") })));
         }
         let parsed: WireResponse = resp.json().await.map_err(|e| ExtractionError::Failed(e.to_string()))?;
         let entities = parsed

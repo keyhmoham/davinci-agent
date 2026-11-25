@@ -48,6 +48,15 @@ async fn main() -> anyhow::Result<()> {
         "starting dfae"
     );
     let engine = build_engine(cfg.clone()).await.map_err(anyhow::Error::msg)?;
+    // say now, in the log, which model is unusable and why (a red dot in the TUI cannot)
+    {
+        let e = engine.clone();
+        tokio::spawn(async move {
+            for (name, why) in e.model_problems().await {
+                tracing::warn!(model = %name, "{why}");
+            }
+        });
+    }
     let resumed = engine.resume_unfinished().await;
     if !resumed.is_empty() {
         tracing::info!(count = resumed.len(), "resumed unfinished tasks");

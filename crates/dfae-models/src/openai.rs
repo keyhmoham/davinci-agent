@@ -110,22 +110,41 @@ impl LanguageModel for OpenAiCompat {
     }
 
     async fn health(&self) -> bool {
-        let mut rb = self.http.get(format!("{}/models", self.base)).timeout(Duration::from_secs(3));
+        self.diagnose().await.is_ok()
+    }
+
+    async fn diagnose(&self) -> Result<(), String> {
+        let mut rb = self.http.get(format!("{}/models", self.base)).timeout(Duration::from_secs(5));
         if let Some(k) = &self.key {
             rb = rb.bearer_auth(k);
         }
-        let Ok(resp) = rb.send().await else { return false };
-        if !resp.status().is_success() {
-            return false;
+        let resp = rb.send().await.map_err(|e| format!("cannot reach {}: {e}", self.base))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(format!("{} answered HTTP {status}: the API key was refused", self.base));
         }
-        // A server that is up but lacks the configured model (Ollama before the pull finishes) is not healthy.
+        if !status.is_success() {
+            // many gateways have no model listing; the chat endpoint is what matters, and a real call will say what is wrong
+            return Ok(());
+        }
+        // A server that is up but lacks the configured model (Ollama before the pull finishes) is not usable.
         match resp.json::<Value>().await.ok().and_then(|v| v["data"].as_array().cloned()) {
             Some(models) => {
                 let norm = |m: &str| m.strip_suffix(":latest").unwrap_or(m).to_string();
                 let want = norm(&self.model);
-                models.iter().filter_map(|m| m["id"].as_str()).any(|id| norm(id) == want)
+                let ids: Vec<String> = models.iter().filter_map(|m| m["id"].as_str()).map(String::from).collect();
+                if ids.iter().any(|id| norm(id) == want) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{} is up but does not list the model '{}' (it lists {})",
+                        self.base,
+                        self.model,
+                        if ids.is_empty() { "none".to_string() } else { ids.iter().take(6).cloned().collect::<Vec<_>>().join(", ") }
+                    ))
+                }
             }
-            None => true, // not a listing we understand: do not guess
+            None => Ok(()), // not a listing we understand: do not guess
         }
     }
 }

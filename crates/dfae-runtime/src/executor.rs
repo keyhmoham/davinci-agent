@@ -475,7 +475,18 @@ impl Inner {
                 evidence.push(format!("context expanded on request: {}", need.join(", ")));
             }
         }
-        let text = text.trim().to_string();
+        let mut text = text.trim().to_string();
+        // the agent never asks the user: a reply that is only a question gets one more try, told to decide and do the work
+        if economy::contracts::asks_the_user(&text) {
+            let user = format!(
+                "STEP: {}\n{ctx_text}\nINPUTS:\n{}\nYOUR PREVIOUS ANSWER ASKED THE USER A QUESTION. Nobody will answer. Decide on sensible defaults yourself, say in a few words what you assumed, and write the result itself.",
+                step.description,
+                render(&[])
+            );
+            if let Ok(t) = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step")).await {
+                text = t.trim().to_string();
+            }
+        }
         // zero-cost output contract: junk is stopped here instead of feeding the next model call
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));

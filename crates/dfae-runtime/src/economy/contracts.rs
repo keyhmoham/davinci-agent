@@ -23,6 +23,16 @@ pub fn resolve_templates(args: &Value, outputs: &HashMap<&str, &str>, render: &d
 }
 
 /// Why a model's step output must not be passed on, if it must not.
+/// A short reply that is only a question for the user ("What information do you want to include?"). The agent never asks:
+/// a step that comes back like this has not done its work.
+pub fn asks_the_user(text: &str) -> bool {
+    static ASK: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?is)\b(?:what|which|where|when|how)\b[^?]*\b(?:do you|would you|should i|shall i)\b|\b(?:could|can|would|will) you (?:please |kindly )?(?:provide|tell|specify|share|clarify|confirm|let me know)\b|\bplease (?:provide|tell me|specify|let me know|clarify)\b|\bI(?:'ll| will)? need (?:some |more |a few )?(?:more )?(?:details|information|content|input)\b").unwrap()
+    });
+    let t = text.trim();
+    t.split_whitespace().count() <= 70 && t.ends_with('?') && ASK.is_match(t)
+}
+
 pub fn model_output_issue(text: &str) -> Option<String> {
     let t = text.trim();
     if !t.chars().any(|c| c.is_alphanumeric()) {
@@ -34,6 +44,9 @@ pub fn model_output_issue(text: &str) -> Option<String> {
         if (unique.len() as f64) / (words.len() as f64) < 0.2 {
             return Some("degenerate repetition".into());
         }
+    }
+    if asks_the_user(t) {
+        return Some("asks the user instead of deciding".into());
     }
     if t.contains("<data src=") || t.starts_with("STEP:") || t.contains("\nINPUTS:") {
         return Some("the model echoed its prompt".into());
@@ -56,6 +69,15 @@ mod tests {
         let e = resolve_templates(&json!({"e": "{{s7}}"}), &outs, &|o| o.to_string()).unwrap_err();
         assert!(e.contains("s7 has not produced a result"));
         assert_eq!(resolve_templates(&json!({"e": "plain"}), &outs, &|o| o.to_string()).unwrap(), json!({"e": "plain"}));
+    }
+
+    #[test]
+    fn a_reply_that_only_asks_the_user_is_not_a_result() {
+        assert!(asks_the_user("To create a landing page about Earth, I'll need some content and design details. What information do you want to include?"));
+        assert!(asks_the_user("Could you please provide the file name?"));
+        assert!(!asks_the_user("Earth is the third planet. Why does it matter?"), "a question inside content is not a request for input");
+        assert!(!asks_the_user("The port is 8080."));
+        assert!(model_output_issue("What would you like the page to say?").is_some());
     }
 
     #[test]
