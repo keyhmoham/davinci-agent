@@ -39,6 +39,11 @@ pub(crate) struct StepOutput {
     pub evidence: Vec<String>,
 }
 
+/// What a step is called in events: its tool, or `agent` for a delegated step.
+fn step_label(s: &Step) -> Option<String> {
+    s.tool.clone().or_else(|| (s.kind == StepKind::Agent).then(|| "agent".to_string()))
+}
+
 fn kind_str(k: ErrorKind) -> String {
     serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "other".into())
 }
@@ -179,7 +184,7 @@ impl Inner {
             EventKind::StepUpdate {
                 step_id: id.into(),
                 status: StepStatus::Running,
-                tool: step.tool.clone(),
+                tool: step_label(&step),
                 summary: None,
                 error: None,
                 attempts: step.attempts,
@@ -229,7 +234,7 @@ impl Inner {
                     EventKind::StepUpdate {
                         step_id: id.into(),
                         status: StepStatus::Succeeded,
-                        tool: step.tool.clone(),
+                        tool: step_label(&step),
                         summary: Some(tokens::truncate_tokens(&summary, 40)),
                         error: None,
                         attempts: step.attempts,
@@ -253,7 +258,7 @@ impl Inner {
                     EventKind::StepUpdate {
                         step_id: id.into(),
                         status: StepStatus::Failed,
-                        tool: step.tool.clone(),
+                        tool: step_label(&step),
                         summary: None,
                         error: Some(f.message.clone()),
                         attempts: step.attempts,

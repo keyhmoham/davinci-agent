@@ -8,3 +8,6 @@ write 'hello from dfae' to notes/hello.txt
 read notes/hello.txt
 read the file notes/hello.txt and tell me how many words it contains
 check system health and explain whether anything looks unusual
+read todo.md, notes/hello.txt and summarize them
+explain what a mutex is and explain what a semaphore is
+Find the latest PostgreSQL vulnerabilities, check whether my server is affected, and patch it if necessary

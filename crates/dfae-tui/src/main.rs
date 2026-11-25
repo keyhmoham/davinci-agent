@@ -248,11 +248,20 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
                     if let Ok(s) = api.stats().await {
                         let _ = tx.send(Msg::Stats(s));
                     }
-                    if let Ok(d) = api.dispatch().await {
-                        let _ = tx.send(Msg::Dispatch(d));
-                    }
                 }
                 tokio::time::sleep(Duration::from_millis(if ok { 2000 } else { 1000 })).await;
+            }
+        });
+    }
+    // dispatcher pools: fast, so worker-slot occupancy is visible while agents run
+    {
+        let (tx, api) = (tx.clone(), api.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(d) = api.dispatch().await {
+                    let _ = tx.send(Msg::Dispatch(d));
+                }
+                tokio::time::sleep(Duration::from_millis(400)).await;
             }
         });
     }

@@ -780,13 +780,21 @@ fn draw_team(f: &mut Frame, area: Rect, app: &App) {
             ]));
             l.push(Line::from(vec![
                 label(" team cost "),
-                Span::raw(format!(
-                    "{} generative tokens across {} agents vs ~{} for one naive agent ({:.0}% saved)",
-                    fmt_tokens(s.generative_tokens),
-                    t.children.len(),
-                    fmt_tokens(s.baseline_tokens),
-                    s.saved_pct
-                )),
+                Span::raw(if s.baseline_tokens > 0 {
+                    format!(
+                        "{} generative tokens across {} agents vs ~{} for one naive agent ({:.0}% saved)",
+                        fmt_tokens(s.generative_tokens),
+                        t.children.len(),
+                        fmt_tokens(s.baseline_tokens),
+                        s.saved_pct
+                    )
+                } else {
+                    format!(
+                        "{} generative tokens so far across {} agents (the baseline is computed when the task ends)",
+                        fmt_tokens(s.generative_tokens),
+                        t.children.len()
+                    )
+                }),
             ]));
             l.push(Line::from(vec![
                 label(" shared    "),
@@ -840,7 +848,10 @@ fn draw_team(f: &mut Frame, area: Rect, app: &App) {
                 .map(|s| {
                     let child_id = s.args.get("child").and_then(|c| c.as_str()).unwrap_or("");
                     let cref = d.team.as_ref().and_then(|t| t.children.iter().rev().find(|c| c.step_id == s.id));
-                    let (rl, rc) = role_badge(cref.and_then(|c| c.role));
+                    // a running agent's role/mode come from its live task row; the ref is only final once it ends
+                    let live = app.tasks.iter().find(|t| t.task_id == child_id);
+                    let role = cref.and_then(|c| c.role).or(live.and_then(|t| t.role)).filter(|r| *r != AgentRole::Coordinator);
+                    let (rl, rc) = role_badge(role);
                     let (icon, ic) = match s.status {
                         StepStatus::Running => (spinner(app), ACCENT),
                         StepStatus::Succeeded => ("✔", OK),
@@ -849,14 +860,11 @@ fn draw_team(f: &mut Frame, area: Rect, app: &App) {
                         StepStatus::Pending => ("⧗", DIM),
                         _ => ("⊘", DIM),
                     };
-                    let mode = cref.and_then(|c| c.mode).map(|m| mode_badge(Some(m))).unwrap_or(("·", DIM));
+                    let mode = cref.and_then(|c| c.mode).or(live.and_then(|t| t.mode)).map(|m| mode_badge(Some(m))).unwrap_or(("·", DIM));
                     Row::new(vec![
                         Cell::from(Span::styled(icon, Style::new().fg(ic))),
                         Cell::from(s.id.clone()),
-                        Cell::from(Span::styled(
-                            cref.and_then(|c| c.role).map(|r| format!("{rl} {}", r.as_str())).unwrap_or_else(|| "…".into()),
-                            Style::new().fg(rc),
-                        )),
+                        Cell::from(Span::styled(role.map(|r| format!("{rl} {}", r.as_str())).unwrap_or_else(|| "…".into()), Style::new().fg(rc))),
                         Cell::from(Span::styled(mode.0, Style::new().fg(mode.1).bold())),
                         Cell::from(tokens_of(child_id).map(fmt_tokens).unwrap_or_else(|| "-".into())),
                         Cell::from(if s.attempts > 1 { format!("×{}", s.attempts) } else { String::new() }),

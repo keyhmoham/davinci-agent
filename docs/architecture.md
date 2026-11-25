@@ -30,6 +30,39 @@ No model owns control flow, permissions, or the claim that a task is done.
    answers are checked for ungrounded numbers/paths/URLs.
 10. **Learn** — calibration, episodic memory, validated fact promotion, skill crystallisation.
 
+## Teams (`crates/dfae-runtime/src/{team,dispatch,agents}.rs`)
+
+Delegation is a **plan step kind** (`Agent`); an agent is a child `TaskRecord` run through the same pipeline.
+
+1. **Decompose** (`team::decompose`, deterministic) — segments the request at `;`, newlines, sentence ends and soft
+   separators (`and`, `,`, `then`, `after that`) *only where a new imperative clause starts* (a verb in the lexicon, or a
+   fragment that binds to one of the registered tools' own patterns — so custom tools extend the splitter). Enumerations
+   (`read a, b and c`) expand into one sub-goal per item. A trailing `summarise / compare / combine …` clause becomes the
+   **join** (a reasoning step over all agents). Comparisons ("compare X and Y") are never split.
+2. **Dependencies** are inferred conservatively: sequence words (`then`, `finally`), anaphora (`it`, `them`,
+   `if necessary`, `whether … affected`, `based on`), and *an analysis clause right after an acquisition clause* ("read x
+   and tell me …") make a sub-goal wait for its predecessor and receive its summary. A false dependency only costs
+   parallelism; a false independence would cost correctness.
+3. **Decide** — `assess_decomposition` over `TeamFacts` (how many sub-goals bind without a model, how many model parts run
+   in parallel, how many wait on a deterministic one, how many change state, whether there is a join, whether a model exists).
+   Local rule: split for parallel model work (≥2), fan-out with a join (≥2 free agents), a pipeline of ≥3 that separates
+   read-only from state-changing work; don't split when one plan does as well or everything is already Direct-mode.
+   With Jev the same question is asked of the hosted model; either way the answer is calibrated on past outcomes.
+4. **Dispatch** — each agent routes itself, then **fixes its role** (`pick_role`: a deterministic binding that changes
+   state → operator; risky/maintenance → operator; no tools needed → analyst; "verify/check…" → verifier; else researcher),
+   narrows its tool scope, and waits for a worker slot (`Dispatcher::acquire_agent`: role pool, then global pool).
+5. **Run** — the agent inherits the entities of its sub-goal (no extractor call), a `Minimal` context profile, a slice of
+   the coordinator's budget, and the coordinator's taint / auto-approve; it plans, executes, verifies and learns like any task.
+6. **Supervise** — on failure the decision layer picks retry (fresh agent), escalate (re-run on the stronger model) or fail;
+   `max_replans` is 0 for agent steps because the agent already replans internally. Siblings are isolated from the failure.
+7. **Join** — usage and ledger entries roll up (`origin` marks them), and the coordinator verifies: an agent step counts as
+   evidence only if the agent itself was verified or partial. The answer is the join step's text, or each agent's answer under
+   its sub-goal when there is no join.
+
+**Dispatcher invariants.** Coordinators hold only an *admission* slot; agents hold a *role* slot then a *global* slot, always
+in that order; agents never wait on other agents (depth 1). So a slot holder never waits for a slot another holder needs.
+`operator=1` makes side-effecting agents strictly sequential.
+
 ## State machine
 
 `created → running ⇄ waiting_for_tool / waiting_for_approval / recovering → verifying → completed | failed | cancelled`.

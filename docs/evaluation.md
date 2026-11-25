@@ -25,6 +25,15 @@ each) accumulate in the history. This is a plausible but simple cost model; real
 search, history trimming). **"X% saved" is therefore model-relative.** A direct-mode task shows ~100% because it
 used zero generative tokens, which is real; the baseline it is compared with is hypothetical.
 
+## Teams
+
+A coordinator's **baseline** models one naive agent doing *all* the work (every agent's steps in one history), not the sum of
+per-agent baselines, and agents' own baselines are excluded from global totals. Their generative tokens roll up into the
+coordinator's ledger (`origin` = agent id) for the team's cost, while `/v1/stats` counts each call once. Compare
+team vs flat on your tasks with `/team off` (or `delegate:false`): expect the clearest wins on fan-out + join and on
+mixed read-only / state-changing pipelines, and roughly neutral token cost on model-only pipelines. Measure latency too —
+parallel agents are mostly a wall-clock gain.
+
 ## Benchmark properly
 
 Compare, on *your* task distribution:

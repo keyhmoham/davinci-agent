@@ -22,6 +22,17 @@ before execution on the final arguments** (templates resolved); (3) again **insi
 | runtime | unprivileged user, read-only root filesystem, all capabilities dropped, `no-new-privileges`, memory and pid limits, API bound to loopback |
 | budgets | steps, model calls, tool calls, replans, wall-clock — enforced, not advisory |
 
+## Subagents
+
+Delegation never widens authority. An agent's **tool scope** comes from its role (researcher/verifier/analyst are read-only
+or tool-less) and is checked at tool selection, at direct binding, when replaying skills, and again immediately before
+execution; the policy engine then applies exactly as for a top-level task. Taint (suspected injection) and auto-approve are
+inherited from the coordinator, and an agent's taint flows back, so a poisoned observation cannot be laundered through a
+child. Agents cannot spawn agents; each gets a slice of the coordinator's budget; cancelling the coordinator cancels them
+all; side-effecting agents are serialised by the `operator` pool. Approvals raised by an agent appear on that agent and
+are answered there (the TUI's `Ctrl+A` finds them). Known limit: a role is chosen heuristically from the sub-task's text and
+routing, so a mis-classified state-changing request fails closed (its write tool is outside a read-only scope) rather than open.
+
 ## Data egress (read this before adding keys)
 
 - **Jev** (only if `JEV_API_KEY` is set): each decision sends the request text, extracted entity text and a few

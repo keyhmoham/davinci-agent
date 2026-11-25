@@ -26,6 +26,10 @@ Every request takes the cheapest path that can do the job:
 | **Assisted** | + SLM | planning + reasoning steps only | planning, writing, analysis, unusual arguments |
 | **Escalated** | + stronger model | as needed | the SLM's plan is invalid, repeated failures, or high complexity (and a stronger model is configured) |
 
+Requests that split into sub-tasks are handled by a **team of subagents** that forms automatically
+(see [Teams](#teams-subagents-swarm-and-dispatch)); each agent picks its own mode, so a deterministic
+sub-task inside a team still costs no generative tokens.
+
 Mechanisms that cut tokens (all implemented and tested):
 
 - **Direct binding** — tools declare regex patterns with named groups; a request that binds
@@ -53,6 +57,45 @@ The TUI's **Tokens** view and the `ledger` on every task show actual generative 
 the full raw history on each step (formula in [`docs/evaluation.md`](docs/evaluation.md)). The
 baseline is a model, not a measurement — benchmark against a real agent before quoting a number.
 
+## Teams: subagents, swarm and dispatch
+
+No command is needed. When a request splits into sub-tasks, the runtime forms a team on its own:
+
+```
+read a.txt, b.txt and c.txt and summarize them          Find the latest PostgreSQL vulnerabilities, check whether my
+   ├─ c1 read a.txt   (researcher · direct · 0 tokens)   server is affected, and patch it if necessary
+   ├─ c2 read b.txt   (researcher · direct · 0 tokens)      c1 research  (researcher)  ──▶ upstream summary
+   ├─ c3 read c.txt   (researcher · direct · 0 tokens)      c2 check     (verifier)    ──▶ upstream summary
+   └─ join            (SLM · one call)                      c3 patch     (operator, approval-gated)
+```
+
+**What triggers it.** A deterministic *decomposer* proposes a split (clauses, comma lists, numbered items,
+"read a, b and c" enumerations, a trailing "…and summarize them" as the join). The decision layer then judges
+`assess_decomposition` — and says yes only when splitting helps: parallel model work, a fan-out whose agents need
+no model, or a pipeline that separates read-only from state-changing work. A request like *"read todo.md and tell
+me which tasks are open"* stays one task (one plan does it as well, without the handoff). The judgement is calibrated
+against how earlier splits turned out. Opt out per request (`/team off`, `delegate:false`) or server-wide (`DFAE_TEAM=off`).
+
+**Delegation is a plan step** (`kind: agent`), so the DAG executor, approvals, retries, verification and the
+UI all work on teams unchanged. A subagent is an ordinary child task running the same pipeline.
+
+| Mechanism | What it does |
+|---|---|
+| **Roles** | `researcher` (read-only), `operator` (may change state), `analyst` (reasoning only), `verifier` (read-only checks) — chosen from what the sub-task will actually do. A role's **tool scope** is enforced in selection, binding, skills *and* at execution. |
+| **Dispatcher** | Admission control for top-level tasks (`DFAE_MAX_CONCURRENT_TASKS`; a bounded queue, then load shedding) and **worker pools per role**. Default `operator=1`: agents that may change state never run concurrently; researchers fan out. |
+| **Handoff** | A dependent agent receives its predecessors' results as a compact `UPSTREAM` section — not the whole history. Independent agents run in parallel. |
+| **Budgets** | Each agent gets a *slice* of the coordinator's remaining model calls / tool calls / time; usage rolls up, so a team cannot overspend. Agents cannot spawn agents (depth 1), which also makes the pools deadlock-free by construction. |
+| **Supervision** | Failure isolation (siblings finish; the join is skipped; partial results are kept). The decision layer retries transient failures with a *fresh* agent, escalates to the stronger model, and never retries a policy denial. |
+| **Shared cache** | Agents of a team share read-only tool results (`fs_read`, `fs_list`, `fs_search`, `calc`); *any* side effect by any agent invalidates it, and a read that raced a write is never cached. |
+| **Security inheritance** | Taint, auto-approve and the policy engine are inherited — delegation is never a way around an approval. Approvals raised by an agent are answered on that agent. Cancelling the coordinator cancels every agent. |
+| **Accounting** | Agents' token ledgers roll up into the coordinator (the team's real cost) without double-counting globally; the baseline models *one* naive agent doing all the work. |
+| **Resume** | After a restart a coordinator adopts agents that had finished and marks unknown ones failed — it never silently re-runs work that may have had side effects. |
+
+**What teams buy you, honestly.** Parallelism, context isolation (each agent's prompt holds its own sub-goal and
+upstream summary), least privilege, and serialised side effects. Raw token savings appear when sub-goals replace
+*planned tool steps* with free deterministic agents (fan-out + join); a pipeline of model-only agents costs about
+what one plan would. The TUI **Team** view shows agents, roles, dependencies and the live worker pools.
+
 ## Architecture
 
 ```
@@ -73,7 +116,7 @@ baseline is a model, not a measurement — benchmark against a real agent before
 | `dfae-models` | OpenAI-compatible and Anthropic providers, tier gateway, JSON extraction + one repair retry |
 | `dfae-memory` | hash embedder · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
 | `dfae-tools` | registry · **policy engine** · 11 native tools · direct binder · calculator |
-| `dfae-runtime` | pipeline, planner/validator, DAG executor, approvals, recovery/replan, verification, skills, resume |
+| `dfae-runtime` | pipeline, planner/validator, DAG executor, approvals, recovery/replan, verification, skills, resume · **team: decomposer, roles, dispatcher, subagent supervision** |
 | `dfae-server` | REST + SSE API, bearer auth, Prometheus metrics |
 | `dfae-tui` | the `dfae` terminal client (also `dfae --ask "…"`) |
 | `services/gliner-service` | FastAPI wrapper around GLiNER (chunking, offsets, health) |
@@ -112,7 +155,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | Key | Action |
 |---|---|
 | `Enter` | submit the request |
-| `Tab` / `Shift+Tab` | Timeline · Plan · Cognition · Tokens · Memory · Tools |
+| `Tab` / `Shift+Tab` | Timeline · Plan · **Team** · Cognition · Tokens · Memory · Tools |
 | `↑`/`↓` | select task (empty input) or recall history |
 | `y` / `n` | approve / deny the pending approval |
 | `Ctrl+A` | jump to a task waiting for approval |
@@ -121,7 +164,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | `PgUp`/`PgDn`/`End` | scroll the timeline |
 | `F1` | help |
 
-Commands: `/mode`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/cancel`, `/autoapprove on`, `/quit`.
+Commands: `/mode`, `/team auto|on|off`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/cancel`, `/autoapprove on`, `/quit`.
 
 Things to try: `what is 12 * (3 + 4)?` · `list the files in ./ and what time is it` ·
 `write 'hello' to notes/hello.txt` (asks for approval) · `remember that the staging db is db-staging-01`
@@ -138,7 +181,7 @@ curl -N localhost:8080/v1/tasks/<id>/events   # SSE: replays history, then live
 
 `/health` (liveness) · `/v1/health` · `/v1/info` · `/v1/tasks` (POST/GET) · `/v1/tasks/{id}` ·
 `/v1/tasks/{id}/cancel` · `/v1/tasks/{id}/approvals/{aid}` · `/v1/tasks/{id}/events` ·
-`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
+`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/dispatch` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
 Set `DFAE_API_TOKEN` to require `Authorization: Bearer …` (everything except `/health`).
 
 ### Configuration
@@ -152,7 +195,10 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `STRONG_PROVIDER` / `STRONG_API_KEY` / `STRONG_MODEL` | optional escalation model (`anthropic` or `openai`-compatible) |
 | `DFAE_API_TOKEN` | bearer token for the API |
 | `DFAE_ALLOW_AUTO_APPROVE` | allow `auto_approve` requests (benchmarks only) |
-| `DFAE_MAX_STEPS`, `_MAX_MODEL_CALLS`, `_MAX_TOOL_CALLS`, `_MAX_REPLANS`, `_MAX_SECONDS` | per-task budgets |
+| `DFAE_MAX_STEPS`, `_MAX_MODEL_CALLS`, `_MAX_TOOL_CALLS`, `_MAX_REPLANS`, `_MAX_SECONDS`, `_MAX_CHILDREN` | per-task budgets |
+| `DFAE_TEAM` | `off` disables automatic delegation |
+| `DFAE_MAX_CONCURRENT_TASKS` / `DFAE_MAX_QUEUED_TASKS` | admission control: tasks running at once / waiting before load shedding (8 / 64) |
+| `DFAE_MAX_AGENTS` / `DFAE_ROLE_SLOTS` | subagents running at once (8) / per-role pools (`researcher=4,operator=1,analyst=4,verifier=2`) |
 
 Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `DATABASE_URL` is set), then
 `cargo run --release -p dfae-tui`. NVIDIA GPU for the SLM: add `-f compose.gpu.yaml`.
@@ -170,7 +216,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 100+ tests, hermetic
+cargo test --workspace                       # 150+ tests, hermetic
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -180,8 +226,10 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D` clean, 100+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 150+ unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
+| Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
+| Quality of automatic splits with a *real* SLM/Jev | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
 | Postgres store, audit chain | verified against PostgreSQL 16 (`real[]` fallback path) |
 | HTTP API + SSE + auth, TUI rendering and key handling | verified (integration tests; TUI also driven in a real terminal) |
 | GLiNER service with the real model, called by the Rust engine | verified manually (extraction of the blueprint example) |
@@ -193,7 +241,7 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 ### Not implemented (from the blueprint)
 
-MCP client/server, sub-agents and delegation, browser and microVM/WASM sandboxes (the container is
+MCP client/server, agent-to-agent messaging, nested teams (agents cannot spawn agents), task priorities / work stealing, browser and microVM/WASM sandboxes (the container is
 the isolation boundary), OpenTelemetry (Prometheus metrics, structured logs and the audit chain
 instead), distributed workers, trajectory export / fine-tuning pipeline, model-based embeddings
 (a deterministic hash embedder is used; the `Embedder` trait is the seam), multi-user authentication.
