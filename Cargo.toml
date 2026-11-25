@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/dfae-core",
+  "crates/dfae-decision",
+  "crates/dfae-extract",
+  "crates/dfae-models",
+  "crates/dfae-memory",
+  "crates/dfae-tools",
+  "crates/dfae-runtime",
+  "crates/dfae-server",
+  "crates/dfae-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+dfae-core = { path = "crates/dfae-core" }
+dfae-decision = { path = "crates/dfae-decision" }
+dfae-extract = { path = "crates/dfae-extract" }
+dfae-models = { path = "crates/dfae-models" }
+dfae-memory = { path = "crates/dfae-memory" }
+dfae-tools = { path = "crates/dfae-tools" }
+dfae-runtime = { path = "crates/dfae-runtime" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+parking_lot = "0.12"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"] }
+deadpool-postgres = "0.14"
+ratatui = "0.30"
+crossterm = "0.29"
+shlex = "2"
+toml = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+debug = 1

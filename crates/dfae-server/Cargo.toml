@@ -1,0 +1,32 @@
+[package]
+name = "dfae-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dfae-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+parking_lot = { workspace = true }
+dfae-runtime = { workspace = true }
+dfae-decision = { workspace = true }
+dfae-extract = { workspace = true }
+dfae-models = { workspace = true }
+dfae-memory = { workspace = true }
+dfae-tools = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio-stream = { workspace = true }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+[dev-dependencies]
+tempfile = "3"
+reqwest = { workspace = true }

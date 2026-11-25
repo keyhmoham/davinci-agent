@@ -1,0 +1,27 @@
+[package]
+name = "dfae-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dfae-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+parking_lot = { workspace = true }
+dfae-memory = { workspace = true }
+tokio-util = { workspace = true }
+reqwest = { workspace = true }
+shlex = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+futures-util = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+[dev-dependencies]
+tempfile = "3"
