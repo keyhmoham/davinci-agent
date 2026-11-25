@@ -399,7 +399,8 @@ impl Engine {
             totals.gliner_calls += l.gliner_calls;
             totals.cache_hits += l.cache_hits;
         }
-        totals.saved_tokens = totals.baseline_tokens.saturating_sub(totals.generative_tokens);
+        totals.external_tokens = totals.strong_tokens;
+        totals.saved_tokens = totals.baseline_tokens.saturating_sub(totals.external_tokens);
         totals.saved_pct = if totals.baseline_tokens > 0 { 100.0 * totals.saved_tokens as f32 / totals.baseline_tokens as f32 } else { 0.0 };
         s.totals = totals;
         s.memory = self.inner.store.stats().await.unwrap_or_default();
@@ -497,16 +498,27 @@ impl Inner {
     pub(crate) async fn remaining_budget(&self, ctx: &Arc<TaskCtx>) -> Budget {
         let r = ctx.rec.lock().await;
         let mut b = r.budget.clone();
-        b.max_model_calls = b.max_model_calls.saturating_sub(r.usage.model_calls);
+        // the plan gate asks "can the calls this plan needs be afforded?" of the tier that will make them
+        let tier = self.pick_tier(r.mode.unwrap_or(ExecMode::Assisted)).unwrap_or(Tier::Slm);
+        b.max_model_calls =
+            if tier == Tier::Strong { b.max_model_calls.saturating_sub(r.usage.model_calls) } else { b.max_local_calls.saturating_sub(r.usage.local_calls) };
         b
     }
 
-    pub(crate) async fn take_model_call(&self, ctx: &Arc<TaskCtx>, n: u32) -> Result<(), String> {
+    /// External calls are metered against the paid budget; local ones only against a runaway guard.
+    pub(crate) async fn take_model_call(&self, ctx: &Arc<TaskCtx>, tier: Tier, n: u32) -> Result<(), String> {
         let mut r = ctx.rec.lock().await;
-        if r.usage.model_calls + n > r.budget.max_model_calls {
-            return Err(format!("model-call budget exceeded ({} allowed)", r.budget.max_model_calls));
+        if tier == Tier::Strong {
+            if r.usage.model_calls + n > r.budget.max_model_calls {
+                return Err(format!("model-call budget exceeded ({} allowed)", r.budget.max_model_calls));
+            }
+            r.usage.model_calls += n;
+        } else {
+            if r.usage.local_calls + n > r.budget.max_local_calls {
+                return Err(format!("local model-call budget exceeded ({} allowed)", r.budget.max_local_calls));
+            }
+            r.usage.local_calls += n;
         }
-        r.usage.model_calls += n;
         Ok(())
     }
 
@@ -521,18 +533,18 @@ impl Inner {
 
     /// Generate text on a tier with budget + ledger accounting.
     pub(crate) async fn generate_text(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<String, String> {
-        self.take_model_call(ctx, 1).await?;
+        self.take_model_call(ctx, tier, 1).await?;
         let g: Generated = self.models.generate(tier, req).await.map_err(|e| e.to_string())?;
         self.add_ledger(ctx, g.entry.clone()).await;
         Ok(g.text)
     }
 
     pub(crate) async fn gen_json(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<Value, String> {
-        self.take_model_call(ctx, 1).await?;
+        self.take_model_call(ctx, tier, 1).await?;
         match self.models.generate_json(tier, req).await {
             Ok((v, calls)) => {
                 if calls.len() > 1 {
-                    self.take_model_call(ctx, (calls.len() - 1) as u32).await.ok();
+                    self.take_model_call(ctx, tier, (calls.len() - 1) as u32).await.ok();
                 }
                 for c in calls {
                     self.add_ledger(ctx, c.entry).await;
@@ -552,6 +564,11 @@ impl Inner {
         } else {
             None
         }
+    }
+
+    /// Would reasoning in this mode go to the external (paid) model? Self-hosted models are free.
+    pub(crate) fn is_external(&self, mode: ExecMode) -> bool {
+        self.pick_tier(mode) == Some(Tier::Strong)
     }
 
     pub(crate) fn gen_request(&self, tier: Tier, system: &str, user: String, purpose: &str) -> GenerationRequest {

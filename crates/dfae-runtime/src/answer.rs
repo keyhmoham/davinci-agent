@@ -5,6 +5,7 @@
 use crate::engine::{Inner, TaskCtx};
 use crate::prompts;
 use dfae_core::*;
+use dfae_models::Tier;
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
 
@@ -140,7 +141,8 @@ impl Inner {
             from_model = true;
             t
         } else if let Some(tier) = self.pick_tier(mode) {
-            let ev = evidence_block(&snapshot, 220);
+            // the paid model gets tight evidence; a self-hosted one gets what the steps produced
+            let ev = evidence_block(&snapshot, if tier == Tier::Strong { 220 } else { 800 });
             let user = format!("REQUEST: {goal}\nEVIDENCE:\n{ev}");
             match self.generate_text(ctx, tier, self.gen_request(tier, prompts::ANSWER_SYSTEM, user, "answer")).await {
                 Ok(t) => {

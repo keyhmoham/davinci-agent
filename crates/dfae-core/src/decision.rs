@@ -246,6 +246,9 @@ pub struct CompletionFacts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DecisionState {
     pub request: String,
+    /// The last few turns of the conversation (oldest first), so "now do the same for b.txt" can be judged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<EntityBrief>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

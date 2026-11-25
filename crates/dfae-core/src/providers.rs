@@ -116,4 +116,11 @@ pub const DEFAULT_LABELS: &[&str] = &[
     "action",
     "document",
     "risk",
+    "directory",
+    "programming language",
+    "command",
+    "date",
+    "city",
+    "number",
+    "email",
 ];

@@ -91,7 +91,8 @@ impl Inner {
         self.stage_retrieve(ctx, &goal, &entities, req.profile.unwrap_or_default(), &history).await;
 
         // ---- 3. route -------------------------------------------------------
-        let state = self.decision_state(&goal, &entities);
+        let mut state = self.decision_state(&goal, &entities);
+        state.recent = ctx.base_ctx.lock().turns.iter().map(|(q, a)| format!("user: {q} → assistant: {a}")).collect();
         let routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
         ctx.rec.lock().await.route = Some(routing.clone());
 
@@ -184,7 +185,7 @@ impl Inner {
             }
         }
         let mut plan = plan;
-        plan.estimate = Some(self.cost.estimate_plan(&plan));
+        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(mode)));
         ctx.rec.lock().await.plan = Some(plan.clone());
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
@@ -416,7 +417,7 @@ impl Inner {
         }
         self.emit(ctx, EventKind::Mode { mode, reason, skill_id: None }).await;
         let mut plan = planner::chat_plan(goal, gap);
-        plan.estimate = Some(self.cost.estimate_plan(&plan));
+        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(mode)));
         ctx.rec.lock().await.plan = Some(plan.clone());
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
@@ -453,9 +454,9 @@ impl Inner {
         let turns: Vec<(String, String)> = history
             .iter()
             .rev()
-            .take(4)
+            .take(8)
             .rev()
-            .map(|t| (tokens::truncate_tokens(&t.goal, 48), tokens::truncate_tokens(t.final_answer.as_deref().or(t.error.as_deref()).unwrap_or(""), 80)))
+            .map(|t| (tokens::truncate_tokens(&t.goal, 150), tokens::truncate_tokens(t.final_answer.as_deref().or(t.error.as_deref()).unwrap_or(""), 250)))
             .collect();
         let upstream = ctx
             .rec
@@ -474,7 +475,9 @@ impl Inner {
     }
 
     /// Context text for prompts (rebuilt from the current task state).
-    pub(crate) async fn context_text(&self, ctx: &Arc<TaskCtx>, include_observations: bool) -> String {
+    /// The context a model is given. A self-hosted model (free per token) always gets the fullest profile;
+    /// the external one the smallest that fits the task — unless the request pinned a profile.
+    pub(crate) async fn context_text(&self, ctx: &Arc<TaskCtx>, include_observations: bool, tier: Tier) -> String {
         let base = ctx.base_ctx.lock().clone();
         let r = ctx.rec.lock().await;
         let obs: Vec<(String, String)> = if include_observations {
@@ -496,10 +499,14 @@ impl Inner {
         } else {
             vec![]
         };
-        let profile = r.request.profile.unwrap_or(match r.route.as_ref().map(|x| x.complexity).unwrap_or(0.3) {
-            c if c >= 0.65 => ContextProfile::Reasoning,
-            c if c < 0.25 => ContextProfile::Minimal,
-            _ => ContextProfile::Standard,
+        let profile = r.request.profile.unwrap_or(if tier != Tier::Strong {
+            ContextProfile::Reasoning
+        } else {
+            match r.route.as_ref().map(|x| x.complexity).unwrap_or(0.3) {
+                c if c >= 0.65 => ContextProfile::Reasoning,
+                c if c < 0.25 => ContextProfile::Minimal,
+                _ => ContextProfile::Standard,
+            }
         });
         let pkg = build_context(&ContextInput {
             goal: &r.goal,
@@ -547,6 +554,10 @@ impl Inner {
         tstate.tools = self.scoped_briefs(ctx);
         let picked = self.note(ctx, self.decider.select_tools(tstate).await).await;
         let mut allowed: Vec<String> = picked.into_iter().map(|(n, _)| n).collect();
+        // every tool listed is prompt text: a paid model gets the six best, a self-hosted one all that were judged relevant
+        if self.pick_tier(mode) == Some(Tier::Strong) {
+            allowed.truncate(6);
+        }
         for c in calls.unwrap_or(&[]) {
             if !allowed.contains(&c.tool) {
                 allowed.push(c.tool.clone());
@@ -580,9 +591,15 @@ impl Inner {
         let mut used_mode = if tier == Tier::Strong { ExecMode::Escalated } else { mode };
         let mut last_err = String::new();
         for attempt in 0..2 {
-            let ctx_text = self.context_text(ctx, false).await;
-            let user = prompts::plan_user(&self.tools.signatures(&allowed), &ctx_text, budget.max_steps.min(12));
-            let mut req = self.gen_request(tier, prompts::PLAN_SYSTEM, user, if attempt == 0 { "plan" } else { "plan_escalated" });
+            let ctx_text = self.context_text(ctx, false, tier).await;
+            // a self-hosted model gets parameter help and worked examples; the paid one gets the leanest prompt
+            let (sigs, system) = if tier == Tier::Strong {
+                (self.tools.signatures(&allowed), prompts::PLAN_SYSTEM)
+            } else {
+                (self.tools.signatures_detailed(&allowed), prompts::PLAN_SYSTEM_LOCAL)
+            };
+            let user = prompts::plan_user(&sigs, &ctx_text, budget.max_steps.min(12));
+            let mut req = self.gen_request(tier, system, user, if attempt == 0 { "plan" } else { "plan_escalated" });
             req.json = true;
             let source = if tier == Tier::Strong { PlanSource::Strong } else { PlanSource::Slm };
             match self.try_plan(ctx, tier, req, goal, source, &allowed).await {

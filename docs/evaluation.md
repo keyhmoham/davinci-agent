@@ -10,6 +10,8 @@ estimator (`max(chars/4, words·4/3)`, deliberately slightly high). GLiNER calls
 
 * **generative tokens** = SLM + strong-model tokens — what an LLM bill is made of.
 * **decision tokens** = decision-model input+output tokens (a local model: compute, not a bill).
+* **external tokens** = strong-model input+output tokens: the only ones that cost anything. The saved percentage compares
+  *these* with the naive baseline (an agent that sends everything to an external model each step); SLM and decision tokens are reported but free.
 
 ## The baseline (an estimate, not a measurement)
 

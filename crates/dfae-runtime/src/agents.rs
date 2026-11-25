@@ -76,7 +76,7 @@ impl Inner {
         let dec = team::decompose(goal, entities, &|fragment| bind_direct(&metas, fragment, entities).is_some())?;
         let direct: Vec<bool> = dec.subgoals.iter().map(|s| bind_direct(&metas, &s.text, entities).is_some()).collect();
         let models_available = self.models.has(Tier::Slm) || self.models.has(Tier::Strong);
-        let facts = team::team_facts(&dec, &direct, models_available, &self.cost);
+        let facts = team::team_facts(&dec, &direct, models_available, &self.cost, self.is_external(ExecMode::Assisted));
         let confidence = if force {
             1.0
         } else {
@@ -88,7 +88,7 @@ impl Inner {
             return None;
         }
         let mut plan = team::plan_from_decomposition(goal, &dec, &direct);
-        plan.estimate = Some(self.cost.estimate_plan(&plan));
+        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(ExecMode::Assisted)));
         let budget = self.remaining_budget(ctx).await;
         if let Err(errs) = crate::planner::validate_plan(&plan.steps, &self.tools, &[], &budget) {
             self.emit(ctx, EventKind::Warning { message: format!("team plan rejected ({}); planning as one task", errs.join("; ")) }).await;
@@ -242,6 +242,7 @@ impl Inner {
             let reserve = if plan.steps.iter().any(|s| s.kind == StepKind::Reasoning && !s.status.is_done()) { 2 } else { 0 };
             let pending_agents = plan.steps.iter().filter(|s| s.kind == StepKind::Agent && !s.status.is_done() || s.id == step.id).count().max(1) as u32;
             let models_left = r.budget.max_model_calls.saturating_sub(r.usage.model_calls).saturating_sub(reserve);
+            let local_left = r.budget.max_local_calls.saturating_sub(r.usage.local_calls).saturating_sub(reserve);
             let tools_left = r.budget.max_tool_calls.saturating_sub(r.usage.tool_calls);
             let share = |left: u32| if left == 0 { 0 } else { (left / pending_agents).max(1) };
             let upstream: Vec<Upstream> = deps
@@ -255,6 +256,7 @@ impl Inner {
             let budget = Budget {
                 max_steps: r.budget.max_steps,
                 max_model_calls: share(models_left),
+                max_local_calls: share(local_left),
                 max_tool_calls: share(tools_left),
                 max_replans: r.budget.max_replans,
                 max_seconds: remaining_secs,
@@ -310,6 +312,7 @@ impl Inner {
         {
             let mut r = ctx.rec.lock().await;
             r.usage.model_calls += child.usage.model_calls;
+            r.usage.local_calls += child.usage.local_calls;
             r.usage.tool_calls += child.usage.tool_calls;
             for e in child.ledger.entries.iter().filter(|e| e.origin.is_none()) {
                 let mut e = e.clone();

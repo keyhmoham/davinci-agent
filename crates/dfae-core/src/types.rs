@@ -330,6 +330,9 @@ pub struct Plan {
 pub struct CostEstimate {
     pub model_calls: u32,
     pub tokens: u64,
+    /// The calls go to the external (paid) model; otherwise they run on a self-hosted one and are free.
+    #[serde(default)]
+    pub external: bool,
 }
 
 impl Plan {
@@ -403,7 +406,11 @@ pub struct Approval {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Budget {
     pub max_steps: u32,
+    /// Calls to the **external** (paid, strong) model. Local models cost nothing, so they are not limited by this.
     pub max_model_calls: u32,
+    /// Calls to the self-hosted small model: only a runaway guard.
+    #[serde(default = "default_max_local_calls")]
+    pub max_local_calls: u32,
     pub max_tool_calls: u32,
     pub max_replans: u32,
     pub max_seconds: u64,
@@ -416,16 +423,23 @@ fn default_max_children() -> u32 {
     8
 }
 
+fn default_max_local_calls() -> u32 {
+    200
+}
+
 impl Default for Budget {
     fn default() -> Self {
-        Self { max_steps: 30, max_model_calls: 10, max_tool_calls: 25, max_replans: 2, max_seconds: 600, max_children: 8 }
+        Self { max_steps: 30, max_model_calls: 10, max_local_calls: 200, max_tool_calls: 25, max_replans: 2, max_seconds: 600, max_children: 8 }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BudgetUsage {
+    /// External-model calls.
     pub model_calls: u32,
+    /// Self-hosted model calls.
+    pub local_calls: u32,
     pub tool_calls: u32,
     pub replans: u32,
     pub children: u32,

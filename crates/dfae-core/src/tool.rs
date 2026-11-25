@@ -92,6 +92,12 @@ impl ToolMetadata {
         format!("{}({}) {}", self.name, ps.join(", "), self.description)
     }
 
+    /// The signature plus what each parameter means: for self-hosted models, where extra prompt text costs nothing.
+    pub fn signature_detailed(&self) -> String {
+        let help: Vec<String> = self.params.iter().filter(|p| !p.description.trim().is_empty()).map(|p| format!("{}: {}", p.name, p.description)).collect();
+        if help.is_empty() { self.signature() } else { format!("{}\n   params — {}", self.signature(), help.join(" · ")) }
+    }
+
     /// Text used for lexical tool selection.
     pub fn search_text(&self) -> String {
         format!("{} {} {} {}", self.name.replace('_', " "), self.description, self.category, self.keywords.join(" "))

@@ -106,7 +106,13 @@ fn describe(e: &Event) -> Option<String> {
             "plan      {} steps ({:?}){}",
             plan.steps.len(),
             plan.source,
-            plan.estimate.map(|e| format!(" · est. {} model calls ≈ {} tok", e.model_calls, e.tokens)).unwrap_or_default()
+            plan.estimate
+                .map(|e| if e.external {
+                    format!(" · est. {} model calls ≈ {} external tok", e.model_calls, e.tokens)
+                } else {
+                    format!(" · est. {} local model calls (free)", e.model_calls)
+                })
+                .unwrap_or_default()
         ),
         EventKind::Repaired { step_id, note } => format!("repair    {step_id}: {note} (no model call)"),
         EventKind::TeamFormed { goals, reason } => format!("team      {} agents — {reason}", goals.iter().filter(|g| !g.synth).count()),

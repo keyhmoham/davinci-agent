@@ -78,9 +78,9 @@ impl CostModel {
     }
 
     /// Expected *remaining* cost of finishing `plan` (planning calls already made are not included).
-    pub fn estimate_plan(&self, plan: &Plan) -> CostEstimate {
+    pub fn estimate_plan(&self, plan: &Plan, external: bool) -> CostEstimate {
         if plan.source == PlanSource::Chat {
-            return CostEstimate { model_calls: 1, tokens: self.tokens("chat") };
+            return CostEstimate { model_calls: 1, tokens: self.tokens("chat"), external };
         }
         let own = plan_model_calls(&plan.steps);
         let reasoning = plan.steps.iter().filter(|s| s.kind == StepKind::Reasoning && !s.status.is_done()).count() as u64;
@@ -94,12 +94,16 @@ impl CostModel {
                 tokens += self.tokens("plan") + self.tokens("step");
             }
         }
-        CostEstimate { model_calls: calls, tokens }
+        CostEstimate { model_calls: calls, tokens, external }
     }
 
     /// Cost of doing `model_parts` model-needing sub-tasks (plus an optional join) as
     /// one plan versus as a team of agents: every agent pays for its own plan.
-    pub fn flat_vs_team(&self, model_parts: usize, has_join: bool) -> (u64, u64) {
+    pub fn flat_vs_team(&self, model_parts: usize, has_join: bool, external: bool) -> (u64, u64) {
+        // self-hosted models cost nothing, so splitting model work can never be "too expensive"
+        if !external {
+            return (0, 0);
+        }
         let (plan, step) = (self.tokens("plan"), self.tokens("step"));
         let n = model_parts as u64;
         let join = u64::from(has_join);
@@ -169,7 +173,7 @@ mod tests {
         let m = CostModel::new();
         let mut r = Step::reasoning("s1", "think");
         r.depends_on = vec![];
-        let e = m.estimate_plan(&plan(vec![r]));
+        let e = m.estimate_plan(&plan(vec![r]), true);
         assert_eq!((e.model_calls, e.tokens), (1, 150));
 
         let mut direct = Step::reasoning("c1", "read a");
@@ -177,14 +181,15 @@ mod tests {
         direct.args = json!({"direct": true});
         let mut model = Step::reasoning("c2", "explain");
         model.kind = StepKind::Agent;
-        let e = m.estimate_plan(&plan(vec![direct, model]));
+        let e = m.estimate_plan(&plan(vec![direct, model]), true);
         assert_eq!((e.model_calls, e.tokens), (2, 330 + 150), "a deterministic agent is free; a model agent pays plan + step");
 
         // splitting model work across agents costs extra planning calls: a team never wins on tokens alone
-        let (flat, team) = m.flat_vs_team(3, false);
+        let (flat, team) = m.flat_vs_team(3, false, true);
         assert_eq!((flat, team), (330 + 3 * 150, 3 * (330 + 150)));
         assert!(team > flat);
-        let (flat, team) = m.flat_vs_team(0, true);
+        let (flat, team) = m.flat_vs_team(0, true, true);
         assert!(team < flat, "a fan-out of free agents plus a join beats planning it as one task");
+        assert_eq!(m.flat_vs_team(3, true, false), (0, 0), "a self-hosted model is not billed, so a split is never penalised for its price");
     }
 }

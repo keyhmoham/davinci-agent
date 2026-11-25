@@ -46,6 +46,8 @@ pub struct Ledger {
 pub struct LedgerSummary {
     pub slm_tokens: u64,
     pub strong_tokens: u64,
+    /// Tokens sent to and from the **external** (paid) model: the only ones that cost anything.
+    pub external_tokens: u64,
     pub decision_tokens: u64,
     /// SLM + strong-model tokens (what an LLM bill would be made of).
     pub generative_tokens: u64,
@@ -99,8 +101,10 @@ impl Ledger {
             }
         }
         s.generative_tokens = s.slm_tokens + s.strong_tokens;
+        s.external_tokens = s.strong_tokens;
         s.baseline_tokens = self.baseline_tokens;
-        s.saved_tokens = s.baseline_tokens.saturating_sub(s.generative_tokens);
+        // the baseline is what a monolithic agent would have spent on an external model; self-hosted models are free
+        s.saved_tokens = s.baseline_tokens.saturating_sub(s.external_tokens);
         s.saved_pct = if s.baseline_tokens > 0 { 100.0 * s.saved_tokens as f32 / s.baseline_tokens as f32 } else { 0.0 };
         s
     }
@@ -150,9 +154,23 @@ mod tests {
             origin: None,
         });
         let s = l.summary();
-        assert_eq!(s.generative_tokens, 150);
-        assert_eq!(s.saved_tokens, 850);
-        assert!((s.saved_pct - 85.0).abs() < 0.01);
+        assert_eq!((s.generative_tokens, s.external_tokens), (150, 0), "a self-hosted model's tokens are not external");
+        assert_eq!(s.saved_tokens, 1000, "nothing was spent on an external model");
+        assert!((s.saved_pct - 100.0).abs() < 0.01);
+        l.record(LedgerEntry {
+            ts: Utc::now(),
+            component: Component::Strong,
+            model: "big".into(),
+            purpose: "plan".into(),
+            prompt_tokens: 200,
+            completion_tokens: 100,
+            latency_ms: 1,
+            cached: false,
+            origin: None,
+        });
+        let s = l.summary();
+        assert_eq!((s.external_tokens, s.saved_tokens), (300, 700));
+        assert!((s.saved_pct - 70.0).abs() < 0.01);
     }
 
     #[test]

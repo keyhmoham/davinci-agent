@@ -112,7 +112,7 @@ impl Inner {
                 steps_total: total,
                 checks_passed,
                 checks_failed,
-                evidence: answer::evidence_block(&rec, 60),
+                evidence: answer::evidence_block(&rec, 300), // the decision model is self-hosted: show it the evidence
             });
             Some(self.note(ctx, self.decider.assess_completion(st).await).await)
         } else {

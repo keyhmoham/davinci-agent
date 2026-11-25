@@ -151,13 +151,8 @@ impl Config {
                 api_key: env("DECISION_API_KEY"),
                 timeout_ms: env_parse("DECISION_TIMEOUT_MS", 15_000),
                 parallel: env_parse("DECISION_PARALLEL", 1),
-                // what the model adds most to; mode and plan checks are mostly hard rules, and the team-split
-                // decision is priced by the cost model, so they stay on the local rules
-                kinds: env_or("DECISION_KINDS", "route_task,select_tools,assess_recovery,assess_escalation,assess_completion")
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect(),
+                // the model is self-hosted and free per token, so it makes every decision; narrow it to save latency
+                kinds: env_or("DECISION_KINDS", "all").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             },
             slm: ModelConfig {
                 provider: slm_provider,
@@ -178,6 +173,7 @@ impl Config {
             budget: Budget {
                 max_steps: env_parse("DFAE_MAX_STEPS", 30),
                 max_model_calls: env_parse("DFAE_MAX_MODEL_CALLS", 12),
+                max_local_calls: env_parse("DFAE_MAX_LOCAL_CALLS", 200),
                 max_tool_calls: env_parse("DFAE_MAX_TOOL_CALLS", 25),
                 max_replans: env_parse("DFAE_MAX_REPLANS", 2),
                 max_seconds: env_parse("DFAE_MAX_SECONDS", 600),

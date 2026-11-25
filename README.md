@@ -21,13 +21,21 @@ docker compose run --rm tui      # the terminal UI
 
 ## Why it is cheap
 
+**What counts as cost.** Only the **external** model (`STRONG_*`, paid per token) is a cost. The decision model, GLiNER and the SLM
+are self-hosted: their tokens are free, so they are **never** starved to save tokens — they get the fullest context, parameter help and
+worked examples in their prompts, and the decision model sees every tool, the whole request and the recent conversation. Token
+optimisation (compact prompts, summaries, tool narrowing, the paid-call budget, the cost model) applies to calls that go to the
+external model. Budgets are split the same way: `DFAE_MAX_MODEL_CALLS` meters external calls, `DFAE_MAX_LOCAL_CALLS` (default 200)
+is only a runaway guard for self-hosted ones. The ledger's `external_tokens` is the number to watch; savings are measured against what a
+naive agent would have spent on an external model.
+
 Every request takes the cheapest path that can do the job:
 
 | Mode | Components | Generative tokens | Used when |
 |---|---|---|---|
-| **Direct** | decision model + code + tools | **0** | the request binds to tools deterministically ("what is 12*(3+4)", "list the files in ./ and what time is it", a replayed learned skill) |
-| **Assisted** | + SLM | planning + reasoning steps only | planning, writing, analysis, unusual arguments |
-| **Escalated** | + stronger model | as needed | the SLM's plan is invalid, repeated failures, or high complexity (and a stronger model is configured) |
+| **Direct** | decision model + code + tools | **0** external | the request binds to tools deterministically ("what is 12*(3+4)", "list the files in ./ and what time is it", a replayed learned skill) |
+| **Assisted** | + SLM | 0 external (SLM tokens are free); planning + reasoning steps only | planning, writing, analysis, unusual arguments |
+| **Escalated** | + stronger model | the only paid mode: lean prompts, a call budget | the SLM's plan is invalid, repeated failures, or high complexity (and a stronger model is configured) |
 
 Requests that split into sub-tasks are handled by a **team of subagents** that forms automatically
 (see [Teams](#teams-subagents-swarm-and-dispatch)); each agent picks its own mode, so a deterministic
@@ -38,12 +46,13 @@ Mechanisms that cut tokens (all implemented and tested):
 - **Direct binding** — tools declare regex patterns with named groups; a request that binds
   completely never reaches a model. Anything that smells like reasoning ("explain", "why", …)
   is refused by the binder and goes to the SLM.
-- **Tool narrowing** — the decision layer picks the relevant tools; the SLM prompt contains
-  only those signatures (`fs_read(path:str*, max_bytes:int) …`), not every schema. The plan is
+- **Tool narrowing** — the decision layer judges every tool; a plan prompt contains only the relevant signatures, not every schema (up to six
+  for the paid model, all judged relevant for a self-hosted one, which also gets parameter descriptions). The plan is
   *validated against that subset*, so it is also a security property.
-- **Compact, budgeted context** — entities, ranked + de-duplicated memories and observations
+- **Compact, budgeted context (external model)** — entities, ranked + de-duplicated memories and observations
   are packed into a profile-sized budget (`minimal` 450 / `standard` 1300 / `reasoning` 3200 tokens),
-  dropping the least important material first.
+  dropping the least important material first. A self-hosted model always gets the `reasoning` profile, step outputs up to ~900 tokens
+  (the paid model ~300), eight turns of conversation and worked planner examples.
 - **Observation compression** — tool output is redacted, de-duplicated and head/tail-elided
   before it re-enters a prompt; full output stays in state.
 - **No redundant calls** — a lone reasoning leaf *is* the answer (no synthesis call); decisions

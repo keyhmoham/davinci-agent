@@ -49,6 +49,15 @@ fn kind_str(k: ErrorKind) -> String {
     serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "other".into())
 }
 
+/// How much of a step's output is kept in its summary. Roomy: it is trimmed to the tier that reads it.
+const STEP_SUMMARY_TOKENS: usize = 900;
+
+/// How much of an earlier step's output goes into a prompt: the paid model gets a tight summary, a
+/// self-hosted model (free per token) gets nearly all of it.
+fn step_tokens(tier: Tier) -> usize {
+    if tier == Tier::Strong { 300 } else { STEP_SUMMARY_TOKENS }
+}
+
 impl Inner {
     pub(crate) async fn execute_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>) -> Result<(), String> {
         let sem = Arc::new(Semaphore::new(self.cfg.max_parallel.max(1)));
@@ -203,7 +212,7 @@ impl Inner {
             Ok(out) => {
                 let content = out.content;
                 let hits = dfae_core::safety::scan_injection(&content);
-                let mut summary = tokens::compress_text(&content, 300);
+                let mut summary = tokens::compress_text(&content, STEP_SUMMARY_TOKENS);
                 if !hits.is_empty() && step.kind == StepKind::Tool {
                     summary = format!("[flagged: possible prompt injection ({})] {summary}", hits.join(", "));
                     {
@@ -282,7 +291,8 @@ impl Inner {
             return self.run_chat_reply(ctx, step, mode).await;
         }
         let tier = self.pick_tier(mode).ok_or_else(|| StepFailure::new(ErrorKind::Policy, "no language model is configured for reasoning steps"))?;
-        let ctx_text = self.context_text(ctx, false).await;
+        let ctx_text = self.context_text(ctx, false, tier).await;
+        let cap = step_tokens(tier);
         // lazy context: short upstream summaries first; the model may ask for more (`NEED s1`)
         let lazy_on = self.cfg.economy.lazy_context && !deps.is_empty();
         let to_err = |e: String| StepFailure::new(if e.contains("budget") { ErrorKind::Policy } else { ErrorKind::Transient }, e);
@@ -292,7 +302,7 @@ impl Inner {
                     let body = if lazy_on {
                         if expand.contains(id) { tokens::compress_text(output, 600) } else { tokens::truncate_tokens(summary, 40) }
                     } else {
-                        summary.clone()
+                        tokens::truncate_tokens(summary, cap)
                     };
                     dfae_core::safety::wrap_untrusted(&format!("{id} {}", tool.as_deref().unwrap_or("reasoning")), &body)
                 })
@@ -336,7 +346,12 @@ impl Inner {
                 "no language model is configured, so I can only run tool requests (files, calculator, web search and pages…) — set SLM_BASE_URL or STRONG_API_KEY to chat",
             )
         })?;
-        let turns = ctx.base_ctx.lock().turns.clone();
+        // history for a self-hosted model is generous; for the paid one the last three turns, trimmed
+        let paid = tier == Tier::Strong;
+        let (keep, q_tok, a_tok) = if paid { (3, 48, 80) } else { (8, 150, 250) };
+        let all = ctx.base_ctx.lock().turns.clone();
+        let turns: Vec<(String, String)> =
+            all.iter().skip(all.len().saturating_sub(keep)).map(|(q, a)| (tokens::truncate_tokens(q, q_tok), tokens::truncate_tokens(a, a_tok))).collect();
         let gap = if step.description.contains("no tool fits") { "NOTE: no tool fits this request\n" } else { "" };
         let user = format!("CAN: {can}\n{gap}{goal}");
         let mut req = self.gen_request(tier, prompts::CHAT_SYSTEM, user, "chat");
@@ -349,7 +364,9 @@ impl Inner {
             }
         }
         req.messages.extend(current);
-        req.max_tokens = req.max_tokens.min(400); // conversational replies are short
+        if paid {
+            req.max_tokens = req.max_tokens.min(400); // a paid reply is kept short; a self-hosted one is not cut off
+        }
         let text = self.generate_text(ctx, tier, req).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?;
         let text = crate::style::compact(&text);
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
@@ -669,6 +686,7 @@ impl Inner {
             }
             a.clone()
         };
+        let done_tokens = if tier == Tier::Strong { 40 } else { 250 };
         let (done, kept_ids) = {
             let r = ctx.rec.lock().await;
             let plan = r.plan.as_ref().ok_or("no plan")?;
@@ -676,15 +694,23 @@ impl Inner {
                 .steps
                 .iter()
                 .filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped))
-                .map(|s| format!("{} {}: {}", s.id, s.tool.as_deref().unwrap_or("reasoning"), tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), 40)))
+                .map(|s| {
+                    format!(
+                        "{} {}: {}",
+                        s.id,
+                        s.tool.as_deref().unwrap_or("reasoning"),
+                        tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), done_tokens)
+                    )
+                })
                 .collect();
             let kept: Vec<String> =
                 plan.steps.iter().filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped)).map(|s| s.id.clone()).collect();
             (done.join("\n"), kept)
         };
         let prefix = format!("r{replans}_");
-        let ctx_text = self.context_text(ctx, false).await;
-        let user = prompts::replan_user(&self.tools.signatures(&allowed), &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
+        let ctx_text = self.context_text(ctx, false, tier).await;
+        let sigs = if tier == Tier::Strong { self.tools.signatures(&allowed) } else { self.tools.signatures_detailed(&allowed) };
+        let user = prompts::replan_user(&sigs, &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
         let mut req = self.gen_request(tier, prompts::REPLAN_SYSTEM, user, "replan");
         req.json = true;
         let v = self.gen_json(ctx, tier, req).await?;
