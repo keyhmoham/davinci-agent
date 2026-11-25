@@ -136,6 +136,19 @@ pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, regis
     Ok(steps)
 }
 
+/// Parse a *brief* plan (intents, no arguments): every step is marked `brief`, so the local system turns it into
+/// an action just before it runs. Arguments the planner did give are kept as pre-bound hints.
+pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, registry: &ToolRegistry) -> Result<Vec<Step>, String> {
+    let mut steps = parse_plan(v, goal, source, prefix, registry)?;
+    let arr = v.get("steps").and_then(|s| s.as_array()).ok_or("missing 'steps' array")?;
+    for (s, raw) in steps.iter_mut().zip(arr) {
+        s.brief = true;
+        s.expect = raw.get("expect").or_else(|| raw.get("success")).and_then(|e| e.as_str()).map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        s.strong = raw.get("strong").and_then(|b| b.as_bool()).unwrap_or(false);
+    }
+    Ok(steps)
+}
+
 /// Drop dependencies on steps that do not exist (a model's slip, e.g. `after: ["r1_2"]` with no such step).
 /// Data still flows only through `{{id}}` templates, which are checked when the step runs.
 pub fn prune_unknown_deps(steps: &mut [Step]) -> Vec<String> {
@@ -237,9 +250,12 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
                     if !allowed.iter().any(|a| a == name) {
                         errs.push(format!("step {}: tool '{name}' is not available for this task; use only: {}", s.id, allowed.join(", ")));
                     }
-                    // arguments that contain templates are validated at run time
+                    // arguments that contain templates are validated at run time; a brief step has none yet
                     let has_template = !template_refs(&s.args).is_empty();
-                    if !has_template && let Err(e) = m.validate_args(&s.args) {
+                    if !has_template
+                        && !s.brief
+                        && let Err(e) = m.validate_args(&s.args)
+                    {
                         errs.push(format!("step {} ({name}): {e}", s.id));
                     }
                 }

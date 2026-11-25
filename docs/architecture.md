@@ -30,6 +30,25 @@ No model owns control flow, permissions, or the claim that a task is done.
    answers are checked for ungrounded numbers/paths/URLs.
 10. **Learn** — calibration, episodic memory, validated fact promotion, skill crystallisation.
 
+## Planning and acting (`planner.rs`, `implement.rs`, `executor.rs::run_step`)
+
+Mode selection has one hard rule on top of the decision model's answer: with an external model available, a request that does not bind
+deterministically, matches no skill and has `complexity ≥ DFAE_EXTERNAL_MIN_COMPLEXITY` is `escalated` (a user's explicit mode wins).
+`escalated` now means *the external model plans, the local system acts*:
+
+* **Planning phase** (`stage_model_plan`, event `phase: planning`): `BRIEF_PLAN_SYSTEM` + one `name: description` line per tool; the reply is
+  parsed by `parse_brief_plan`: every step is `brief`, `expect`/`strong` are read, arguments the planner did give are kept as hints. Plan
+  validation skips argument checks for brief steps; the paid-call gate counts only reasoning the planner kept for itself (`Step::runs_local`).
+* **Acting phase** (event `phase: acting`): `run_step` calls `Inner::implement_step` for a brief step, which decides the action just in time:
+  entities (GLiNER + rules) from the step sentence → kind (the planner's tool; if none, a tool only when the sentence binds outright via
+  `bind_direct`) → arguments: planner hints, `bind_direct` on the sentence, entities that are *unambiguous* for a parameter (two candidate
+  paths are never guessed), then the ladder SLM, SLM, external model with the schema error fed back each time → validation (schema, `{{id}}` only
+  from this step's dependencies). The result is written back into the plan (`tool`, `args`, `how`) and the normal machinery runs it: policy,
+  contracts, repair, retries. A reasoning step is written by the SLM unless `strong`.
+* **Judging**: if the planner gave `expect`, the decision model's completion question is asked of the result; a "no" fails the step
+  (`other`), and the usual recovery decision (retry / repair / replan / skip) follows. Re-plans by the external model use `BRIEF_REPLAN_SYSTEM`.
+* **Reviewing** (event `phase: reviewing`): verification and, if the evidence says the request is not accomplished, one continuation plan.
+
 ## Conversation (`session.rs`, `pipeline.rs::run_chat`, `executor.rs::run_chat_reply`)
 
 Routing already says whether a request needs tools. If it does not (and nothing binds directly or matches a skill) — or if

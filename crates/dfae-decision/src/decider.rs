@@ -253,6 +253,17 @@ impl Decider {
                 reason = "no language model configured; using deterministic binding".into();
             }
         }
+        // medium and complex work is planned by the external model (and carried out by the local system)
+        if requested == ModeRequest::Auto
+            && mode != ExecMode::Escalated
+            && facts.strong_available
+            && !facts.direct_bindable
+            && facts.skill_score.is_none()
+            && facts.complexity >= self.thresholds.external_min_complexity
+        {
+            mode = ExecMode::Escalated;
+            reason = format!("medium or complex task (complexity {:.2}): the external model plans it, the local system carries it out", facts.complexity);
+        }
         if requested == ModeRequest::Auto && mode == ExecMode::Assisted && conf < self.thresholds.escalate_below && facts.strong_available {
             mode = ExecMode::Escalated;
             reason = format!("low confidence {conf:.2}; escalating");
@@ -348,6 +359,27 @@ mod tests {
         st.mode_facts = Some(ModeFacts { slm_available: true, strong_available: false, ..Default::default() });
         let m = d.select_mode(st, ModeRequest::Escalated).await.value;
         assert_eq!(m.mode, ExecMode::Assisted);
+    }
+
+    #[tokio::test]
+    async fn medium_and_complex_tasks_go_to_the_external_model_when_there_is_one() {
+        let d = decider();
+        let mode = |complexity: f32, direct: bool, strong: bool, requested: ModeRequest| {
+            let st = DecisionState {
+                request: "x".into(),
+                mode_facts: Some(ModeFacts { complexity, direct_bindable: direct, strong_available: strong, slm_available: true, ..Default::default() }),
+                ..Default::default()
+            };
+            let d = &d;
+            async move { d.select_mode(st, requested).await.value }
+        };
+        let m = mode(0.5, false, true, ModeRequest::Auto).await;
+        assert_eq!(m.mode, ExecMode::Escalated);
+        assert!(m.reason.contains("external model plans"), "{}", m.reason);
+        assert_eq!(mode(0.2, false, true, ModeRequest::Auto).await.mode, ExecMode::Assisted, "simple tasks stay local");
+        assert_eq!(mode(0.9, true, true, ModeRequest::Auto).await.mode, ExecMode::Direct, "what binds deterministically is never sent out");
+        assert_eq!(mode(0.9, false, false, ModeRequest::Auto).await.mode, ExecMode::Assisted, "no external model, no escalation");
+        assert_eq!(mode(0.9, false, true, ModeRequest::Assisted).await.mode, ExecMode::Assisted, "an explicit choice wins");
     }
 
     struct Failing;

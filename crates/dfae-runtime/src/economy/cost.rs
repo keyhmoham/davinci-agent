@@ -122,7 +122,8 @@ pub fn plan_model_calls(steps: &[Step]) -> u32 {
     if reasoning == 0 {
         return 0;
     }
-    let pending = steps.iter().filter(|s| s.kind == StepKind::Reasoning && !s.status.is_done()).count() as u32;
+    // reasoning the local system does (a brief plan's steps) is not a call to the budgeted model
+    let pending = steps.iter().filter(|s| s.kind == StepKind::Reasoning && !s.status.is_done() && !s.runs_local()).count() as u32;
     let leaves: Vec<&Step> = steps.iter().filter(|s| !steps.iter().any(|o| o.depends_on.contains(&s.id))).collect();
     let single_reasoning_leaf = leaves.len() == 1 && leaves[0].kind == StepKind::Reasoning;
     pending + u32::from(!single_reasoning_leaf)

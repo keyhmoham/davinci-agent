@@ -66,6 +66,9 @@ pub struct Thresholds {
     pub escalate_below: f32,
     /// Tool relevance threshold (probability) for including a tool.
     pub tool_min_relevance: f32,
+    /// From this complexity (0..1, from the decision model) a task is "medium" and is planned by the external
+    /// model when one is configured; below it the self-hosted models handle it alone. 2.0 turns this off.
+    pub external_min_complexity: f32,
 }
 
 /// Token-economy switches (the zero-cost mechanisms that save generative tokens).
@@ -184,6 +187,7 @@ impl Config {
                 skill_min_similarity: env_parse("DFAE_SKILL_MIN_SIM", 0.82),
                 escalate_below: env_parse("DFAE_ESCALATE_BELOW", 0.35),
                 tool_min_relevance: env_parse("DFAE_TOOL_MIN_REL", 0.5),
+                external_min_complexity: env_parse("DFAE_EXTERNAL_MIN_COMPLEXITY", 0.3),
             },
             economy: EconomyConfig {
                 repair: !matches!(env("DFAE_REPAIR").as_deref(), Some("off" | "false" | "0")),

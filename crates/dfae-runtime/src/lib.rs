@@ -11,6 +11,7 @@ mod dispatch;
 pub mod economy;
 mod engine;
 mod executor;
+mod implement;
 mod pipeline;
 pub mod planner;
 pub mod prompts;

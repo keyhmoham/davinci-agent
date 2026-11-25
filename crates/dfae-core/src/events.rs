@@ -94,6 +94,20 @@ pub enum EventKind {
     Ledger {
         summary: LedgerSummary,
     },
+    /// The task moved to another phase: `planning` (a planner writes the brief plan), `acting` (the local system
+    /// implements and runs each step), `reviewing` (the result is judged against the request).
+    Phase {
+        phase: String,
+        detail: String,
+    },
+    /// The local system turned a planner's intent into an action.
+    StepImplemented {
+        step_id: String,
+        /// `rules`, `rules+slm`, `rules+slm+strong`, `reasoning`, `plan` (the planner already gave valid arguments)…
+        how: String,
+        tool: Option<String>,
+        args: String,
+    },
     /// A step was repaired deterministically (no model call) and will be re-run.
     Repaired {
         step_id: String,

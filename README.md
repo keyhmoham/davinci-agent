@@ -21,6 +21,24 @@ docker compose run --rm tui      # the terminal UI
 
 ## Why it is cheap
 
+## Plan with the best model, act with the local ones
+
+With an external model configured (`STRONG_*`), the work of a medium or complex task is split into two phases that never mix:
+
+1. **Planning** — the external model writes a *brief plan*: a few steps, each an **intent** in one sentence (every concrete path, name, pattern
+   or text in it), an optional tool, the steps it depends on, and what the result must show (`expect`). It writes no tool arguments, so the paid
+   output stays short. It is used by default for every task the decision model rates medium or higher
+   (`DFAE_EXTERNAL_MIN_COMPLEXITY`, default 0.3) that does not bind deterministically — and for conversation of that complexity.
+2. **Acting** — the program drives the self-hosted triple, step by step, right before each step runs (so it sees the real results of earlier steps):
+   GLiNER and the rules read the sentence for paths, names and quoted text; the tools' own patterns and the entities bind what they can; the
+   decision model chooses the tool when the planner left it open and later judges the result against `expect`; the SLM fills in what is still
+   missing (and writes the reasoning steps); only if the SLM cannot, the external model is asked for the arguments. A step nothing can carry out
+   fails with a precise message and recovery takes over: retry, deterministic repair, then a **re-plan by the external model**. Every
+   implementation is recorded (`step_implemented` event, "done by" in the Plan tab: `rules`, `rules+slm`, `strong`, …).
+
+So the external model spends tokens on *thinking about the task* (plan, re-plans, the final answer, steps it flags `strong`), and the free,
+self-hosted components do the work. Below the threshold, or with no external model, the self-hosted models plan and act on their own as before.
+
 **What counts as cost.** Only the **external** model (`STRONG_*`, paid per token) is a cost. The decision model, GLiNER and the SLM
 are self-hosted: their tokens are free, so they are **never** starved to save tokens — they get the fullest context, parameter help and
 worked examples in their prompts, and the decision model sees every tool, the whole request and the recent conversation. Token
@@ -303,7 +321,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 220+ tests, hermetic
+cargo test --workspace                       # 230+ tests, hermetic
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -313,7 +331,7 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 220+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 230+ unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
 | Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |

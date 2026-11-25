@@ -15,7 +15,7 @@ use dfae_memory::{ContextInput, build_context, dedupe_memories, rank_memories};
 use dfae_models::Tier;
 use dfae_tools::{DirectCall, bind_direct};
 use futures_util::FutureExt;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
@@ -117,7 +117,9 @@ impl Inner {
 
         // ---- 4b. conversation: nothing to run, so nothing to plan ----------------------
         if !is_agent && calls.is_none() && skill.is_none() && !routing.needs_tools && req.mode == ModeRequest::Auto {
-            return self.run_chat(ctx, &goal, false).await;
+            // a conversational reply of medium or higher complexity is written by the external model too
+            let paid = self.models.has(Tier::Strong) && routing.complexity >= self.cfg.thresholds.external_min_complexity;
+            return self.run_chat(ctx, &goal, false, if paid { ExecMode::Escalated } else { ExecMode::Assisted }).await;
         }
 
         // ---- 5. mode ---------------------------------------------------------
@@ -185,7 +187,9 @@ impl Inner {
             }
         }
         let mut plan = plan;
-        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(mode)));
+        // a brief plan's remaining work is the local system's: free, apart from what the planner flagged
+        let any_brief = plan.steps.iter().any(|s| s.brief);
+        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(mode) && !any_brief));
         ctx.rec.lock().await.plan = Some(plan.clone());
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
@@ -196,11 +200,18 @@ impl Inner {
     /// execute → verify (+ at most one continuation) → answer. Shared by fresh
     /// runs and by tasks resumed after a restart.
     pub(crate) async fn execute_and_conclude(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, mode: ExecMode) -> Result<(), String> {
+        let phased = ctx.rec.lock().await.plan.as_ref().map(|p| p.steps.iter().any(|s| s.brief || s.how.is_some())).unwrap_or(false);
+        if phased {
+            self.emit(ctx, EventKind::Phase { phase: "acting".into(), detail: "the local system implements and runs each step of the plan".into() }).await;
+        }
         let mut exec_err = self.execute_plan(ctx).await.err();
         if self.is_cancelled(ctx).await {
             return Err("cancelled".into());
         }
         self.set_status(ctx, TaskStatus::Verifying).await;
+        if phased {
+            self.emit(ctx, EventKind::Phase { phase: "reviewing".into(), detail: "the result is judged against the request".into() }).await;
+        }
         let mut verification = self.stage_verify(ctx).await;
         let is_chat = ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false);
         if exec_err.is_none()
@@ -407,9 +418,12 @@ impl Inner {
     }
 
     /// A conversational turn: one reply, no planning. `gap` = a tool-shaped request no tool fits.
-    async fn run_chat(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, gap: bool) -> Result<(), String> {
-        let mode = ExecMode::Assisted;
-        let reason = "conversation: no tool needed, so no plan".to_string();
+    async fn run_chat(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, gap: bool, mode: ExecMode) -> Result<(), String> {
+        let reason = if mode == ExecMode::Escalated {
+            "conversation of medium or higher complexity: the external model answers".to_string()
+        } else {
+            "conversation: no tool needed, so no plan".to_string()
+        };
         {
             let mut r = ctx.rec.lock().await;
             r.mode = Some(mode);
@@ -593,8 +607,18 @@ impl Inner {
         for attempt in 0..2 {
             let ctx_text = self.context_text(ctx, false, tier).await;
             // a self-hosted model gets parameter help and worked examples; the paid one gets the leanest prompt
-            let (sigs, system) = if tier == Tier::Strong {
-                (self.tools.signatures(&allowed), prompts::PLAN_SYSTEM)
+            // planning phase: the external model writes a brief plan of intents (no arguments: the local system
+            // supplies them step by step); a self-hosted planner writes a concrete plan as before
+            let brief = tier == Tier::Strong;
+            if brief {
+                self.emit(
+                    ctx,
+                    EventKind::Phase { phase: "planning".into(), detail: "the external model writes a brief plan; the local system will carry it out".into() },
+                )
+                .await;
+            }
+            let (sigs, system) = if brief {
+                (self.tools.brief_lines(&allowed), prompts::BRIEF_PLAN_SYSTEM)
             } else {
                 (self.tools.signatures_detailed(&allowed), prompts::PLAN_SYSTEM_LOCAL)
             };
@@ -602,7 +626,7 @@ impl Inner {
             let mut req = self.gen_request(tier, system, user, if attempt == 0 { "plan" } else { "plan_escalated" });
             req.json = true;
             let source = if tier == Tier::Strong { PlanSource::Strong } else { PlanSource::Slm };
-            match self.try_plan(ctx, tier, req, goal, source, &allowed).await {
+            match self.try_plan(ctx, tier, req, goal, source, &allowed, brief).await {
                 Ok(steps) => {
                     let _ = entities;
                     return Ok((Plan { goal: goal.into(), steps, source, revision: 0, estimate: None }, used_mode));
@@ -634,10 +658,13 @@ impl Inner {
         goal: &str,
         source: PlanSource,
         allowed: &[String],
+        brief: bool,
     ) -> Result<Vec<Step>, String> {
+        let parse =
+            |v: &Value| if brief { planner::parse_brief_plan(v, goal, source, "", &self.tools) } else { planner::parse_plan(v, goal, source, "", &self.tools) };
         let v = self.gen_json(ctx, tier, req.clone()).await?;
         let _ = allowed; // the live list is ctx.allowed: admitting a tool below widens it
-        let problems = match planner::parse_plan(&v, goal, source, "", &self.tools) {
+        let problems = match parse(&v) {
             Ok(steps) => match self.finish_plan(ctx, steps, goal, true).await {
                 Ok(steps) => return Ok(steps),
                 Err(errs) => errs,
@@ -648,7 +675,7 @@ impl Inner {
         req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
         req.purpose = "plan_repair".into();
         let v2 = self.gen_json(ctx, tier, req).await?;
-        let steps = planner::parse_plan(&v2, goal, source, "", &self.tools)?;
+        let steps = parse(&v2)?;
         // the second attempt is judged on validity alone: a plan that is merely less ambitious is still a plan
         self.finish_plan(ctx, steps, goal, false).await.map_err(|e| e.join("; "))
     }

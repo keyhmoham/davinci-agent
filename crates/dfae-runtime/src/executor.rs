@@ -164,6 +164,19 @@ impl Inner {
         Ok(())
     }
 
+    /// Which model writes a reasoning step of a brief plan: the SLM, unless the planner wants the external one.
+    fn step_tier(&self, step: &Step) -> Option<Tier> {
+        if step.strong && self.models.has(Tier::Strong) {
+            Some(Tier::Strong)
+        } else if self.models.has(Tier::Slm) {
+            Some(Tier::Slm)
+        } else if self.models.has(Tier::Strong) {
+            Some(Tier::Strong)
+        } else {
+            None
+        }
+    }
+
     async fn run_step(self: &Arc<Self>, ctx: &Arc<TaskCtx>, id: &str) -> Result<(), StepFailure> {
         // mark running and snapshot what the step needs
         let (step, mode, tainted, deps) = {
@@ -202,10 +215,42 @@ impl Inner {
         )
         .await;
 
-        let result = match step.kind {
-            StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps).await,
-            StepKind::Tool => self.run_tool(ctx, &step, tainted, &deps).await,
-            StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
+        // ---- acting phase: a planner's intent becomes an action, now, with the results of earlier steps in hand ----
+        let mut step = step;
+        let prepared: Result<(), StepFailure> = if step.brief {
+            match self.implement_step(ctx, &step, &deps).await {
+                Ok(done) => {
+                    if let Some(s) = ctx.rec.lock().await.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                        s.kind = done.kind;
+                        s.tool = done.tool.clone();
+                        s.args = done.args.clone();
+                        s.brief = false;
+                        s.how = done.how.clone();
+                        s.approval_required = done.approval_required;
+                    }
+                    step = done;
+                    Ok(())
+                }
+                Err(f) => Err(f),
+            }
+        } else {
+            Ok(())
+        };
+        let result = match prepared {
+            Err(f) => Err(f),
+            Ok(()) => match step.kind {
+                StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps).await,
+                StepKind::Tool => self.run_tool(ctx, &step, tainted, &deps).await,
+                StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
+            },
+        };
+        // the planner said what success looks like: the decision model checks the result against it
+        let result = match result {
+            Ok(out) if step.how.is_some() && step.expect.is_some() => match self.judge_step(ctx, &step, &out.content).await {
+                Some(why) => Err(StepFailure::new(ErrorKind::Other, why)),
+                None => Ok(out),
+            },
+            other => other,
         };
 
         match result {
@@ -290,7 +335,9 @@ impl Inner {
         if ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false) {
             return self.run_chat_reply(ctx, step, mode).await;
         }
-        let tier = self.pick_tier(mode).ok_or_else(|| StepFailure::new(ErrorKind::Policy, "no language model is configured for reasoning steps"))?;
+        // steps of a brief plan are written by the self-hosted model unless the planner asked for the external one
+        let tier = if step.how.is_some() { self.step_tier(step) } else { self.pick_tier(mode) };
+        let tier = tier.ok_or_else(|| StepFailure::new(ErrorKind::Policy, "no language model is configured for reasoning steps"))?;
         let ctx_text = self.context_text(ctx, false, tier).await;
         let cap = step_tokens(tier);
         // lazy context: short upstream summaries first; the model may ask for more (`NEED s1`)
@@ -710,11 +757,18 @@ impl Inner {
         let prefix = format!("r{replans}_");
         let ctx_text = self.context_text(ctx, false, tier).await;
         let sigs = if tier == Tier::Strong { self.tools.signatures(&allowed) } else { self.tools.signatures_detailed(&allowed) };
+        // the external model re-plans in intents, as it planned; a self-hosted one in concrete steps
+        let brief = tier == Tier::Strong;
+        let sigs = if brief { self.tools.brief_lines(&allowed) } else { sigs };
         let user = prompts::replan_user(&sigs, &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
-        let mut req = self.gen_request(tier, prompts::REPLAN_SYSTEM, user, "replan");
+        let mut req = self.gen_request(tier, if brief { prompts::BRIEF_REPLAN_SYSTEM } else { prompts::REPLAN_SYSTEM }, user, "replan");
         req.json = true;
         let v = self.gen_json(ctx, tier, req).await?;
-        let new_steps = planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?;
+        let new_steps = if brief {
+            planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?
+        } else {
+            planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?
+        };
         if new_steps.is_empty() {
             return Ok(false);
         }

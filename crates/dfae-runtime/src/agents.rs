@@ -76,7 +76,11 @@ impl Inner {
         let dec = team::decompose(goal, entities, &|fragment| bind_direct(&metas, fragment, entities).is_some())?;
         let direct: Vec<bool> = dec.subgoals.iter().map(|s| bind_direct(&metas, &s.text, entities).is_some()).collect();
         let models_available = self.models.has(Tier::Slm) || self.models.has(Tier::Strong);
-        let facts = team::team_facts(&dec, &direct, models_available, &self.cost, self.is_external(ExecMode::Assisted));
+        // agents of a medium or complex request are planned by the external model, each paying for its own plan
+        let complexity = ctx.rec.lock().await.route.as_ref().map(|r| r.complexity).unwrap_or(0.0);
+        let external_work =
+            self.is_external(ExecMode::Assisted) || (self.models.has(Tier::Strong) && complexity >= self.cfg.thresholds.external_min_complexity);
+        let facts = team::team_facts(&dec, &direct, models_available, &self.cost, external_work);
         let confidence = if force {
             1.0
         } else {
@@ -88,7 +92,7 @@ impl Inner {
             return None;
         }
         let mut plan = team::plan_from_decomposition(goal, &dec, &direct);
-        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(ExecMode::Assisted)));
+        plan.estimate = Some(self.cost.estimate_plan(&plan, external_work));
         let budget = self.remaining_budget(ctx).await;
         if let Err(errs) = crate::planner::validate_plan(&plan.steps, &self.tools, &[], &budget) {
             self.emit(ctx, EventKind::Warning { message: format!("team plan rejected ({}); planning as one task", errs.join("; ")) }).await;

@@ -388,6 +388,10 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             EventKind::Repaired { step_id, note } => {
                 push(badge("repair", OK), format!("{step_id}: {note} · fixed in code, no model call"), Style::new().fg(OK))
             }
+            EventKind::Phase { phase, detail } => push(badge(phase, VIOLET), detail.clone(), Style::new().fg(VIOLET).bold()),
+            EventKind::StepImplemented { step_id, how, tool, args } => {
+                push(badge("act", OK), format!("{step_id} → {} {args} · by {how}", tool.as_deref().unwrap_or("reasoning")), Style::new().fg(OK))
+            }
             EventKind::Queued { position } => push(badge("queued", WARN), format!("waiting for a free slot (position {position})"), Style::new().fg(WARN)),
             EventKind::TeamFormed { goals, reason } => {
                 push(badge("team", ACCENT), reason.clone(), Style::new().fg(ACCENT).bold());
@@ -674,7 +678,14 @@ fn draw_plan(f: &mut Frame, area: Rect, app: &App) {
                         StepKind::Reasoning => VIOLET,
                     }),
                 )),
-                Cell::from(if s.kind == StepKind::Agent { trunc(&one_line(&s.description), 40) } else { trunc(&one_line(&args_brief(&s.args)), 40) }),
+                Cell::from(if s.brief {
+                    // an intent: the local system has not decided how to carry it out yet
+                    format!("▸ {}", trunc(&one_line(&s.description), 38))
+                } else if s.kind == StepKind::Agent || (s.kind == StepKind::Reasoning && s.how.is_some()) {
+                    trunc(&one_line(&s.description), 40)
+                } else {
+                    trunc(&one_line(&args_brief(&s.args)), 40)
+                }),
                 Cell::from(s.depends_on.join(",")),
                 Cell::from(if s.attempts > 1 { format!("×{}", s.attempts) } else { String::new() }),
                 Cell::from(dur),
@@ -714,6 +725,18 @@ fn draw_plan(f: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(vec![label("step "), Span::styled(s.id.clone(), Style::new().bold()), label("  "), Span::raw(trunc(&s.description, 80))]));
         if s.kind == StepKind::Tool {
             lines.push(Line::from(vec![label("args "), Span::raw(trunc(&s.args.to_string(), 120))]));
+        }
+        if let Some(how) = &s.how {
+            lines.push(Line::from(vec![
+                label("done by "),
+                Span::styled(how.clone(), Style::new().fg(OK)),
+                label("  (planner wrote the intent; this is how the local system carried it out)"),
+            ]));
+        } else if s.brief {
+            lines.push(Line::from(vec![label("intent "), Span::styled("not implemented yet: decided right before the step runs", Style::new().fg(WARN))]));
+        }
+        if let Some(e) = &s.expect {
+            lines.push(Line::from(vec![label("expects "), Span::raw(trunc(e, 100))]));
         }
         if !s.checks.is_empty() {
             lines.push(Line::from(vec![label("checks "), Span::raw(s.checks.iter().map(|c| c.describe()).collect::<Vec<_>>().join("; "))]));

@@ -37,11 +37,19 @@ fn coerce(ty: ParamType, v: &Value) -> Option<Value> {
     }
 }
 
+/// The value a parameter takes from the request's entities — only when there is exactly one candidate:
+/// with two file paths in the sentence ("copy a.txt to b.txt") which one is which is a question for a model, not a guess.
 fn entity_value(p: &ParamSpec, goal: &str, entities: &[Entity]) -> Option<Value> {
-    p.entity_hints
-        .iter()
-        .find_map(|h| entities.iter().find(|e| &e.label == h && goal.contains(e.text.as_str())))
-        .and_then(|e| coerce(p.ty, &json!(e.text)).or_else(|| Some(json!(e.text))))
+    let mut candidates: Vec<&Entity> = Vec::new();
+    for e in entities.iter().filter(|e| p.entity_hints.iter().any(|h| h == &e.label) && goal.contains(e.text.as_str())) {
+        if !candidates.iter().any(|c| c.text == e.text) {
+            candidates.push(e);
+        }
+    }
+    match candidates.as_slice() {
+        [e] => coerce(p.ty, &json!(e.text)).or_else(|| Some(json!(e.text))),
+        _ => None,
+    }
 }
 
 /// Make `args` satisfy `meta`'s schema if that can be done without guessing.
@@ -81,6 +89,23 @@ pub fn fix_args(meta: &ToolMetadata, args: &Value, goal: &str, entities: &[Entit
     }
     let fixed = Value::Object(obj);
     (meta.validate_args(&fixed).is_ok() && !notes.is_empty()).then(|| Fix { args: fixed, note: notes.join("; ") })
+}
+
+/// Fill the *required* parameters that the sentence and its entities supply, even when the arguments stay
+/// incomplete (`fix_args` only answers when the result is valid). Returns the arguments and whether anything was added.
+pub fn fill_partial(meta: &ToolMetadata, args: &Value, goal: &str, entities: &[Entity]) -> (Value, bool) {
+    let mut obj: Map<String, Value> = args.as_object().cloned().unwrap_or_default();
+    let mut added = false;
+    for p in meta.params.iter().filter(|p| p.required) {
+        if obj.get(&p.name).map(|v| !v.is_null()).unwrap_or(false) {
+            continue;
+        }
+        if let Some(v) = entity_value(p, goal, entities) {
+            obj.insert(p.name.clone(), v);
+            added = true;
+        }
+    }
+    (Value::Object(obj), added)
 }
 
 /// If a path argument does not exist but exactly one file or directory of that
