@@ -29,6 +29,13 @@ use std::sync::Arc;
 
 type Dep = (String, Option<String>, String, String);
 
+/// The most common of several candidate argument sets (ties go to the earliest).
+fn majority(candidates: Vec<Map<String, Value>>) -> Option<Map<String, Value>> {
+    let keyed: Vec<String> = candidates.iter().map(|c| Value::Object(c.clone()).to_string()).collect();
+    let best = (0..candidates.len()).max_by_key(|&i| (keyed.iter().filter(|k| **k == keyed[i]).count(), std::cmp::Reverse(i)))?;
+    candidates.into_iter().nth(best)
+}
+
 fn object(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
@@ -106,6 +113,7 @@ impl Inner {
         deps: &[Dep],
         problem: Option<&str>,
         rejected: bool,
+        temperature: f32,
     ) -> Result<Map<String, Value>, String> {
         let paid = tier == Tier::Strong;
         let ents = entities
@@ -121,6 +129,9 @@ impl Inner {
         let user = prompts::bind_user(&sig, &step.description, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
         let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
         req.json = true;
+        req.temperature = temperature;
+        // a self-hosted server can be told the exact shape: wrong parameter names and types become impossible
+        req.schema = Some(meta.args_schema());
         if paid {
             req.max_tokens = req.max_tokens.min(400);
         }
@@ -242,28 +253,43 @@ impl Inner {
             }
             let mut satisfied = false;
             let mut rejected = feedback.is_some(); // the first ask says what is missing; later ones say what was wrong with the answer
-            for tier in ladder {
-                match self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected).await {
-                    Ok(got) => {
-                        let mut merged = args.clone();
-                        // the model's values replace rule guesses only where the rules had nothing valid
-                        for (k, v) in got {
-                            merged.entry(k).or_insert(v);
-                        }
-                        if let Some(f) = repair::fix_args(&meta, &Value::Object(merged.clone()), &step.description, &entities) {
-                            merged = object(&f.args);
-                        }
-                        match valid(&merged) {
-                            Ok(()) => {
-                                args = merged;
-                                how.push(if tier == Tier::Strong { "strong" } else { "slm" });
-                                satisfied = true;
-                                break;
+            for (rung, tier) in ladder.into_iter().enumerate() {
+                // A second self-hosted try is a vote: three samples, and the answer most of the valid ones agree on wins.
+                // Self-hosted tokens are free, and one wrong sample no longer decides the step.
+                let samples = if tier == Tier::Slm && rung == 1 { 3 } else { 1 };
+                let temperature = if samples > 1 { 0.5 } else { 0.1 };
+                let asks = (0..samples).map(|_| self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected, temperature));
+                let mut candidates: Vec<Map<String, Value>> = Vec::new();
+                for reply in futures_util::future::join_all(asks).await {
+                    match reply {
+                        Ok(got) => {
+                            let mut merged = args.clone();
+                            // the model's values replace rule guesses only where the rules had nothing valid
+                            for (k, v) in got {
+                                merged.entry(k).or_insert(v);
                             }
-                            Err(e) => problem = Some(e),
+                            if let Some(f) = repair::fix_args(&meta, &Value::Object(merged.clone()), &step.description, &entities) {
+                                merged = object(&f.args);
+                            }
+                            match valid(&merged) {
+                                Ok(()) => candidates.push(merged),
+                                Err(e) => problem = Some(e),
+                            }
                         }
+                        Err(e) => problem = Some(e),
                     }
-                    Err(e) => problem = Some(e),
+                }
+                if let Some(best) = majority(candidates) {
+                    args = best;
+                    how.push(if tier == Tier::Strong {
+                        "strong"
+                    } else if samples > 1 {
+                        "slm-vote"
+                    } else {
+                        "slm"
+                    });
+                    satisfied = true;
+                    break;
                 }
                 rejected = true;
             }
@@ -339,5 +365,24 @@ impl Inner {
         });
         let p = self.note(ctx, self.decider.judge_step(st).await).await;
         (p < 0.35).then(|| format!("the result does not meet the expectation \"{expect}\" (decision model: {p:.2})"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn m(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn the_answer_most_samples_agree_on_wins_and_ties_go_to_the_first() {
+        let a = m(json!({"path": "a.txt"}));
+        let b = m(json!({"path": "b.txt"}));
+        assert_eq!(majority(vec![a.clone(), b.clone(), b.clone()]), Some(b.clone()));
+        assert_eq!(majority(vec![a.clone(), b]), Some(a));
+        assert_eq!(majority(vec![]), None);
     }
 }

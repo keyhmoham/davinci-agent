@@ -406,3 +406,46 @@ async fn a_file_cut_off_by_the_token_limit_is_caught_by_a_parser_and_rewritten_l
     assert!(binds.len() >= 2 && binds[1].contains("malformed") && binds[1].contains("invalid JSON"), "{binds:?}");
     assert_eq!(r.strong.calls(), 1, "no re-plan: a parser error is the local model's to fix");
 }
+
+#[tokio::test]
+async fn work_the_external_model_plans_is_one_plan_not_a_team_of_planners() {
+    let r = rig(false, |c| c.thresholds.external_min_complexity = 0.01);
+    r.strong.push(
+        &json!({"steps": [
+            {"id": "s1", "do": "explain what a mutex is in two sentences", "tool": null},
+            {"id": "s2", "do": "explain what a semaphore is in two sentences", "tool": null}
+        ]})
+        .to_string(),
+    );
+    r.slm.push("A mutex is a lock.");
+    r.slm.push("A semaphore counts permits.");
+    r.slm.push("A mutex is a lock; a semaphore counts permits.");
+    // delegation is left on (the default): the decomposition exists, but each agent would pay for a plan of its own
+    let id = r.engine.submit(TaskRequest { goal: "Explain what a mutex is, and explain what a semaphore is".into(), ..Default::default() }).await.unwrap();
+    let t = r.engine.wait(&id, Duration::from_secs(30)).await.unwrap();
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(t.team.is_none(), "no team: {:?}", t.team);
+    assert_eq!(r.strong.calls(), 1, "one planner call for the whole request");
+}
+
+#[tokio::test]
+async fn a_reasoning_step_that_misses_its_expectation_is_rewritten_locally_before_the_planner_hears_of_it() {
+    let r = rig(true, |_| {});
+    std::fs::write(r.ws.path().join("brief.txt"), "A small coffee roaster that sells beans by subscription.").unwrap();
+    r.strong.push(
+        &json!({"steps": [
+            {"id": "s1", "do": "read brief.txt", "tool": "fs_read"},
+            {"id": "s2", "do": "come up with a short product tagline from the brief", "tool": null, "after": ["s1"], "expect": "a tagline"}
+        ]})
+        .to_string(),
+    );
+    r.slm.push("BAD tagline: coffee");
+    r.slm.push("Roasted slow, poured fast.");
+    let t = run_as(&r, ModeRequest::Escalated, "Read brief.txt and come up with a short product tagline from it").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(t.final_answer.as_deref().unwrap().contains("Roasted slow"), "{:?}", t.final_answer);
+    let steps: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "step").map(|q| q.messages[0].content.clone()).collect();
+    assert_eq!(steps.len(), 2, "the step was written twice");
+    assert!(steps[1].contains("PREVIOUS ANSWER WAS REJECTED"), "{}", steps[1]);
+    assert_eq!(r.strong.calls(), 1, "the planner was not bothered");
+}

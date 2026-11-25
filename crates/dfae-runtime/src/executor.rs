@@ -49,6 +49,9 @@ fn kind_str(k: ErrorKind) -> String {
     serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "other".into())
 }
 
+/// Outputs shorter than this are summarised mechanically: reading them locally would save the external model nothing.
+const CONDENSE_MIN_TOKENS: usize = 1500;
+
 /// How much of a step's output is kept in its summary. Roomy: it is trimmed to the tier that reads it.
 const STEP_SUMMARY_TOKENS: usize = 900;
 
@@ -281,7 +284,7 @@ impl Inner {
         let result = match prepared {
             Err(f) => Err(f),
             Ok(()) => match step.kind {
-                StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps).await,
+                StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps, None).await,
                 StepKind::Tool => self.run_tool(ctx, &step, tainted, &deps).await,
                 StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
             },
@@ -317,7 +320,21 @@ impl Inner {
         // look at the plan again, now knowing what was found.
         let result = match result {
             Ok(mut out) if step.how.is_some() && step.expect.is_some() => {
-                if let Some(why) = self.judge_step(ctx, &step, &out.content).await {
+                let mut verdict = self.judge_step(ctx, &step, &out.content).await;
+                // a self-hosted model that wrote the step gets one chance to put it right, told what was wrong, before the
+                // external planner hears of it
+                if let Some(why) = verdict.clone()
+                    && step.kind == StepKind::Reasoning
+                    && self.step_tier(&step) == Some(Tier::Slm)
+                    && let Ok(second) = self.run_reasoning(ctx, &step, mode, &deps, Some(&why)).await
+                {
+                    let again = self.judge_step(ctx, &step, &second.content).await;
+                    if again.is_none() {
+                        out = second;
+                    }
+                    verdict = again;
+                }
+                if let Some(why) = verdict {
                     let problem = format!(
                         "step {id} ({}) finished, but its result does not meet what was expected: \"{}\" ({why}). Its result was: {}. Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
                         tokens::truncate_tokens(&step.description, 30),
@@ -338,6 +355,9 @@ impl Inner {
                 let content = out.content;
                 let hits = dfae_core::safety::scan_injection(&content);
                 let mut summary = tokens::compress_text(&content, STEP_SUMMARY_TOKENS);
+                if let Some(c) = self.condense(ctx, &step, &content).await {
+                    summary = c;
+                }
                 if !hits.is_empty() && step.kind == StepKind::Tool {
                     summary = format!("[flagged: possible prompt injection ({})] {summary}", hits.join(", "));
                     {
@@ -411,6 +431,7 @@ impl Inner {
         step: &Step,
         mode: ExecMode,
         deps: &[(String, Option<String>, String, String)],
+        feedback: Option<&str>,
     ) -> Result<StepOutput, StepFailure> {
         if ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false) {
             return self.run_chat_reply(ctx, step, mode).await;
@@ -440,6 +461,9 @@ impl Inner {
         let mut user = format!("STEP: {}\n{ctx_text}\nINPUTS:\n{}", step.description, render(&[]));
         if lazy_on {
             user.push_str(&economy::lazy::need_instruction(&ids));
+        }
+        if let Some(f) = feedback {
+            user.push_str(&format!("\nYOUR PREVIOUS ANSWER WAS REJECTED: {f}\nWrite it again so that it meets the expectation."));
         }
         let mut text = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step")).await.map_err(to_err)?;
         let mut evidence = Vec::new();
@@ -622,6 +646,27 @@ impl Inner {
             }
         }
         Ok(StepOutput { content, evidence })
+    }
+
+    /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the external model
+    /// reads this instead of a mechanical cut of the first lines. Kept only if it states nothing the output lacks.
+    async fn condense(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> Option<String> {
+        if !self.cfg.economy.condense || step.kind != StepKind::Tool || !self.models.has(Tier::Slm) || tokens::estimate_tokens(content) < CONDENSE_MIN_TOKENS {
+            return None;
+        }
+        let goal = ctx.rec.lock().await.goal.clone();
+        let user = format!(
+            "TASK: {}\nSTEP: {}\n{}",
+            tokens::truncate_tokens(&goal, 80),
+            tokens::truncate_tokens(&step.description, 40),
+            dfae_core::safety::wrap_untrusted(step.tool.as_deref().unwrap_or("output"), &tokens::truncate_tokens(content, 6000))
+        );
+        let mut req = self.gen_request(Tier::Slm, prompts::CONDENSE_SYSTEM, user, "condense");
+        req.max_tokens = req.max_tokens.min(500);
+        let text = self.generate_text(ctx, Tier::Slm, req).await.ok()?;
+        let text = text.trim().to_string();
+        let grounded = crate::answer::ungrounded_claims(&text, content, "").is_empty();
+        (grounded && !text.is_empty() && tokens::estimate_tokens(&text) < tokens::estimate_tokens(content) / 2).then(|| format!("[condensed] {text}"))
     }
 
     /// Suspend the step until a human approves *this exact action*.

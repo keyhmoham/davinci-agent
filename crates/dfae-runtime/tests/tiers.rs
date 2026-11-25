@@ -20,11 +20,16 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    rig_with(false)
+}
+
+fn rig_with(condense: bool) -> Rig {
     let ws = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
     cfg.economy.plan_prefix_always = true;
+    cfg.economy.condense = condense;
     let store = Arc::new(InMemoryStore::new());
     let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf()));
     let mut reg = ToolRegistry::new();
@@ -116,4 +121,24 @@ async fn self_hosted_calls_do_not_count_against_the_paid_budget() {
     let s = t.ledger.summary();
     assert_eq!(s.external_tokens, 0);
     assert_eq!(s.saved_tokens, s.baseline_tokens, "only external tokens are spent against the naive baseline");
+}
+
+#[tokio::test]
+async fn a_big_output_is_read_locally_and_the_external_model_gets_what_matters() {
+    let r = rig_with(true);
+    big_file(&r);
+    r.strong.push(&brief("big.log"));
+    // the self-hosted model condenses the 600-line log for the planner's later steps
+    r.slm.push("line number 3 of the log with some words in it");
+    r.strong.push("done");
+    let t = run(&r, "Read big.log and summarise it", ModeRequest::Escalated).await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let step = t.plan.as_ref().unwrap().step("s1").unwrap().clone();
+    assert!(step.summary.as_deref().unwrap().starts_with("[condensed]"), "{:?}", step.summary);
+    assert!(r.slm.requests.lock().iter().any(|q| q.purpose == "condense"));
+    // the paid reasoning step read the condensed text, not 600 lines
+    let paid = r.strong.requests.lock().iter().find(|q| q.purpose == "step").unwrap().messages[0].content.clone();
+    assert!(paid.matches("line number").count() <= 2, "{paid}");
+    // and a made-up number would have been refused: an answer that invents values is not a summary
+    assert_eq!(t.ledger.summary().slm_calls, 1);
 }

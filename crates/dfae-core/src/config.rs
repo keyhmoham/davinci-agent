@@ -97,6 +97,9 @@ pub struct EconomyConfig {
     pub answer_local_first: bool,
     /// The plan prompt shows what the workspace contains, so the planner does not spend steps exploring it.
     pub workspace_snapshot: bool,
+    /// A big tool output is condensed by the self-hosted model into what matters for the task before the external
+    /// model reads it (`DFAE_CONDENSE=off` keeps the mechanical summary).
+    pub condense: bool,
 }
 
 /// Team orchestration and dispatch limits.
@@ -215,6 +218,7 @@ impl Config {
                 plan_report: matches!(env("DFAE_PLAN_REPORT").as_deref(), Some("on" | "true" | "1")),
                 answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
                 workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
+                condense: !matches!(env("DFAE_CONDENSE").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),

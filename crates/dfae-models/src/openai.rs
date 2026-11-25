@@ -11,6 +11,8 @@ pub struct OpenAiCompat {
     key: Option<String>,
     name: String,
     caches: bool,
+    /// Cleared the first time the server rejects `response_format: json_schema`: later calls ask for plain JSON.
+    schema_ok: std::sync::atomic::AtomicBool,
 }
 
 impl OpenAiCompat {
@@ -19,7 +21,7 @@ impl OpenAiCompat {
         // OpenAI's own API caches a repeated prompt prefix by itself; other servers say so with `STRONG_PROMPT_CACHE=on`.
         // Self-hosted ones are free anyway, and a request that is billed in full is no loss there.
         let caches = base.contains("api.openai.com");
-        Self { http, base: base.trim_end_matches('/').to_string(), model: model.into(), key, name: format!("openai:{model}"), caches }
+        Self { http, base: base.trim_end_matches('/').to_string(), model: model.into(), key, name: format!("openai:{model}"), caches, schema_ok: true.into() }
     }
 
     /// Declare whether this server bills a repeated prompt prefix at a fraction.
@@ -51,9 +53,10 @@ impl LanguageModel for OpenAiCompat {
             "temperature": req.temperature,
             "stream": false,
         });
-        if let Some(schema) = &req.schema {
+        let schema = req.schema.as_ref().filter(|_| self.schema_ok.load(std::sync::atomic::Ordering::Relaxed));
+        if let Some(schema) = schema {
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "reply", "strict": false, "schema": schema}});
-        } else if req.json {
+        } else if req.json || req.schema.is_some() {
             body["response_format"] = json!({"type": "json_object"});
         }
         let mut last = String::new();
@@ -74,9 +77,9 @@ impl LanguageModel for OpenAiCompat {
             };
             let status = resp.status();
             if !status.is_success() {
-                let body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
-                last = format!("HTTP {status}: {body}");
-                if status == reqwest::StatusCode::NOT_FOUND && body.contains("not found") {
+                let err_body: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
+                last = format!("HTTP {status}: {err_body}");
+                if status == reqwest::StatusCode::NOT_FOUND && err_body.contains("not found") {
                     last.push_str(&format!(
                         " — the model server does not have '{}'. With the bundled Ollama it may still be downloading or the pull failed: \
                          `docker compose logs -f ollama-pull` (retry: `docker compose run --rm ollama-pull`)",
@@ -84,6 +87,12 @@ impl LanguageModel for OpenAiCompat {
                     ));
                 }
                 if is_retryable(status) {
+                    continue;
+                }
+                // a server that does not know json_schema is asked for plain JSON from now on, and this call is repeated
+                if status == reqwest::StatusCode::BAD_REQUEST && schema.is_some() {
+                    self.schema_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                    body["response_format"] = json!({"type": "json_object"});
                     continue;
                 }
                 return Err(ModelError::Request(last));
