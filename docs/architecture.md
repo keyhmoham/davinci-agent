@@ -45,8 +45,8 @@ Mode selection has one hard rule on top of the decision model's answer: with an 
 deterministically, matches no skill and has `complexity ≥ DFAE_EXTERNAL_MIN_COMPLEXITY` is `escalated` (a user's explicit mode wins).
 `escalated` now means *the external model plans, the local system acts*:
 
-* **Planning phase** (`stage_model_plan`, event `phase: planning`): `BRIEF_PLAN_SYSTEM` + one `name: description` line per tool; the reply is
-  parsed by `parse_brief_plan`: every step is `brief`, `expect`/`strong` are read, arguments the planner did give are kept as hints. Plan
+* **Planning phase** (`stage_model_plan`, event `phase: planning`): the brief-plan prompt (see *The cost of planning* below); the reply is
+  parsed by `parse_line_plan` / `parse_brief_plan`: every step is `brief`, `expect`/`strong` are read, arguments the planner did give are kept as hints. Plan
   validation skips argument checks for brief steps; the paid-call gate counts only reasoning the planner kept for itself (`Step::runs_local`).
 * **Acting phase** (event `phase: acting`): `run_step` calls `Inner::implement_step` for a brief step, which decides the action just in time:
   entities (GLiNER + rules) from the step sentence → kind (the planner's tool; if none, a tool only when the sentence binds outright via
@@ -55,8 +55,41 @@ deterministically, matches no skill and has `complexity ≥ DFAE_EXTERNAL_MIN_CO
   from this step's dependencies). The result is written back into the plan (`tool`, `args`, `how`) and the normal machinery runs it: policy,
   contracts, repair, retries. A reasoning step is written by the SLM unless `strong`.
 * **Judging**: if the planner gave `expect`, the decision model's completion question is asked of the result; a "no" fails the step
-  (`other`), and the usual recovery decision (retry / repair / replan / skip) follows. Re-plans by the external model use `BRIEF_REPLAN_SYSTEM`.
+  (`other`), and the usual recovery decision (retry / repair / replan / skip) follows. Re-plans by the external model use the same system prompt as planning (the re-plan rules are in the message).
 * **Reviewing** (event `phase: reviewing`): verification and, if the evidence says the request is not accomplished, one continuation plan.
+
+### The cost of planning (`prompts.rs`, `pipeline.rs::brief_request`, `economy/prefix.rs`)
+
+* **Format**: the external planner writes *plan lines* (`s2 fs_write after=s1: write site/index.html …` with an optional indented `expect:`
+  line) — about a third fewer output tokens than JSON (36 % on the benchmark plans), and no syntax to get wrong. `planner::parse_line_plan` turns them into the same JSON
+  shape; a reply that is JSON anyway is accepted. `DFAE_PLAN_FORMAT=json` restores JSON.
+* **Cacheable prefix**: when the provider caches prompts and traffic keeps the cache warm, the system prompt is rules + the *whole* tool
+  catalogue (sorted, with parameter names) + worked examples — byte-identical from task to task and shared by planning and re-planning
+  (what a re-plan needs is in its user message). The per-task part is a shortlist (`LIKELY TOOLS:`), the context and the workspace line.
+  Otherwise the narrow per-task tool list is sent, as before.
+* **Answers**: a reasoning leaf is the answer; otherwise the *self-hosted* model writes it from the evidence and `ungrounded_claims` checks
+  that every number, path, URL and code span in it occurs in the evidence — only a failed check is escalated to the external model. A plan of
+  tool steps only (no prose in it) gets the same local composition. `DFAE_PLAN_REPORT=on` additionally lets the planner pre-write the reply.
+* **What the planner is told**: a one-line workspace snapshot (two levels, capped), the condensed form of big outputs, a lesson from an
+  earlier similar task, and for a re-plan the step's actual result (`step s1 (…) found: … — this does not meet what was expected`).
+
+### Checking what was done (`planner::expect_checks`, `syntax.rs`, `implement.rs::judge_step`)
+
+`expect` is natural language for the decision model, but the parts code can read are checked by code first (`FileExists`, `FileContains`,
+`Contains`, exit status). If every clause was understood the checks *are* the verdict; otherwise the decision model still judges. After a
+write, the file is parsed by type; a malformed file is rewritten by the local model with the parser's complaint (`implement_step(…, feedback)`),
+and only if that fails does recovery (retry, repair, re-plan) take over. A local reasoning step that misses its expectation is rewritten once
+with the reason before the checkpoint goes to the planner.
+
+### Learning (`pipeline.rs::{learn, apply_feedback, shadow_evaluate}`)
+
+* skills made from an external plan keep intents (`Skill.intent`) and match only the same request shape;
+* a task that revised its plan and then succeeded stores `Lesson: for "…": <what went wrong> — what worked: <steps>`;
+* the decision model also answers whether a message judges the previous result (`feedback`: negative / positive); a negative verdict counts
+  against the calibration of the decisions behind it and the skill that produced it, and leaves a lesson;
+* `DFAE_DECISION_LOG=path` appends every decision with its eventual outcome (`completed`, `failed`, `rejected_by_user`, `confirmed_by_user`) as
+  JSONL — the data to evaluate or fine-tune the decision model; `DFAE_SHADOW_EVAL=0.05` also puts 5 % of the routing questions to the external
+  model and logs agreement (off by default: it spends external tokens).
 
 ## Conversation (`session.rs`, `pipeline.rs::run_chat`, `executor.rs::run_chat_reply`)
 

@@ -29,6 +29,13 @@ use std::sync::Arc;
 
 type Dep = (String, Option<String>, String, String);
 
+/// The most common of several candidate argument sets (ties go to the earliest).
+fn majority(candidates: Vec<Map<String, Value>>) -> Option<Map<String, Value>> {
+    let keyed: Vec<String> = candidates.iter().map(|c| Value::Object(c.clone()).to_string()).collect();
+    let best = (0..candidates.len()).max_by_key(|&i| (keyed.iter().filter(|k| **k == keyed[i]).count(), std::cmp::Reverse(i)))?;
+    candidates.into_iter().nth(best)
+}
+
 fn object(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
@@ -61,6 +68,7 @@ impl Inner {
                         purpose: "extract_step".into(),
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        cached_tokens: 0,
                         latency_ms: res.latency_ms,
                         cached: res.cached,
                         origin: None,
@@ -105,6 +113,7 @@ impl Inner {
         deps: &[Dep],
         problem: Option<&str>,
         rejected: bool,
+        temperature: f32,
     ) -> Result<Map<String, Value>, String> {
         let paid = tier == Tier::Strong;
         let ents = entities
@@ -120,6 +129,9 @@ impl Inner {
         let user = prompts::bind_user(&sig, &step.description, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
         let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
         req.json = true;
+        req.temperature = temperature;
+        // a self-hosted server can be told the exact shape: wrong parameter names and types become impossible
+        req.schema = Some(meta.args_schema());
         if paid {
             req.max_tokens = req.max_tokens.min(400);
         }
@@ -130,7 +142,10 @@ impl Inner {
     }
 
     /// Decide what a brief step becomes and bind its arguments. Returns the concrete step.
-    pub(crate) async fn implement_step(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, deps: &[Dep]) -> Result<Step, StepFailure> {
+    ///
+    /// `feedback` is set when a previous implementation of this step ran and its result was unusable (the file it wrote
+    /// does not parse): the generated parts are produced again by a model, told what was wrong.
+    pub(crate) async fn implement_step(self: &Arc<Self>, ctx: &Arc<TaskCtx>, step: &Step, deps: &[Dep], feedback: Option<&str>) -> Result<Step, StepFailure> {
         let fail = |kind: ErrorKind, m: String| StepFailure { kind, message: m };
         let allowed = ctx.allowed.lock().clone();
         let scoped: Vec<ToolMetadata> = self.scoped_metas(ctx).into_iter().filter(|m| allowed.contains(&m.name)).collect();
@@ -164,6 +179,11 @@ impl Inner {
 
         // ---- arguments: the planner's, then rules, then entities --------------------
         let mut args = object(&step.args);
+        if feedback.is_some() {
+            for k in ["content", "new_string", "text", "body"] {
+                args.remove(k);
+            }
+        }
         let planned = !args.is_empty();
         if let Some(d) = &direct_args {
             fill(&mut args, d);
@@ -196,6 +216,13 @@ impl Inner {
         }
         let valid = |a: &Map<String, Value>| -> Result<(), String> {
             meta.validate_args(&Value::Object(a.clone()))?;
+            let bad = planner::malformed_placeholders(&Value::Object(a.clone()));
+            if !bad.is_empty() {
+                return Err(format!(
+                    "{} is not a value: write the real text, or {{{{<step id>}}}} / {{{{prev_code}}}} to use an earlier result",
+                    bad.join(", ")
+                ));
+            }
             // a `{{id}}` template may only name a step this one depends on
             for r in planner::template_refs(&Value::Object(a.clone())) {
                 if !step.depends_on.contains(&r) && !crate::session::ARTIFACT_NAMES.contains(&r.as_str()) {
@@ -210,7 +237,7 @@ impl Inner {
             }
         } else {
             // ---- the models: the SLM first, the external model only if the SLM cannot ----
-            let mut problem = valid(&args).err();
+            let mut problem = feedback.map(str::to_string).or_else(|| valid(&args).err());
             let mut ladder: Vec<Tier> = Vec::new();
             if self.models.has(Tier::Slm) {
                 ladder.extend([Tier::Slm, Tier::Slm]);
@@ -225,29 +252,44 @@ impl Inner {
                 ));
             }
             let mut satisfied = false;
-            let mut rejected = false; // the first ask says what is missing; later ones say what was wrong with the answer
-            for tier in ladder {
-                match self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected).await {
-                    Ok(got) => {
-                        let mut merged = args.clone();
-                        // the model's values replace rule guesses only where the rules had nothing valid
-                        for (k, v) in got {
-                            merged.entry(k).or_insert(v);
-                        }
-                        if let Some(f) = repair::fix_args(&meta, &Value::Object(merged.clone()), &step.description, &entities) {
-                            merged = object(&f.args);
-                        }
-                        match valid(&merged) {
-                            Ok(()) => {
-                                args = merged;
-                                how.push(if tier == Tier::Strong { "strong" } else { "slm" });
-                                satisfied = true;
-                                break;
+            let mut rejected = feedback.is_some(); // the first ask says what is missing; later ones say what was wrong with the answer
+            for (rung, tier) in ladder.into_iter().enumerate() {
+                // A second self-hosted try is a vote: three samples, and the answer most of the valid ones agree on wins.
+                // Self-hosted tokens are free, and one wrong sample no longer decides the step.
+                let samples = if tier == Tier::Slm && rung == 1 { 3 } else { 1 };
+                let temperature = if samples > 1 { 0.5 } else { 0.1 };
+                let asks = (0..samples).map(|_| self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected, temperature));
+                let mut candidates: Vec<Map<String, Value>> = Vec::new();
+                for reply in futures_util::future::join_all(asks).await {
+                    match reply {
+                        Ok(got) => {
+                            let mut merged = args.clone();
+                            // the model's values replace rule guesses only where the rules had nothing valid
+                            for (k, v) in got {
+                                merged.entry(k).or_insert(v);
                             }
-                            Err(e) => problem = Some(e),
+                            if let Some(f) = repair::fix_args(&meta, &Value::Object(merged.clone()), &step.description, &entities) {
+                                merged = object(&f.args);
+                            }
+                            match valid(&merged) {
+                                Ok(()) => candidates.push(merged),
+                                Err(e) => problem = Some(e),
+                            }
                         }
+                        Err(e) => problem = Some(e),
                     }
-                    Err(e) => problem = Some(e),
+                }
+                if let Some(best) = majority(candidates) {
+                    args = best;
+                    how.push(if tier == Tier::Strong {
+                        "strong"
+                    } else if samples > 1 {
+                        "slm-vote"
+                    } else {
+                        "slm"
+                    });
+                    satisfied = true;
+                    break;
                 }
                 rejected = true;
             }
@@ -277,9 +319,40 @@ impl Inner {
         Ok(done)
     }
 
+    /// A planner says "index.html exists" for a step that wrote `site/index.html`: the file it named exists under the
+    /// path the step used, so the expectation holds.
+    fn satisfied_by_arguments(&self, c: &Check, step: &Step) -> bool {
+        let Check::FileExists { path } = c else { return false };
+        let want = path.trim_start_matches("./").trim_end_matches('/');
+        let mut texts = Vec::new();
+        if let Some(m) = step.args.as_object() {
+            texts.extend(m.values().filter_map(|v| v.as_str()));
+        }
+        texts.iter().any(|t| {
+            let t = t.trim_start_matches("./").trim_end_matches('/');
+            (t.ends_with(&format!("/{want}")) || want.ends_with(&format!("/{t}")) || t == want)
+                && self.policy.guard().read_path(t).map(|p| p.exists()).unwrap_or(false)
+        })
+    }
+
     /// Did a step's result meet what the planner expected of it? `Some(reason)` if the decision model says no.
     pub(crate) async fn judge_step(&self, ctx: &Arc<TaskCtx>, step: &Step, output: &str) -> Option<String> {
         let expect = step.expect.as_deref()?;
+        // what code can check, code checks: facts about files and output need no model, and a model must not overrule them
+        let (checks, understood) = crate::planner::expect_checks(expect);
+        let mut missed: Vec<String> = Vec::new();
+        for c in &checks {
+            let (pass, ev) = self.eval_check(c, output);
+            if !pass && !self.satisfied_by_arguments(c, step) {
+                missed.push(format!("{} ({ev})", c.describe()));
+            }
+        }
+        if !missed.is_empty() {
+            return Some(format!("not met: {}", missed.join("; ")));
+        }
+        if understood {
+            return None;
+        }
         let entities = ctx.rec.lock().await.entities.clone();
         let mut st = self.decision_state(&format!("STEP: {}\nEXPECTATION: {expect}", step.description), &entities);
         st.completion_facts = Some(CompletionFacts {
@@ -292,5 +365,24 @@ impl Inner {
         });
         let p = self.note(ctx, self.decider.judge_step(st).await).await;
         (p < 0.35).then(|| format!("the result does not meet the expectation \"{expect}\" (decision model: {p:.2})"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn m(v: Value) -> Map<String, Value> {
+        v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn the_answer_most_samples_agree_on_wins_and_ties_go_to_the_first() {
+        let a = m(json!({"path": "a.txt"}));
+        let b = m(json!({"path": "b.txt"}));
+        assert_eq!(majority(vec![a.clone(), b.clone(), b.clone()]), Some(b.clone()));
+        assert_eq!(majority(vec![a.clone(), b]), Some(a));
+        assert_eq!(majority(vec![]), None);
     }
 }

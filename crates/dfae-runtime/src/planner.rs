@@ -30,6 +30,34 @@ pub fn template_refs(v: &Value) -> Vec<String> {
     out
 }
 
+static ANY_BRACES: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{([^{}]*)\}\}").unwrap());
+
+/// `{{…}}` in string values that is not a reference the system can resolve (`{{s1}}`, `{{prev_code}}`): a small model's
+/// invented placeholder such as `{{ENT.location}}`, which would otherwise be written literally into a file.
+pub fn malformed_placeholders(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => {
+                for c in ANY_BRACES.captures_iter(s) {
+                    let inner = c[1].trim();
+                    let ident = !inner.is_empty()
+                        && inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+                        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if !ident {
+                        out.push(c[0].to_string());
+                    }
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+            Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+            _ => {}
+        }
+    }
+    walk(v, &mut out);
+    out
+}
+
 /// Substitute `{{id}}` templates using `lookup`.
 pub fn substitute(v: &Value, lookup: &dyn Fn(&str) -> Option<String>) -> Value {
     match v {
@@ -51,7 +79,7 @@ pub fn plan_from_calls(goal: &str, calls: &[DirectCall]) -> Plan {
         }
         steps.push(s);
     }
-    Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None }
+    Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None, report: None }
 }
 
 /// Tools a planner needs next to `tool` to use it properly.
@@ -72,7 +100,7 @@ pub fn companions(tool: &str) -> &'static [&'static str] {
 /// needs a capability none of the tools has, so the reply says so honestly.
 pub fn chat_plan(goal: &str, gap: bool) -> Plan {
     let desc = if gap { "reply; no tool fits this request" } else { "reply" };
-    Plan { goal: goal.into(), steps: vec![Step::reasoning("s1", desc)], source: PlanSource::Chat, revision: 0, estimate: None }
+    Plan { goal: goal.into(), steps: vec![Step::reasoning("s1", desc)], source: PlanSource::Chat, revision: 0, estimate: None, report: None }
 }
 
 /// Parse a model-produced plan. `prefix` is prepended to every new step id
@@ -83,14 +111,20 @@ pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, regis
     let strip = |id: &str| -> String { if prefix.is_empty() { id.to_string() } else { id.strip_prefix(prefix).unwrap_or(id).to_string() } };
     let raw_ids: Vec<String> =
         arr.iter().enumerate().map(|(i, s)| s.get("id").and_then(|x| x.as_str()).map(&strip).unwrap_or_else(|| format!("s{}", i + 1))).collect();
-    let new_ids: HashSet<&String> = raw_ids.iter().collect();
+    // A re-plan's steps are numbered in order (`r1_1`, `r1_2`…) whatever ids the model wrote, so a model that repeats an
+    // id or mixes `s2` with `r1_s2` can never produce duplicates. References resolve to the first step of that name.
+    let new_ids: Vec<String> = raw_ids.iter().enumerate().map(|(i, raw)| if prefix.is_empty() { raw.clone() } else { format!("{prefix}{}", i + 1) }).collect();
+    let mut by_raw: HashMap<&str, &String> = HashMap::new();
+    for (raw, new) in raw_ids.iter().zip(&new_ids) {
+        by_raw.entry(raw.as_str()).or_insert(new);
+    }
     let rename = |id: &str| -> String {
         let bare = strip(id);
-        if new_ids.contains(&bare) { format!("{prefix}{bare}") } else { id.to_string() }
+        by_raw.get(bare.as_str()).map(|n| (*n).clone()).unwrap_or_else(|| id.to_string())
     };
     let mut steps = Vec::new();
     for (i, s) in arr.iter().enumerate() {
-        let id = format!("{prefix}{}", raw_ids[i]);
+        let id = new_ids[i].clone();
         let tool = s.get("tool").and_then(|t| t.as_str()).map(str::trim).filter(|t| !t.is_empty() && *t != "null" && *t != "none");
         let desc = s.get("do").or_else(|| s.get("description")).or_else(|| s.get("action")).and_then(|d| d.as_str()).unwrap_or("").to_string();
         let args = s.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -147,6 +181,275 @@ pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str,
         s.strong = raw.get("strong").and_then(|b| b.as_bool()).unwrap_or(false);
     }
     Ok(steps)
+}
+
+static LINE_STEP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?P<id>[A-Za-z][A-Za-z0-9_]*)[.)]?\s+\[?(?P<tool>[A-Za-z_][A-Za-z0-9_]*|-)\]?(?P<meta>(?:\s+(?:after=[A-Za-z0-9_,]*|strong))*)\s*:\s*(?P<do>.*)$",
+    )
+    .unwrap()
+});
+
+/// Parse the compact line format of a brief plan into the same JSON shape `parse_brief_plan` reads:
+///
+/// ```text
+/// s1 fs_mkdir: create the directory site
+/// s2 fs_write after=s1: write site/index.html, a page that says hello
+///   expect: site/index.html exists
+/// s3 - after=s2 strong: summarise what was built
+/// report: The page is in site/index.html.
+/// ```
+///
+/// A model that answers in JSON anyway is accepted as is. Roughly a quarter of the output tokens of the JSON form.
+pub fn parse_line_plan(text: &str) -> Result<Value, String> {
+    if let Some(v) = dfae_models::extract_json(text)
+        && v.get("steps").is_some()
+    {
+        return Ok(v);
+    }
+    let mut steps: Vec<Value> = Vec::new();
+    let mut report: Option<String> = None;
+    let mut in_report = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        // a model may bullet its lines
+        let t = line.trim().trim_start_matches(['-', '*', '•']).trim_start();
+        if t.is_empty() || t.starts_with("```") {
+            continue;
+        }
+        if in_report {
+            report = report.map(|r| format!("{r}\n{t}"));
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("report:") {
+            let at = t.len() - rest.len();
+            report = Some(t[at..].trim().to_string());
+            in_report = true;
+            continue;
+        }
+        let indented = line.starts_with(char::is_whitespace) && !LINE_STEP.is_match(t);
+        if indented || lower.starts_with("expect:") {
+            let Some(last) = steps.last_mut() else { continue };
+            if let Some(rest) = lower.strip_prefix("expect:") {
+                last["expect"] = Value::String(t[t.len() - rest.len()..].trim().to_string());
+            } else if let Some(d) = last["do"].as_str() {
+                // a long sentence the model wrapped
+                last["do"] = Value::String(format!("{d} {t}"));
+            }
+            continue;
+        }
+        if let Some(c) = LINE_STEP.captures(t) {
+            let mut after: Vec<String> = Vec::new();
+            let mut strong = false;
+            for part in c["meta"].split_whitespace() {
+                if let Some(ids) = part.strip_prefix("after=") {
+                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(str::to_string));
+                } else if part == "strong" {
+                    strong = true;
+                }
+            }
+            let tool = if &c["tool"] == "-" { Value::Null } else { Value::String(c["tool"].to_string()) };
+            steps.push(json!({"id": &c["id"], "tool": tool, "do": c["do"].trim(), "after": after, "strong": strong}));
+        }
+    }
+    if steps.is_empty() {
+        return Err("no plan lines found (expected `<id> <tool|-> [after=ids]: <intent>`)".into());
+    }
+    let mut v = json!({"steps": steps});
+    if let Some(r) = report.filter(|r| !r.is_empty()) {
+        v["report"] = Value::String(r);
+    }
+    Ok(v)
+}
+
+/// The planner's pre-written final reply, if it is usable: every `{{id}}` in it names a step of the plan.
+pub fn plan_report(v: &Value, steps: &[Step]) -> Option<String> {
+    let r = v.get("report").and_then(|r| r.as_str()).map(str::trim).filter(|r| !r.is_empty())?;
+    let ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    // ids in the report follow the same renumbering as the steps only for a first plan; a re-plan sets its own
+    TEMPLATE.captures_iter(r).all(|c| ids.contains(&c[1])).then(|| r.to_string())
+}
+
+static EXPECT_EXISTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the |a )?(?:(?:file|directory|dir|folder) )?[`"']?([\w./~\-]*[\w/])[`"']?(?: (?:file|directory|dir|folder))? (?:now |newly )?(?:exists?|is created|was created|is written|is present)$"#).unwrap()
+});
+static EXPECT_CONTAINS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the |a )?(?:(?:file|directory) )?[`"']?([\w./~\-]*[\w/])[`"']? (?:file )?(?:now |then )?contains? (?:the (?:text|line|string|word) )?(?:`([^`]+)`|"([^"]+)"|'([^']+)'|(.+))$"#).unwrap()
+});
+static EXPECT_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the )?(?:output|result|response|listing) (?:also |now )?(?:contains?|shows?|lists?|includes?|mentions?|has) (?:the (?:text|line|word|entries?|string) )?(?:`([^`]+)`|"([^"]+)"|'([^']+)'|(.+))$"#).unwrap()
+});
+static EXPECT_OK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:the )?(?:command|step|tool|script|build|tests?|process|server|job)?\s*(?:exits?|exited|returns?|finish(?:es|ed)?)(?: with)?(?: (?:exit )?(?:code|status))? 0$|^(?:the )?(?:command |step |tool |script |build |tests? |process |server |job )?(?:succeeds|succeeded|runs successfully|ran successfully|starts|started|starts successfully|is running|runs)$").unwrap()
+});
+
+/// Turn what a planner expects of a step into checks code can run, when it is a condition code understands
+/// ("site/index.html exists", "config.toml now contains port = 9090", "the command exits 0", "the output lists X").
+/// The bool says whether *every* clause of the expectation was understood: if so the checks are the whole judgement and
+/// no model has to be asked; otherwise the decision model still judges what code could not.
+pub fn expect_checks(expect: &str) -> (Vec<Check>, bool) {
+    let mut checks = Vec::new();
+    let mut all = true;
+    let text = expect.trim().trim_end_matches('.');
+    // clauses: split on ";" and " and " but not inside quotes (a quoted value may contain either)
+    let mut clauses: Vec<String> = Vec::new();
+    let (mut cur, mut quote) = (String::new(), None::<char>);
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            None if matches!(c, '"' | '`') => quote = Some(c),
+            _ => {}
+        }
+        let rest: String = chars[i..].iter().take(5).collect();
+        if quote.is_none() && (c == ';' || rest.eq_ignore_ascii_case(" and ")) {
+            clauses.push(std::mem::take(&mut cur));
+            i += if c == ';' { 1 } else { 5 };
+            continue;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    clauses.push(cur);
+    for clause in clauses.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
+        let pick =
+            |c: &regex::Captures, from: usize| (from..c.len()).find_map(|i| c.get(i)).map(|m| m.as_str().trim().trim_matches(['"', '`', '\'']).to_string());
+        if let Some(c) = EXPECT_EXISTS.captures(clause) {
+            checks.push(Check::FileExists { path: c[1].to_string() });
+        } else if let Some(c) = EXPECT_CONTAINS.captures(clause)
+            && let Some(v) = pick(&c, 2).filter(|v| !v.is_empty())
+            && (c[1].contains('.') || c[1].contains('/'))
+        {
+            checks.push(Check::FileContains { path: c[1].to_string(), value: v });
+        } else if let Some(c) = EXPECT_OUTPUT.captures(clause)
+            && let Some(v) = pick(&c, 1).filter(|v| !v.is_empty())
+        {
+            checks.push(Check::Contains { value: v });
+        } else if EXPECT_OK.is_match(clause) {
+            checks.push(Check::ExitOk);
+        } else if clause.eq_ignore_ascii_case("the output is not empty") || clause.eq_ignore_ascii_case("non-empty output") {
+            checks.push(Check::NonEmpty);
+        } else {
+            all = false;
+        }
+    }
+    let understood = all && !checks.is_empty();
+    (checks, understood)
+}
+
+/// Does every `{{id}}` in a report name a step of the plan?
+pub fn report_refs_exist(report: &str, steps: &[Step]) -> bool {
+    let ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    TEMPLATE.captures_iter(report).all(|c| ids.contains(&c[1]))
+}
+
+static PATHLIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\w.\-]+(?:/[\w.\-]+)+/?|[\w\-]+\.[A-Za-z0-9]{1,6}\b").unwrap());
+
+fn norm_path(p: &str) -> String {
+    p.trim().trim_start_matches("./").trim_end_matches('/').to_string()
+}
+
+fn path_tokens(text: &str) -> Vec<String> {
+    PATHLIKE.find_iter(text).map(|m| norm_path(m.as_str())).filter(|p| !p.is_empty() && !p.starts_with("http")).collect()
+}
+
+fn string_values(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| string_values(x, out)),
+        Value::Object(m) => m.values().for_each(|x| string_values(x, out)),
+        _ => {}
+    }
+}
+
+fn overlaps(a: &str, b: &str) -> bool {
+    a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+}
+
+/// What a step makes (paths it writes) and what it touches (paths it names anywhere: arguments, working directory,
+/// command line, or — for a step not yet implemented — its sentence).
+fn paths_of(step: &Step) -> (Vec<String>, Vec<String>) {
+    let mut texts = vec![step.description.clone()];
+    string_values(&step.args, &mut texts);
+    let mut uses: Vec<String> = texts.iter().flat_map(|t| path_tokens(t)).collect();
+    // arguments that are paths by name count even when they look like a bare word ("public")
+    for k in ["path", "cwd", "dir", "directory", "from", "to"] {
+        if let Some(p) = step.args.get(k).and_then(|v| v.as_str()).map(norm_path).filter(|p| !p.is_empty() && !p.contains("{{")) {
+            uses.push(p);
+        }
+    }
+    let arg = |k: &str| step.args.get(k).and_then(|v| v.as_str()).map(norm_path).filter(|p| !p.is_empty());
+    let writes: Vec<String> = match step.tool.as_deref() {
+        Some("fs_write" | "fs_edit" | "fs_mkdir" | "fs_delete") => arg("path").into_iter().collect(),
+        Some("fs_move") => arg("from").into_iter().chain(arg("to")).collect(),
+        Some("fs_copy") => arg("to").into_iter().collect(),
+        _ => vec![],
+    };
+    // a step that has not been given arguments yet makes whatever its sentence names
+    let writes =
+        if writes.is_empty() && step.brief && matches!(step.tool.as_deref(), Some("fs_write" | "fs_edit" | "fs_mkdir" | "fs_delete" | "fs_move" | "fs_copy")) {
+            path_tokens(&step.description)
+        } else {
+            writes
+        };
+    (writes, uses)
+}
+
+/// A planner (above all a small one) forgets to say that serving a directory must wait until the directory exists.
+/// Code knows which steps change things and which paths each step names, so it adds the missing "after"s:
+/// * steps that change things run in plan order, one after another (a shell command can change anything);
+/// * a step that names a path an earlier step writes waits for that step.
+///
+/// Dependencies only point backwards, and never close a cycle. Returns what was added, for the log.
+pub fn infer_dependencies(steps: &mut [Step], registry: &ToolRegistry) -> Vec<String> {
+    let effect: Vec<bool> =
+        steps.iter().map(|s| s.kind == StepKind::Tool && s.tool.as_deref().and_then(|t| registry.meta(t)).map(|m| m.side_effects).unwrap_or(false)).collect();
+    let paths: Vec<(Vec<String>, Vec<String>)> = steps.iter().map(paths_of).collect();
+    let reaches = |steps: &[Step], from: usize, target: &str| -> bool {
+        // does `from` (transitively) depend on the step named `target`?
+        let mut stack = vec![steps[from].id.clone()];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id == target {
+                return true;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(s) = steps.iter().find(|s| s.id == id) {
+                stack.extend(s.depends_on.iter().cloned());
+            }
+        }
+        false
+    };
+    let mut notes = Vec::new();
+    let mut prev_effect: Option<usize> = None;
+    for i in 0..steps.len() {
+        let mut wanted: Vec<(usize, &str)> = Vec::new();
+        if effect[i] {
+            if let Some(p) = prev_effect {
+                wanted.push((p, "steps that change things run in order"));
+            }
+            prev_effect = Some(i);
+        }
+        for j in 0..i {
+            if effect[j] && paths[j].0.iter().any(|w| paths[i].1.iter().any(|u| overlaps(w, u))) {
+                wanted.push((j, "it uses what that step writes"));
+            }
+        }
+        for (j, why) in wanted {
+            let dep = steps[j].id.clone();
+            if steps[i].depends_on.contains(&dep) || reaches(steps, j, &steps[i].id) || reaches(steps, i, &dep) {
+                continue;
+            }
+            notes.push(format!("{} now waits for {dep} ({why})", steps[i].id));
+            steps[i].depends_on.push(dep);
+        }
+    }
+    notes
 }
 
 /// Drop dependencies on steps that do not exist (a model's slip, e.g. `after: ["r1_2"]` with no such step).
@@ -229,6 +532,14 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
                 Some(m) => {
                     if !allowed.iter().any(|a| a == name) {
                         errs.push(format!("step {}: tool '{name}' is not available for this task; use only: {}", s.id, allowed.join(", ")));
+                    }
+                    let bad = malformed_placeholders(&s.args);
+                    if !bad.is_empty() {
+                        errs.push(format!(
+                            "step {} ({name}): {} is not a reference the system can fill in; write the real text, or use {{{{<step id>}}}} for an earlier step's result",
+                            s.id,
+                            bad.join(", ")
+                        ));
                     }
                     // arguments that contain templates are validated at run time; a brief step has none yet
                     let has_template = !template_refs(&s.args).is_empty();
@@ -335,8 +646,80 @@ mod tests {
             {"id": "s2", "tool": null, "after": ["s1", "s9"]}
         ]});
         let steps = parse_plan(&v, "g", PlanSource::Replan, "r1_", &r).unwrap();
-        assert_eq!(steps[0].id, "r1_s1");
-        assert_eq!(steps[1].depends_on, vec!["r1_s1", "s9"]);
+        assert_eq!(steps[0].id, "r1_1");
+        assert_eq!(steps[1].depends_on, vec!["r1_1", "s9"]);
+    }
+
+    #[test]
+    fn a_step_that_uses_what_another_writes_waits_for_it() {
+        // the container's shell: a full bash, which can change anything
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::from_toml("[shell]\nmode = \"sandbox\"\n").unwrap(), std::env::temp_dir()));
+        let mut r = ToolRegistry::new();
+        register_native(&mut r, policy, Arc::new(InMemoryStore::new()));
+        // the screenshot case: write the page, then serve its directory — the model forgot the "after"
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_write", "args": {"path": "public/earth.html", "content": "<html></html>"}},
+            {"id": "s2", "tool": "shell", "args": {"command": "python3 -m http.server 8000", "cwd": "public"}},
+            {"id": "s3", "tool": "fs_read", "args": {"path": "other.txt"}},
+            {"id": "s4", "tool": "fs_read", "args": {"path": "./public/earth.html"}}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Slm, "", &r).unwrap();
+        let notes = infer_dependencies(&mut steps, &r);
+        let deps = |id: &str| steps.iter().find(|s| s.id == id).unwrap().depends_on.clone();
+        assert_eq!(deps("s2"), vec!["s1"], "{notes:?}");
+        assert!(deps("s3").is_empty(), "an unrelated read stays parallel");
+        assert_eq!(deps("s4"), vec!["s1"], "a read of the written file waits for the write");
+        assert!(notes.iter().any(|n| n.starts_with("s2 now waits for s1")));
+        // idempotent, and never a cycle
+        assert!(infer_dependencies(&mut steps, &r).is_empty());
+        validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+        // changes happen one after another in plan order
+        let mut two = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}}, {"id": "b", "tool": "fs_write", "args": {"path": "y.txt", "content": "2"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        infer_dependencies(&mut two, &r);
+        assert_eq!(two[1].depends_on, vec!["a"]);
+        // an intent that has no arguments yet is judged by its sentence
+        let mut brief = parse_brief_plan(&json!({"steps": [{"id": "s1", "do": "write the page to public/index.html", "tool": "fs_write"}, {"id": "s2", "do": "serve the public directory", "tool": "shell"}]}), "g", PlanSource::Strong, "", &r).unwrap();
+        infer_dependencies(&mut brief, &r);
+        assert_eq!(brief[1].depends_on, vec!["s1"]);
+        // a model's own dependency that would make a cycle is left alone
+        let mut cyc = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}, "after": ["b"]}, {"id": "b", "tool": "fs_write", "args": {"path": "x.txt", "content": "2"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        infer_dependencies(&mut cyc, &r);
+        assert!(find_cycle(&cyc).is_none());
+    }
+
+    #[test]
+    fn invented_placeholders_are_rejected_not_written_into_files() {
+        let r = registry();
+        let steps = parse_plan(
+            &json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a.html", "content": "<p>{{ENT.location}} and {{ENT.person}}</p>"}}]}),
+            "g",
+            PlanSource::Slm,
+            "",
+            &r,
+        )
+        .unwrap();
+        let errs = validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("{{ENT.location}}") && e.contains("real text")), "{errs:?}");
+        // real references are fine
+        assert!(malformed_placeholders(&json!({"a": "{{s1}} and {{ prev_code }}", "b": ["no braces"]})).is_empty());
+        assert_eq!(malformed_placeholders(&json!({"a": "{{}}"})), vec!["{{}}"]);
+    }
+
+    #[test]
+    fn a_replan_with_repeated_or_mixed_ids_never_has_duplicates() {
+        let r = registry();
+        // the screenshot case: the model wrote both `r1_s2` and `s2`, twice over
+        let v = json!({"steps": [
+            {"id": "r1_s1", "tool": "fs_write", "args": {"path": "a.html", "content": "x"}},
+            {"id": "r1_s2", "tool": "fs_list", "args": {"path": "."}, "after": ["r1_s1"]},
+            {"id": "s2", "tool": null, "do": "report", "after": ["r1_s2"]},
+            {"id": "r1_s2", "tool": null, "do": "again", "after": ["s2"]}
+        ]});
+        let steps = parse_plan(&v, "g", PlanSource::Replan, "r1_", &r).unwrap();
+        let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["r1_1", "r1_2", "r1_3", "r1_4"]);
+        validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+        assert_eq!(steps[2].depends_on, vec!["r1_2"]);
     }
 
     #[test]
@@ -371,5 +754,104 @@ mod tests {
         let v = json!({"a": "x {{s1}} y", "b": ["{{s2}}"]});
         let out = substitute(&v, &|id| Some(format!("<{id}>")));
         assert_eq!(out, json!({"a": "x <s1> y", "b": ["<s2>"]}));
+    }
+}
+
+#[cfg(test)]
+mod line_format_tests {
+    use super::*;
+    use dfae_memory::InMemoryStore;
+    use dfae_tools::{PolicyConfig, PolicyEngine, register_native};
+    use std::sync::Arc;
+
+    fn registry() -> ToolRegistry {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), std::env::temp_dir()));
+        let mut r = ToolRegistry::new();
+        register_native(&mut r, policy, Arc::new(InMemoryStore::new()));
+        r
+    }
+
+    const PLAN: &str = "```\ns1 fs_mkdir: create the directory site\ns2 fs_write after=s1: write site/index.html, a page that says hello\n  expect: site/index.html exists\ns3 shell after=s2 strong: run `python3 -m http.server 8000` in site\nreport: Served at http://localhost:8000 ({{s3}})\n```";
+
+    #[test]
+    fn lines_become_the_same_plan_the_json_form_gives() {
+        let r = registry();
+        let v = parse_line_plan(PLAN).unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[1].tool.as_deref(), Some("fs_write"));
+        assert_eq!(steps[1].depends_on, vec!["s1"]);
+        assert_eq!(steps[1].expect.as_deref(), Some("site/index.html exists"));
+        assert!(steps[2].strong && steps[2].brief);
+        assert!(steps[2].description.contains("http.server 8000"));
+        assert_eq!(plan_report(&v, &steps).as_deref(), Some("Served at http://localhost:8000 ({{s3}})"));
+    }
+
+    #[test]
+    fn a_reasoning_step_uses_a_dash_and_wrapped_sentences_join() {
+        let v = parse_line_plan("s1 fs_read: read a.txt\ns2 - after=s1: count the words\n  and say the number").unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
+        assert_eq!(steps[1].kind, StepKind::Reasoning);
+        assert_eq!(steps[1].description, "count the words and say the number");
+        assert!(plan_report(&v, &steps).is_none());
+    }
+
+    #[test]
+    fn json_output_is_still_accepted_and_prose_is_an_error() {
+        let v = parse_line_plan(r#"{"steps":[{"id":"s1","tool":"fs_read","do":"read a.txt"}],"report":"{{s1}}"}"#).unwrap();
+        assert!(v["report"].is_string());
+        assert!(parse_line_plan("Sure, here is my plan: first read the file").is_err());
+    }
+
+    #[test]
+    fn small_variations_in_how_a_model_writes_the_lines_are_tolerated() {
+        let v = parse_line_plan("- s1. [fs_read]: read a.txt\n* s2) - after=s1: count the words\n   expect: a number").unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].tool.as_deref(), Some("fs_read"));
+        assert_eq!(steps[1].depends_on, vec!["s1"]);
+        assert_eq!(steps[1].expect.as_deref(), Some("a number"));
+    }
+
+    #[test]
+    fn a_report_that_names_a_missing_step_is_dropped() {
+        let v = parse_line_plan("s1 fs_read: read a.txt\nreport: it says {{s9}}").unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
+        assert!(plan_report(&v, &steps).is_none());
+    }
+}
+
+#[cfg(test)]
+mod expect_tests {
+    use super::*;
+
+    #[test]
+    fn conditions_code_understands_become_checks() {
+        let (c, all) = expect_checks("site/index.html exists");
+        assert_eq!((c, all), (vec![Check::FileExists { path: "site/index.html".into() }], true));
+        let (c, all) = expect_checks("the file config.toml now contains \"port = 9090\"");
+        assert_eq!((c, all), (vec![Check::FileContains { path: "config.toml".into(), value: "port = 9090".into() }], true));
+        let (c, all) = expect_checks("the command exits 0");
+        assert_eq!((c, all), (vec![Check::ExitOk], true));
+        let (c, all) = expect_checks("the output lists `index.html`");
+        assert_eq!((c, all), (vec![Check::Contains { value: "index.html".into() }], true));
+        let (c, all) = expect_checks("backup/config.toml exists and the command exits 0");
+        assert_eq!(c.len(), 2);
+        assert!(all);
+    }
+
+    #[test]
+    fn what_code_cannot_read_is_left_to_the_decision_model() {
+        let (c, all) = expect_checks("shows the server port");
+        assert!(c.is_empty() && !all);
+        let (c, all) = expect_checks("site/index.html exists and the page looks professional");
+        assert_eq!(c.len(), 1);
+        assert!(!all, "one clause was not understood, so the model still judges");
+    }
+
+    #[test]
+    fn a_quoted_value_may_contain_and() {
+        let (c, all) = expect_checks("notes.txt contains \"salt and pepper\"");
+        assert_eq!((c, all), (vec![Check::FileContains { path: "notes.txt".into(), value: "salt and pepper".into() }], true));
     }
 }

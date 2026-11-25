@@ -100,6 +100,32 @@ impl ToolMetadata {
         format!("{}: {}", self.name, first.trim_end_matches('.'))
     }
 
+    /// The arguments as a JSON schema, for servers that constrain decoding to one: the model cannot answer with a
+    /// wrong parameter name or type, only with a wrong value.
+    pub fn args_schema(&self) -> Value {
+        let ty = |t: ParamType| match t {
+            ParamType::String => "string",
+            ParamType::Integer => "integer",
+            ParamType::Number => "number",
+            ParamType::Boolean => "boolean",
+        };
+        let props: serde_json::Map<String, Value> = self
+            .params
+            .iter()
+            .map(|p| (p.name.clone(), serde_json::json!({"type": ty(p.ty), "description": p.description.chars().take(160).collect::<String>()})))
+            .collect();
+        let required: Vec<&str> = self.params.iter().filter(|p| p.required).map(|p| p.name.as_str()).collect();
+        serde_json::json!({"type": "object", "properties": props, "required": required, "additionalProperties": false})
+    }
+
+    /// A catalogue line for a prompt prefix that is cached (so its length is cheap): the parameter names, which are
+    /// optional (`?`), and the whole description.
+    pub fn catalog_line(&self) -> String {
+        let params: Vec<String> = self.params.iter().map(|p| if p.required { p.name.clone() } else { format!("{}?", p.name) }).collect();
+        let desc: String = self.description.chars().take(420).collect();
+        format!("{}({}): {}", self.name, params.join(", "), desc.trim_end_matches('.'))
+    }
+
     /// The signature plus what each parameter means: for self-hosted models, where extra prompt text costs nothing.
     pub fn signature_detailed(&self) -> String {
         let help: Vec<String> = self.params.iter().filter(|p| !p.description.trim().is_empty()).map(|p| format!("{}: {}", p.name, p.description)).collect();

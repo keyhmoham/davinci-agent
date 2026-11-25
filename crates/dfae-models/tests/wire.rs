@@ -19,7 +19,16 @@ async fn serve(app: Router) -> String {
 }
 
 fn req(json_mode: bool) -> GenerationRequest {
-    GenerationRequest { system: "SYS".into(), messages: vec![Message::user("hello")], max_tokens: 50, temperature: 0.0, json: json_mode, purpose: "t".into() }
+    GenerationRequest {
+        system: "SYS".into(),
+        messages: vec![Message::user("hello")],
+        max_tokens: 50,
+        temperature: 0.0,
+        json: json_mode,
+        purpose: "t".into(),
+        cache: false,
+        schema: None,
+    }
 }
 
 #[tokio::test]
@@ -130,4 +139,38 @@ async fn a_server_without_the_model_is_unhealthy_and_the_error_says_what_to_do()
     // Ollama lists untagged models as `name:latest`
     let m = OpenAiCompat::new(&format!("{base}/v1"), "other", None, Duration::from_secs(5));
     assert!(m.health().await);
+}
+
+#[tokio::test]
+async fn a_schema_is_sent_and_a_server_that_rejects_it_gets_plain_json_instead() {
+    let bodies: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+    let b2 = bodies.clone();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(move |Json(b): Json<Value>| {
+            let b2 = b2.clone();
+            async move {
+                let has_schema = b["response_format"]["type"] == "json_schema";
+                b2.lock().unwrap().push(b);
+                if has_schema {
+                    (StatusCode::BAD_REQUEST, Json(json!({"error": "unsupported response_format"})))
+                } else {
+                    (StatusCode::OK, Json(json!({"model": "m", "choices": [{"message": {"content": "{\"path\":\"a\"}"}}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}})))
+                }
+            }
+        }),
+    );
+    let base = serve(app).await;
+    let m = OpenAiCompat::new(&base, "m", None, Duration::from_secs(5));
+    let mut r = req(true);
+    r.schema = Some(json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}));
+    assert_eq!(m.generate(r.clone()).await.unwrap().text, "{\"path\":\"a\"}");
+    let sent = bodies.lock().unwrap().clone();
+    assert_eq!(sent[0]["response_format"]["type"], "json_schema");
+    assert_eq!(sent[0]["response_format"]["json_schema"]["schema"]["required"], json!(["path"]));
+    assert_eq!(sent[1]["response_format"], json!({"type": "json_object"}), "the call is repeated without the schema");
+    // and the server is not asked for a schema again
+    m.generate(r).await.unwrap();
+    assert_eq!(bodies.lock().unwrap().len(), 3);
+    assert_eq!(bodies.lock().unwrap()[2]["response_format"], json!({"type": "json_object"}));
 }

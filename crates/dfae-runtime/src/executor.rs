@@ -49,6 +49,9 @@ fn kind_str(k: ErrorKind) -> String {
     serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "other".into())
 }
 
+/// Outputs shorter than this are summarised mechanically: reading them locally would save the external model nothing.
+const CONDENSE_MIN_TOKENS: usize = 1500;
+
 /// How much of a step's output is kept in its summary. Roomy: it is trimmed to the tier that reads it.
 const STEP_SUMMARY_TOKENS: usize = 900;
 
@@ -260,7 +263,7 @@ impl Inner {
         // ---- acting phase: a planner's intent becomes an action, now, with the results of earlier steps in hand ----
         let mut step = step;
         let prepared: Result<(), StepFailure> = if step.brief {
-            match self.implement_step(ctx, &step, &deps).await {
+            match self.implement_step(ctx, &step, &deps, None).await {
                 Ok(done) => {
                     if let Some(s) = ctx.rec.lock().await.plan.as_mut().and_then(|p| p.step_mut(id)) {
                         s.kind = done.kind;
@@ -281,22 +284,62 @@ impl Inner {
         let result = match prepared {
             Err(f) => Err(f),
             Ok(()) => match step.kind {
-                StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps).await,
+                StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps, None).await,
                 StepKind::Tool => self.run_tool(ctx, &step, tainted, &deps).await,
                 StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
             },
         };
+        // What the local model wrote does not parse (cut off, unbalanced): it writes it again, told why, before anyone
+        // else hears of it. Only the self-hosted model gets this second try; the planner is not asked.
+        let mut result = result;
+        for _ in 0..2 {
+            let Err(f) = &result else { break };
+            if !(f.message.contains("is malformed") && step.how.as_deref().is_some_and(|h| h.contains("slm")) && self.models.has(Tier::Slm)) {
+                break;
+            }
+            self.emit(ctx, EventKind::Warning { message: format!("step {id}: {}; the local model writes it again", f.message) }).await;
+            let mut again = step.clone();
+            again.brief = true;
+            match self.implement_step(ctx, &again, &deps, Some(&f.message)).await {
+                Ok(done) => {
+                    if let Some(s) = ctx.rec.lock().await.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                        s.args = done.args.clone();
+                        s.how = done.how.clone();
+                    }
+                    step = done;
+                    result = self.run_tool(ctx, &step, tainted, &deps).await;
+                }
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
         // the planner said what success looks like: the decision model checks the result against it. A result that
         // misses it is not thrown away (it is real information: "the workspace is empty"); it makes the planner
         // look at the plan again, now knowing what was found.
         let result = match result {
             Ok(mut out) if step.how.is_some() && step.expect.is_some() => {
-                if let Some(why) = self.judge_step(ctx, &step, &out.content).await {
+                let mut verdict = self.judge_step(ctx, &step, &out.content).await;
+                // a self-hosted model that wrote the step gets one chance to put it right, told what was wrong, before the
+                // external planner hears of it
+                if let Some(why) = verdict.clone()
+                    && step.kind == StepKind::Reasoning
+                    && self.step_tier(&step) == Some(Tier::Slm)
+                    && let Ok(second) = self.run_reasoning(ctx, &step, mode, &deps, Some(&why)).await
+                {
+                    let again = self.judge_step(ctx, &step, &second.content).await;
+                    if again.is_none() {
+                        out = second;
+                    }
+                    verdict = again;
+                }
+                if let Some(why) = verdict {
                     let problem = format!(
-                        "step {id} ({}) finished, but its result does not meet what was expected: \"{}\" ({why}). Its result was: {}. Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
+                        "step {id} ({}) found: {} — this does not meet what was expected: \"{}\" ({why}). Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
                         tokens::truncate_tokens(&step.description, 30),
+                        tokens::truncate_tokens(&out.content, 150),
                         step.expect.as_deref().unwrap_or(""),
-                        tokens::truncate_tokens(&out.content, 150)
                     );
                     ctx.checkpoints.lock().push(problem);
                     out.evidence.push(format!("expectation not met: {why}"));
@@ -312,6 +355,9 @@ impl Inner {
                 let content = out.content;
                 let hits = dfae_core::safety::scan_injection(&content);
                 let mut summary = tokens::compress_text(&content, STEP_SUMMARY_TOKENS);
+                if let Some(c) = self.condense(ctx, &step, &content).await {
+                    summary = c;
+                }
                 if !hits.is_empty() && step.kind == StepKind::Tool {
                     summary = format!("[flagged: possible prompt injection ({})] {summary}", hits.join(", "));
                     {
@@ -385,6 +431,7 @@ impl Inner {
         step: &Step,
         mode: ExecMode,
         deps: &[(String, Option<String>, String, String)],
+        feedback: Option<&str>,
     ) -> Result<StepOutput, StepFailure> {
         if ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false) {
             return self.run_chat_reply(ctx, step, mode).await;
@@ -414,6 +461,9 @@ impl Inner {
         let mut user = format!("STEP: {}\n{ctx_text}\nINPUTS:\n{}", step.description, render(&[]));
         if lazy_on {
             user.push_str(&economy::lazy::need_instruction(&ids));
+        }
+        if let Some(f) = feedback {
+            user.push_str(&format!("\nYOUR PREVIOUS ANSWER WAS REJECTED: {f}\nWrite it again so that it meets the expectation."));
         }
         let mut text = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step")).await.map_err(to_err)?;
         let mut evidence = Vec::new();
@@ -470,7 +520,18 @@ impl Inner {
         if paid {
             req.max_tokens = req.max_tokens.min(400); // a paid reply is kept short; a self-hosted one is not cut off
         }
-        let text = self.generate_text(ctx, tier, req).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?;
+        let text = match self.generate_text(ctx, tier, req.clone()).await {
+            Ok(t) => t,
+            // the external model cannot be reached: the self-hosted one answers instead of the user getting an error
+            Err(e) if paid && self.models.has(Tier::Slm) && e.contains("model request failed") => {
+                self.emit(ctx, EventKind::Warning { message: format!("the external model is unavailable ({e}); the self-hosted model answers instead") }).await;
+                let mut local = self.gen_request(Tier::Slm, prompts::CHAT_SYSTEM, String::new(), "chat");
+                local.messages = req.messages.clone();
+                local.temperature = 0.6;
+                self.generate_text(ctx, Tier::Slm, local).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?
+            }
+            Err(e) => return Err(StepFailure::new(ErrorKind::Transient, e)),
+        };
         let text = crate::style::compact(&text);
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
@@ -567,6 +628,16 @@ impl Inner {
                 return Err(StepFailure::new(ErrorKind::Other, format!("check failed: {} ({ev})", c.describe())));
             }
         }
+        // a file a model just wrote must still parse (a reply cut off by the token limit is the usual culprit)
+        if matches!(name.as_str(), "fs_write" | "fs_edit")
+            && args.get("append").and_then(|a| a.as_bool()) != Some(true)
+            && let Some(path) = args.get("path").and_then(|p| p.as_str())
+            && let Ok(full) = self.policy.guard().read_path(path)
+            && let Ok(text) = std::fs::read_to_string(&full)
+            && let Some(problem) = crate::syntax::problem(&full, &text).await
+        {
+            return Err(StepFailure::new(ErrorKind::Other, format!("{path} was written but is malformed: {problem}")));
+        }
         let mut evidence = out.evidence.clone();
         if let Some(v) = tool.verify(&args, &out, &tctx).await {
             match v {
@@ -575,6 +646,27 @@ impl Inner {
             }
         }
         Ok(StepOutput { content, evidence })
+    }
+
+    /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the external model
+    /// reads this instead of a mechanical cut of the first lines. Kept only if it states nothing the output lacks.
+    async fn condense(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> Option<String> {
+        if !self.cfg.economy.condense || step.kind != StepKind::Tool || !self.models.has(Tier::Slm) || tokens::estimate_tokens(content) < CONDENSE_MIN_TOKENS {
+            return None;
+        }
+        let goal = ctx.rec.lock().await.goal.clone();
+        let user = format!(
+            "TASK: {}\nSTEP: {}\n{}",
+            tokens::truncate_tokens(&goal, 80),
+            tokens::truncate_tokens(&step.description, 40),
+            dfae_core::safety::wrap_untrusted(step.tool.as_deref().unwrap_or("output"), &tokens::truncate_tokens(content, 6000))
+        );
+        let mut req = self.gen_request(Tier::Slm, prompts::CONDENSE_SYSTEM, user, "condense");
+        req.max_tokens = req.max_tokens.min(500);
+        let text = self.generate_text(ctx, Tier::Slm, req).await.ok()?;
+        let text = text.trim().to_string();
+        let grounded = crate::answer::ungrounded_claims(&text, content, "").is_empty();
+        (grounded && !text.is_empty() && tokens::estimate_tokens(&text) < tokens::estimate_tokens(content) / 2).then(|| format!("[condensed] {text}"))
     }
 
     /// Suspend the step until a human approves *this exact action*.
@@ -763,6 +855,7 @@ impl Inner {
                 return Ok(false);
             }
             r.usage.replans += 1;
+            r.problems.push(tokens::truncate_tokens(problem, 60));
             (r.usage.replans, r.budget.clone())
         };
         self.set_status(ctx, TaskStatus::Recovering).await;
@@ -814,37 +907,75 @@ impl Inner {
         };
         let prefix = format!("r{replans}_");
         let ctx_text = self.context_text(ctx, false, tier).await;
-        let sigs = if tier == Tier::Strong { self.tools.signatures(&allowed) } else { self.tools.signatures_detailed(&allowed) };
         // the external model re-plans in intents, as it planned; a self-hosted one in concrete steps
         let brief = tier == Tier::Strong;
-        let sigs = if brief { self.tools.brief_lines(&allowed) } else { sigs };
-        let user = prompts::replan_user(&sigs, &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
-        let mut req = self.gen_request(tier, if brief { prompts::BRIEF_REPLAN_SYSTEM } else { prompts::REPLAN_SYSTEM }, user, "replan");
-        req.json = true;
-        let v = self.gen_json(ctx, tier, req).await?;
-        let new_steps = if brief {
-            planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?
+        let lines = brief && self.cfg.economy.plan_lines;
+        let mut req = if brief {
+            self.brief_request(ctx, &allowed, &ctx_text, budget.max_steps.min(12), Some((&done, problem, &prefix)), "replan")
         } else {
-            planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)?
+            let user = prompts::replan_user(&self.tools.signatures_detailed(&allowed), &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
+            let mut req = self.gen_request(tier, prompts::REPLAN_SYSTEM, user, "replan");
+            req.json = true;
+            req
         };
-        if new_steps.is_empty() {
-            return Ok(false);
+        let mut new_report: Option<String> = None;
+        // Like the first plan, a re-plan gets one repair round: what was wrong with it is told to the model.
+        let mut merged: Option<Vec<Step>> = None;
+        let mut last_problem = String::new();
+        for attempt in 0..2 {
+            let (reply, raw) = self.gen_plan(ctx, tier, req.clone(), lines).await?;
+            let parsed = reply.and_then(|v| {
+                let steps = if brief {
+                    planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
+                } else {
+                    planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
+                }?;
+                Ok((steps, v))
+            });
+            let problems: Vec<String> = match parsed {
+                Err(e) => vec![e],
+                Ok((mut new_steps, v)) => {
+                    if new_steps.is_empty() {
+                        return Ok(false);
+                    }
+                    new_report = planner::plan_report(&v, &new_steps);
+                    self.repair_plan_args(ctx, &mut new_steps, goal).await;
+                    let mut all: Vec<Step> = {
+                        let r = ctx.rec.lock().await;
+                        let plan = r.plan.as_ref().ok_or("no plan")?;
+                        plan.steps.iter().filter(|s| kept_ids.contains(&s.id)).cloned().collect()
+                    };
+                    all.extend(new_steps);
+                    self.admit_readonly_tools(ctx, &all).await;
+                    planner::prune_unknown_deps(&mut all);
+                    planner::infer_dependencies(&mut all, &self.tools);
+                    let allowed_now = ctx.allowed.lock().clone();
+                    let remaining = self.remaining_budget(ctx).await;
+                    match planner::validate_plan(&all, &self.tools, &allowed_now, &remaining) {
+                        Ok(()) => {
+                            merged = Some(all);
+                            break;
+                        }
+                        Err(errs) => errs,
+                    }
+                }
+            };
+            last_problem = problems.join("; ");
+            if attempt == 0 {
+                req.messages.push(Message::assistant(tokens::truncate_tokens(&raw, 500)));
+                let again = if lines { "Return the corrected plan lines only." } else { "Return the corrected JSON only." };
+                req.messages.push(Message::user(format!("Invalid plan:\n- {}\n{again}", problems.join("\n- "))));
+                req.purpose = "replan_repair".into();
+            }
         }
-        let merged: Vec<Step> = {
-            let r = ctx.rec.lock().await;
-            let plan = r.plan.as_ref().ok_or("no plan")?;
-            let mut m: Vec<Step> = plan.steps.iter().filter(|s| kept_ids.contains(&s.id)).cloned().collect();
-            m.extend(new_steps);
-            m
-        };
-        let mut merged = merged;
-        planner::prune_unknown_deps(&mut merged);
-        let remaining = self.remaining_budget(ctx).await;
-        planner::validate_plan(&merged, &self.tools, &allowed, &remaining).map_err(|e| e.join("; "))?;
+        let merged = merged.ok_or(last_problem)?;
         let revised = {
             let mut r = ctx.rec.lock().await;
             let p = r.plan.as_mut().ok_or("no plan")?;
             p.steps = merged;
+            // the pre-written reply of the old plan describes steps that no longer stand; the re-plan may bring its own,
+            // but only its own new steps are ids it can refer to
+            p.report = if self.cfg.economy.plan_report { new_report.filter(|r| planner::report_refs_exist(r, &p.steps)) } else { None };
             p.revision += 1;
             p.clone()
         };

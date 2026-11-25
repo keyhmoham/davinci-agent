@@ -80,6 +80,26 @@ pub struct EconomyConfig {
     /// more (`NEED <step>`). Off by default: it trades a possible extra call for
     /// smaller prompts and should be measured on your workload before enabling.
     pub lazy_context: bool,
+    /// The external planner answers in a compact line format instead of JSON (`DFAE_PLAN_FORMAT=json` for JSON).
+    pub plan_lines: bool,
+    /// The external planner's system prompt carries the whole stable tool catalogue and examples, so a provider
+    /// with prompt caching bills it at a fraction after the first call (`DFAE_PLAN_PREFIX=narrow` lists only the
+    /// tools judged relevant instead).
+    pub plan_prefix: bool,
+    /// Send the prefix on every planner call, not only while traffic keeps the provider's cache warm (`DFAE_PLAN_PREFIX=always`).
+    pub plan_prefix_always: bool,
+    /// The plan carries the final reply as a template; when every step succeeds it is rendered and no answer call is made.
+    /// Off by default: the planner pays for the reply in (five-times-priced) output tokens even when a local model would
+    /// have written an equally good one for free. For deployments whose self-hosted model writes poor answers.
+    pub plan_report: bool,
+    /// The final answer is composed by the self-hosted model and checked against the evidence; the external model
+    /// is asked only when that check fails.
+    pub answer_local_first: bool,
+    /// The plan prompt shows what the workspace contains, so the planner does not spend steps exploring it.
+    pub workspace_snapshot: bool,
+    /// A big tool output is condensed by the self-hosted model into what matters for the task before the external
+    /// model reads it (`DFAE_CONDENSE=off` keeps the mechanical summary).
+    pub condense: bool,
 }
 
 /// Team orchestration and dispatch limits.
@@ -125,6 +145,12 @@ pub struct Config {
     pub thresholds: Thresholds,
     pub team: TeamConfig,
     pub economy: EconomyConfig,
+    /// Append every decision and what became of it to this JSONL file (`DFAE_DECISION_LOG`): the training and evaluation
+    /// set for the decision model (and for the thresholds around it).
+    pub decision_log: Option<PathBuf>,
+    /// Share of requests that the external model also answers the routing questions for, to measure the decision model
+    /// against it (`DFAE_SHADOW_EVAL`, 0..1; default 0 = off). It spends external tokens.
+    pub shadow_eval: f32,
     pub max_parallel: usize,
     pub approval_ttl_secs: u64,
     pub log_json: bool,
@@ -136,6 +162,10 @@ fn parse_slots(s: &str) -> std::collections::BTreeMap<String, usize> {
 }
 
 impl Config {
+    pub fn economy_shadow_on(&self) -> bool {
+        self.shadow_eval > 0.0
+    }
+
     pub fn from_env() -> Self {
         let slm_provider = env_or("SLM_PROVIDER", if env("SLM_BASE_URL").is_some() { "openai" } else { "none" });
         Self {
@@ -192,6 +222,13 @@ impl Config {
             economy: EconomyConfig {
                 repair: !matches!(env("DFAE_REPAIR").as_deref(), Some("off" | "false" | "0")),
                 lazy_context: env_bool("DFAE_LAZY_CONTEXT", false),
+                plan_lines: !matches!(env("DFAE_PLAN_FORMAT").as_deref(), Some("json")),
+                plan_prefix: !matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("narrow" | "off")),
+                plan_prefix_always: matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("always")),
+                plan_report: matches!(env("DFAE_PLAN_REPORT").as_deref(), Some("on" | "true" | "1")),
+                answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
+                workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
+                condense: !matches!(env("DFAE_CONDENSE").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),
@@ -201,6 +238,8 @@ impl Config {
                 role_slots: parse_slots(&env_or("DFAE_ROLE_SLOTS", "researcher=4,operator=1,analyst=4,verifier=2")),
                 agent_timeout_secs: env_parse("DFAE_AGENT_TIMEOUT_SECS", 600),
             },
+            decision_log: env("DFAE_DECISION_LOG").map(PathBuf::from),
+            shadow_eval: env_parse("DFAE_SHADOW_EVAL", 0.0f32).clamp(0.0, 1.0),
             max_parallel: env_parse("DFAE_MAX_PARALLEL", 4),
             approval_ttl_secs: env_parse("DFAE_APPROVAL_TTL_SECS", 900),
             log_json: env_bool("DFAE_LOG_JSON", false),

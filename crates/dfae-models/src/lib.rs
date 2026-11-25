@@ -16,7 +16,7 @@ mod openai;
 
 pub use anthropic::AnthropicModel;
 pub use gateway::*;
-pub use mock::{OfflineStub, ScriptedModel};
+pub use mock::{MIN_CACHE_TOKENS, MeteredModel, OfflineStub, ScriptedModel};
 pub use openai::OpenAiCompat;
 
 use dfae_core::*;
@@ -27,7 +27,13 @@ use std::time::Duration;
 pub fn build_model(cfg: &ModelConfig) -> Option<Arc<dyn LanguageModel>> {
     let timeout = Duration::from_secs(cfg.timeout_secs);
     match cfg.provider.as_str() {
-        "openai" => Some(Arc::new(OpenAiCompat::new(&cfg.base_url, &cfg.model, cfg.api_key.clone(), timeout))),
+        "openai" => {
+            let mut m = OpenAiCompat::new(&cfg.base_url, &cfg.model, cfg.api_key.clone(), timeout);
+            if let Ok(v) = std::env::var("STRONG_PROMPT_CACHE") {
+                m = m.with_prompt_cache(matches!(v.as_str(), "on" | "true" | "1"));
+            }
+            Some(Arc::new(m))
+        }
         "anthropic" => cfg.api_key.clone().map(|k| Arc::new(AnthropicModel::new(&cfg.base_url, &cfg.model, k, timeout)) as Arc<dyn LanguageModel>),
         "mock" => Some(Arc::new(OfflineStub)),
         _ => None,

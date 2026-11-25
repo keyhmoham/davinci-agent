@@ -16,10 +16,13 @@ mod pipeline;
 pub mod planner;
 pub mod prompts;
 mod session;
+mod shadow;
 pub mod skills;
 mod style;
+mod syntax;
 pub mod team;
 mod verify;
+mod workspace;
 
 pub use bootstrap::build_engine;
 pub use bus::EventBus;

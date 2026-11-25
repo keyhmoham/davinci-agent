@@ -345,7 +345,7 @@ pub fn plan_from_decomposition(goal: &str, d: &Decomposition, direct: &[bool]) -
         j.depends_on = d.subgoals.iter().map(|s| s.id.clone()).collect();
         steps.push(j);
     }
-    Plan { goal: goal.into(), steps, source: PlanSource::Team, revision: 0, estimate: None }
+    Plan { goal: goal.into(), steps, source: PlanSource::Team, revision: 0, estimate: None, report: None }
 }
 
 /// Facts the decision layer judges the split on.

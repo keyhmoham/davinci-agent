@@ -89,6 +89,18 @@ The TUI's **Tokens** view and the `ledger` on every task show actual generative 
 the full raw history on each step (formula in [`docs/evaluation.md`](docs/evaluation.md)). The
 baseline is a model, not a measurement — benchmark against a real agent before quoting a number.
 
+### What the external model costs, and how that is kept down
+
+Measured with the ablation benchmark (`cargo test -p dfae-runtime --test bench -- --nocapture`; see `docs/evaluation.md`): against the previous
+flow (JSON plans, per-task tool list, an answer call), the defaults spend **−49 % effective external tokens** (−20 % on a provider without prompt
+caching) and 14 % fewer external calls for the same outcomes. What does it: compact plan lines instead of JSON; the whole tool catalogue and
+examples as a prompt-cache prefix, sent only while the provider's cache is warm; final answers written by the self-hosted model and checked
+against the evidence (the external model only if the check fails); and skills that replay *intents*, so a repeated kind of request costs 0
+external tokens after the first. What keeps quality up while doing it: expectations that code can read are checked by code, written files are
+parsed and rewritten locally when malformed, a rejected reasoning step is rewritten before the planner hears of it, big outputs are condensed
+locally, work the external model plans is one plan rather than a team of planners, a task that went wrong then worked leaves a lesson, and
+"that's wrong, try again" teaches the calibration and the skills.
+
 ## Token economy: zero-cost mechanisms that save tokens
 
 One layer (`crates/dfae-runtime/src/economy`) groups everything that spends no generative tokens to avoid
@@ -305,6 +317,14 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `DFAE_MAX_STEPS`, `_MAX_MODEL_CALLS`, `_MAX_TOOL_CALLS`, `_MAX_REPLANS`, `_MAX_SECONDS`, `_MAX_CHILDREN` | per-task budgets |
 | `DFAE_REPAIR` | `off` disables deterministic repair |
 | `DFAE_LAZY_CONTEXT` | `on` enables lazy upstream context (`NEED <step>` expansion); off by default |
+| `DFAE_PLAN_FORMAT` | `json` makes the external planner write JSON instead of compact plan lines |
+| `DFAE_PLAN_PREFIX` | `narrow`/`off`: per-task tool list in the user message; `always`: send the cacheable prefix on every planner call; default: prefix only while the provider's cache is warm |
+| `STRONG_PROMPT_CACHE` | `on` declares that an OpenAI-compatible external endpoint caches repeated prompt prefixes (Anthropic and `api.openai.com` are known to) |
+| `DFAE_PLAN_REPORT` | `on` lets the planner pre-write the final reply (off: measured to cost more than a local answer) |
+| `DFAE_ANSWER_LOCAL_FIRST` | `off` sends every final answer to the external model |
+| `DFAE_WORKSPACE_SNAPSHOT`, `DFAE_CONDENSE` | `off` disables the workspace line in plan prompts / local condensation of big outputs |
+| `DFAE_DECISION_LOG` | JSONL file of decisions and their outcomes (evaluation / training data) |
+| `DFAE_SHADOW_EVAL` | 0..1: share of requests whose routing the external model also decides, to measure the decision model (spends external tokens; default 0) |
 | `DFAE_TEAM` | `off` disables automatic delegation |
 | `DFAE_MAX_CONCURRENT_TASKS` / `DFAE_MAX_QUEUED_TASKS` | admission control: tasks running at once / waiting before load shedding (8 / 64) |
 | `DFAE_MAX_AGENTS` / `DFAE_ROLE_SLOTS` | subagents running at once (8) / per-role pools (`researcher=4,operator=1,analyst=4,verifier=2`) |
@@ -335,10 +355,11 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 240+ unit/integration/e2e tests | verified |
+| Rust workspace: build, `clippy -D warnings` clean, 280 unit/integration/e2e tests | verified |
 | Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
 | Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
 | Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |
+| External-token reductions (plan lines, cached prefix, local-first answers, intent skills) | verified by the ablation benchmark with a **scripted** planner and a **simulated** prompt cache (`tests/bench.rs`); real-provider cache-hit rates and real-planner behaviour in the new line format are **unmeasured** |
 | Token economy payoff on a *real* model | **unmeasured** — priors come from the shipped prompts; savings per avoided repair (~300–500 tokens) are estimates; lazy context may cost more than it saves for some workloads |
 | Quality of automatic splits with a *real* SLM/decision model | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
 | Conversation (small talk, chat turns, session history, "it"/"that file"/"my city" resolution), file-creation phrasings, planner-slip recovery | verified (`crates/dfae-runtime/tests/chat.rs`) and with the real server |

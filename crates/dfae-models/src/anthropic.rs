@@ -38,7 +38,7 @@ impl LanguageModel for AnthropicModel {
         // for Sonnet-class models); below it `cache_control` is dead weight, so it is only sent
         // when the stable prefix is long enough to be worth caching.
         let mut block = json!({"type": "text", "text": system});
-        if tokens::estimate_tokens(&system) >= CACHE_MIN_TOKENS {
+        if req.cache || tokens::estimate_tokens(&system) >= CACHE_MIN_TOKENS {
             block["cache_control"] = json!({"type": "ephemeral"});
         }
         let body = json!({
@@ -84,10 +84,15 @@ impl LanguageModel for AnthropicModel {
                     + u["cache_creation_input_tokens"].as_u64().unwrap_or(0)
                     + u["cache_read_input_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
+                cached_tokens: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
             };
             return Ok(GenerationResponse { text, usage, model: v["model"].as_str().unwrap_or(&self.model).to_string() });
         }
         Err(ModelError::Request(last))
+    }
+
+    fn caches_prompts(&self) -> bool {
+        true
     }
 
     async fn health(&self) -> bool {

@@ -23,6 +23,13 @@ impl Inner {
                 Ok(p) => (p.exists(), format!("{}", p.display())),
                 Err(e) => (false, e.message),
             },
+            Check::FileContains { path, value } => match self.policy.guard().read_path(path) {
+                Ok(p) => match std::fs::read_to_string(&p) {
+                    Ok(text) => (text.contains(value.as_str()), format!("looked for '{value}' in {}", p.display())),
+                    Err(e) => (false, format!("{}: {e}", p.display())),
+                },
+                Err(e) => (false, e.message),
+            },
         }
     }
 

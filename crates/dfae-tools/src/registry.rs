@@ -66,6 +66,11 @@ impl ToolRegistry {
         names.iter().filter_map(|n| self.meta(n)).map(|m| m.brief_line()).collect::<Vec<_>>().join("\n")
     }
 
+    /// The fuller line per tool for a cached prompt prefix.
+    pub fn catalog_lines(&self, names: &[String]) -> String {
+        names.iter().filter_map(|n| self.meta(n)).map(|m| m.catalog_line()).collect::<Vec<_>>().join("\n")
+    }
+
     /// Signatures with parameter descriptions (for a self-hosted model).
     pub fn signatures_detailed(&self, names: &[String]) -> String {
         names.iter().filter_map(|n| self.meta(n)).map(|m| m.signature_detailed()).collect::<Vec<_>>().join("\n")

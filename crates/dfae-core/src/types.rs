@@ -180,11 +180,24 @@ impl Default for RetryPolicy {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Check {
     NonEmpty,
-    Contains { value: String },
-    NotContains { value: String },
-    Matches { pattern: String },
+    Contains {
+        value: String,
+    },
+    NotContains {
+        value: String,
+    },
+    Matches {
+        pattern: String,
+    },
     ExitOk,
-    FileExists { path: String },
+    FileExists {
+        path: String,
+    },
+    /// A file (not the step's output) contains a text: what an edit leaves behind.
+    FileContains {
+        path: String,
+        value: String,
+    },
 }
 
 impl Check {
@@ -215,6 +228,7 @@ impl Check {
             Check::Matches { pattern } => format!("output matches /{pattern}/"),
             Check::ExitOk => "tool reported success".into(),
             Check::FileExists { path } => format!("file exists: {path}"),
+            Check::FileContains { path, value } => format!("{path} contains '{value}'"),
         }
     }
 }
@@ -346,6 +360,10 @@ pub struct Plan {
     /// What finishing this plan is expected to cost (set when the plan is accepted).
     #[serde(default)]
     pub estimate: Option<CostEstimate>,
+    /// The final reply as the planner wrote it ahead of time, with `{{sN}}` where a step's output belongs.
+    /// When every step succeeds it is rendered and used as the answer: no answer call is made.
+    #[serde(default)]
+    pub report: Option<String>,
 }
 
 /// Expected *remaining* generative cost of a plan, priced by the learned cost model.
@@ -410,11 +428,25 @@ pub struct Routing {
     /// The kind of agent that fits the work: `researcher`, `operator`, `analyst`, `verifier`.
     #[serde(default)]
     pub role: Option<String>,
+    /// What the message says about the previous reply: `negative` ("that's wrong", "try again") or `positive`.
+    #[serde(default)]
+    pub feedback: Option<String>,
 }
 
 impl Routing {
     pub fn new(task_type: &str, complexity: f32, needs_tools: bool, risk: Risk, confidence: f32) -> Self {
-        Self { task_type: task_type.into(), complexity, needs_tools, risk, confidence, changes: false, conditional: false, smalltalk: None, role: None }
+        Self {
+            task_type: task_type.into(),
+            complexity,
+            needs_tools,
+            risk,
+            confidence,
+            changes: false,
+            conditional: false,
+            smalltalk: None,
+            role: None,
+            feedback: None,
+        }
     }
 }
 
@@ -563,6 +595,9 @@ pub struct TaskRecord {
     /// Team view: set on coordinators and on the agents they spawn.
     #[serde(default)]
     pub team: Option<TeamInfo>,
+    /// What went wrong before the plan was revised (one line each): the raw material of a lesson.
+    #[serde(default)]
+    pub problems: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -596,6 +631,7 @@ impl TaskRecord {
             final_answer: None,
             error: None,
             team: None,
+            problems: vec![],
             created_at: now,
             updated_at: now,
         }

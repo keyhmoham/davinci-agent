@@ -20,6 +20,7 @@ mod apply;
 pub mod contracts;
 pub mod cost;
 pub mod lazy;
+pub mod prefix;
 pub mod repair;
 
 pub use cost::{CostModel, plan_model_calls};

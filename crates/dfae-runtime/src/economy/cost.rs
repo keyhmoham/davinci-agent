@@ -134,7 +134,7 @@ mod tests {
     use super::*;
 
     fn plan(steps: Vec<Step>) -> Plan {
-        Plan { goal: "g".into(), steps, source: PlanSource::Slm, revision: 0, estimate: None }
+        Plan { goal: "g".into(), steps, source: PlanSource::Slm, revision: 0, estimate: None, report: None }
     }
 
     #[test]
