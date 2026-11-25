@@ -565,3 +565,23 @@ async fn shadow_evaluation_measures_the_decision_model_against_the_external_one_
     run_as(&r2, ModeRequest::Escalated, "Read config.toml and tell me the port").await;
     assert_eq!(r2.engine.stats().await.shadow_requests, 0);
 }
+
+#[tokio::test]
+async fn a_step_that_comes_back_as_a_question_for_the_user_is_told_to_decide_and_do_the_work() {
+    let r = rig(false, |_| {});
+    std::fs::write(r.ws.path().join("brief.txt"), "A planet page.").unwrap();
+    r.strong.push(
+        &json!({"steps": [
+            {"id": "s1", "do": "read brief.txt", "tool": "fs_read"},
+            {"id": "s2", "do": "compose the text of a landing page about Earth from the brief", "tool": null, "after": ["s1"]}
+        ]})
+        .to_string(),
+    );
+    r.slm.push("To create a landing page about Earth, I'll need some content and design details. What information do you want to include?");
+    r.slm.push("Earth: our home planet. (Assumed a short intro.)");
+    let t = run_as(&r, ModeRequest::Escalated, "Read brief.txt and compose the text of a landing page about Earth from it").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(t.final_answer.as_deref().unwrap().contains("home planet"), "{:?}", t.final_answer);
+    let second = r.slm.requests.lock().iter().filter(|q| q.purpose == "step").nth(1).unwrap().messages[0].content.clone();
+    assert!(second.contains("ASKED THE USER A QUESTION"), "{second}");
+}

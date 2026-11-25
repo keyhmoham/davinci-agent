@@ -684,6 +684,22 @@ pub(crate) fn sandboxed(policy: &PolicyEngine) -> bool {
 pub(crate) fn resolve_cwd(policy: &PolicyEngine, input: &Value) -> Result<PathBuf, ToolError> {
     match input.get("cwd").and_then(|v| v.as_str()).filter(|c| !c.is_empty()) {
         Some(c) => {
+            // A model told "the workspace" writes `workspace` or `/workspace` for it. When no such directory exists inside the
+            // workspace, that names the workspace itself (and `workspace/site` means `site`).
+            let name = policy.workspace().file_name().and_then(|n| n.to_str()).unwrap_or("workspace").to_string();
+            let trimmed = c.trim().trim_start_matches("./").trim_matches('/');
+            let alias = [name.as_str(), "workspace"]
+                .into_iter()
+                .find_map(|w| (trimmed == w).then(String::new).or_else(|| trimmed.strip_prefix(&format!("{w}/")).map(str::to_string)));
+            let c: &str = match &alias {
+                Some(rest) if !policy.workspace().join(trimmed.split('/').next().unwrap_or("")).is_dir() => {
+                    if rest.is_empty() {
+                        return Ok(policy.workspace().to_path_buf());
+                    }
+                    rest
+                }
+                _ => c,
+            };
             let p = policy.guard().read_path(c)?;
             // otherwise the OS answers "No such file or directory" about the command, which sends everyone looking for the wrong thing
             if !p.is_dir() {
@@ -703,6 +719,24 @@ pub(crate) fn resolve_cwd(policy: &PolicyEngine, input: &Value) -> Result<PathBu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_working_directory_called_workspace_means_the_workspace() {
+        let ws = std::env::temp_dir().join(format!("dfae-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(ws.join("site")).unwrap();
+        let policy = PolicyEngine::new(Default::default(), ws.clone());
+        let cwd = |c: &str| resolve_cwd(&policy, &serde_json::json!({"cwd": c}));
+        let root = policy.workspace().to_path_buf();
+        assert_eq!(cwd("workspace").unwrap(), root);
+        assert_eq!(cwd("./workspace/").unwrap(), root);
+        assert_eq!(cwd("workspace/site").unwrap(), root.join("site"));
+        assert_eq!(cwd("site").unwrap(), root.join("site"));
+        assert!(cwd("missing").unwrap_err().message.contains("does not exist"));
+        // a real directory of that name wins
+        std::fs::create_dir_all(ws.join("workspace")).unwrap();
+        assert_eq!(cwd("workspace").unwrap(), root.join("workspace"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 
     #[test]
     fn globs_match_like_a_coding_agent_expects() {
