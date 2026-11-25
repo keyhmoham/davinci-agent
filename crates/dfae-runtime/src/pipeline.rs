@@ -726,7 +726,11 @@ impl Inner {
             Err(e) => vec![e],
         };
         req.messages.push(Message::assistant(tokens::truncate_tokens(&raw, 500)));
-        let again = if lines { "Return the corrected plan lines only." } else { "Return the corrected JSON only." };
+        let again = if lines {
+            "Return the corrected plan lines only, one step per line, e.g.\ns1 fs_read: read a.txt\ns2 - after=s1: summarise it"
+        } else {
+            "Return the corrected JSON only."
+        };
         req.messages.push(Message::user(format!("Invalid plan:\n- {}\n{again}", problems.join("\n- "))));
         req.purpose = "plan_repair".into();
         let (reply2, _) = self.gen_plan(ctx, tier, req, lines).await?;

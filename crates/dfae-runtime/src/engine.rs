@@ -641,7 +641,12 @@ impl Inner {
         }
         req.json = false;
         let text = self.generate_text(ctx, tier, req).await?;
-        Ok((crate::planner::parse_line_plan(&text), text))
+        let parsed = crate::planner::parse_line_plan(&text, &self.tools.names());
+        if let Err(e) = &parsed {
+            // what the model actually wrote is the only way to know what to fix
+            tracing::warn!(error = %e, reply = %tokens::truncate_tokens(&text, 300), "the planner's reply could not be read as a plan");
+        }
+        Ok((parsed, text))
     }
 
     pub(crate) fn pick_tier(&self, mode: ExecMode) -> Option<Tier> {

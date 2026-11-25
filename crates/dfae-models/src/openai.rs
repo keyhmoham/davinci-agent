@@ -110,6 +110,17 @@ impl LanguageModel for OpenAiCompat {
             }
             let v: Value = resp.json().await.map_err(|e| ModelError::InvalidOutput(e.to_string()))?;
             let text = v["choices"][0]["message"]["content"].as_str().unwrap_or_default().to_string();
+            if text.trim().is_empty() {
+                let reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("unknown");
+                return Err(ModelError::InvalidOutput(if reason == "length" {
+                    format!(
+                        "the model used all {} output tokens before writing any text (a reasoning model spends them thinking): raise STRONG_MAX_TOKENS / SLM_MAX_TOKENS",
+                        req.max_tokens
+                    )
+                } else {
+                    format!("the model returned an empty reply (finish reason: {reason})")
+                }));
+            }
             let usage = Usage {
                 prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),

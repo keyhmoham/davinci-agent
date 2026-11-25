@@ -201,11 +201,24 @@ static LINE_STEP: LazyLock<Regex> = LazyLock::new(|| {
 /// ```
 ///
 /// A model that answers in JSON anyway is accepted as is. Roughly a quarter of the output tokens of the JSON form.
-pub fn parse_line_plan(text: &str) -> Result<Value, String> {
-    if let Some(v) = dfae_models::extract_json(text)
-        && v.get("steps").is_some()
-    {
-        return Ok(v);
+///
+/// `tools` are the names of the tools that exist: a model that numbers its lines (`1. fs_mkdir site`), writes
+/// `Step 2: use fs_write to …` or puts the tool in brackets is still understood.
+pub fn parse_line_plan(text: &str, tools: &[String]) -> Result<Value, String> {
+    if let Some(v) = dfae_models::extract_json(text) {
+        if v.get("steps").is_some() {
+            return Ok(v);
+        }
+        // the same plan under another name
+        for key in ["plan", "tasks", "actions", "plan_steps", "stages"] {
+            if let Some(a) = v.get(key).filter(|a| a.is_array()) {
+                let mut out = json!({"steps": a});
+                if let Some(r) = v.get("report") {
+                    out["report"] = r.clone();
+                }
+                return Ok(out);
+            }
+        }
     }
     let mut steps: Vec<Value> = Vec::new();
     let mut report: Option<String> = None;
@@ -244,23 +257,67 @@ pub fn parse_line_plan(text: &str) -> Result<Value, String> {
             let mut strong = false;
             for part in c["meta"].split_whitespace() {
                 if let Some(ids) = part.strip_prefix("after=") {
-                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(str::to_string));
+                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(norm_id));
                 } else if part == "strong" {
                     strong = true;
                 }
             }
             let tool = if &c["tool"] == "-" { Value::Null } else { Value::String(c["tool"].to_string()) };
-            steps.push(json!({"id": &c["id"], "tool": tool, "do": c["do"].trim(), "after": after, "strong": strong}));
+            steps.push(json!({"id": norm_id(&c["id"]), "tool": tool, "do": c["do"].trim(), "after": after, "strong": strong}));
+        } else if let Some(step) = lenient_step(t, tools) {
+            steps.push(step);
         }
     }
     if steps.is_empty() {
-        return Err("no plan lines found (expected `<id> <tool|-> [after=ids]: <intent>`)".into());
+        return Err("no plan lines found (expected `<id> <tool|-> [after=ids]: <intent>`, e.g. `s1 fs_read: read a.txt`)".into());
     }
     let mut v = json!({"steps": steps});
     if let Some(r) = report.filter(|r| !r.is_empty()) {
         v["report"] = Value::String(r);
     }
     Ok(v)
+}
+
+/// `1` and `step1` are `s1`.
+fn norm_id(id: &str) -> String {
+    let lower = id.trim().to_ascii_lowercase();
+    let digits = lower.strip_prefix("step").unwrap_or(&lower);
+    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) { format!("s{digits}") } else { id.trim().to_string() }
+}
+
+static LENIENT_STEP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:step\s*)?(?P<id>\d+|s\d+|step\d+)\s*[.):]\s*(?P<rest>\S.*)$").unwrap());
+
+/// A numbered or "Step 2:" line that is not in the exact format: `1. fs_mkdir site`, `2) [fs_write] write …`,
+/// `s3: - after=s2: summarise`, `Step 4: use fs_search to find TODO`.
+fn lenient_step(t: &str, tools: &[String]) -> Option<Value> {
+    let c = LENIENT_STEP.captures(t)?;
+    let id = norm_id(&c["id"]);
+    let rest = c["rest"].trim();
+    let is_tool = |w: &str| tools.iter().any(|t| t == w);
+    let clean = |w: &str| w.trim_matches(|ch: char| matches!(ch, '[' | ']' | '`' | '(' | ')' | '*' | ',' | '"')).trim_start_matches("tool=").to_string();
+    let (mut tool, mut intent) = (None::<String>, rest.to_string());
+    let mut after: Vec<String> = Vec::new();
+    let mut strong = false;
+    if let Some((head, tail)) = rest.split_once(':') {
+        let toks: Vec<String> = head.split_whitespace().map(clean).collect();
+        let first = toks.first().cloned().unwrap_or_default();
+        if is_tool(&first) || matches!(first.as_str(), "-" | "null" | "none" | "reasoning" | "think") {
+            tool = is_tool(&first).then_some(first);
+            for tok in toks.iter().skip(1) {
+                if let Some(ids) = tok.strip_prefix("after=") {
+                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(norm_id));
+                } else if tok == "strong" {
+                    strong = true;
+                }
+            }
+            intent = tail.trim().to_string();
+        }
+    }
+    if tool.is_none() && intent == rest {
+        // no tool slot: the first existing tool the sentence names is the tool
+        tool = rest.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).find(|w| is_tool(w)).map(str::to_string);
+    }
+    (!intent.is_empty()).then(|| json!({"id": id, "tool": tool, "do": intent, "after": after, "strong": strong}))
 }
 
 /// The planner's pre-written final reply, if it is usable: every `{{id}}` in it names a step of the plan.
@@ -776,7 +833,7 @@ mod line_format_tests {
     #[test]
     fn lines_become_the_same_plan_the_json_form_gives() {
         let r = registry();
-        let v = parse_line_plan(PLAN).unwrap();
+        let v = parse_line_plan(PLAN, &[]).unwrap();
         let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[1].tool.as_deref(), Some("fs_write"));
@@ -789,7 +846,7 @@ mod line_format_tests {
 
     #[test]
     fn a_reasoning_step_uses_a_dash_and_wrapped_sentences_join() {
-        let v = parse_line_plan("s1 fs_read: read a.txt\ns2 - after=s1: count the words\n  and say the number").unwrap();
+        let v = parse_line_plan("s1 fs_read: read a.txt\ns2 - after=s1: count the words\n  and say the number", &[]).unwrap();
         let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
         assert_eq!(steps[1].kind, StepKind::Reasoning);
         assert_eq!(steps[1].description, "count the words and say the number");
@@ -798,14 +855,14 @@ mod line_format_tests {
 
     #[test]
     fn json_output_is_still_accepted_and_prose_is_an_error() {
-        let v = parse_line_plan(r#"{"steps":[{"id":"s1","tool":"fs_read","do":"read a.txt"}],"report":"{{s1}}"}"#).unwrap();
+        let v = parse_line_plan(r#"{"steps":[{"id":"s1","tool":"fs_read","do":"read a.txt"}],"report":"{{s1}}"}"#, &[]).unwrap();
         assert!(v["report"].is_string());
-        assert!(parse_line_plan("Sure, here is my plan: first read the file").is_err());
+        assert!(parse_line_plan("Sure, here is my plan: first read the file", &[]).is_err());
     }
 
     #[test]
     fn small_variations_in_how_a_model_writes_the_lines_are_tolerated() {
-        let v = parse_line_plan("- s1. [fs_read]: read a.txt\n* s2) - after=s1: count the words\n   expect: a number").unwrap();
+        let v = parse_line_plan("- s1. [fs_read]: read a.txt\n* s2) - after=s1: count the words\n   expect: a number", &[]).unwrap();
         let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
         assert_eq!(steps.len(), 2);
         assert_eq!(steps[0].tool.as_deref(), Some("fs_read"));
@@ -814,8 +871,34 @@ mod line_format_tests {
     }
 
     #[test]
+    fn what_real_models_write_instead_of_the_exact_format_is_still_a_plan() {
+        let r = registry();
+        let tools = r.names();
+        // numbered lines, tool first or named in the sentence
+        let v = parse_line_plan("Here is the plan:\n1. fs_mkdir: create the directory site\n2. fs_write: write site/index.html with a page\n3) Step uses shell to run `ls site` after 2\nStep 4: - after=3: say what is in site", &tools).unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
+        assert_eq!(steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2", "s3", "s4"]);
+        assert_eq!(steps[0].tool.as_deref(), Some("fs_mkdir"));
+        assert_eq!(steps[2].tool.as_deref(), Some("shell"), "the tool the sentence names");
+        assert_eq!((steps[3].kind, steps[3].depends_on.clone()), (StepKind::Reasoning, vec!["s3".to_string()]));
+        // JSON under another key
+        let v = parse_line_plan(
+            r#"```json
+{"plan": [{"id": "s1", "tool": "fs_read", "do": "read a.txt"}]}
+```"#,
+            &tools,
+        )
+        .unwrap();
+        assert_eq!(parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap().len(), 1);
+        // `s1: fs_read: ...`
+        let v = parse_line_plan("s1: fs_read: read a.txt\ns2: - after=s1: count words", &tools).unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
+        assert_eq!((steps[0].tool.as_deref(), steps[1].depends_on.clone()), (Some("fs_read"), vec!["s1".to_string()]));
+    }
+
+    #[test]
     fn a_report_that_names_a_missing_step_is_dropped() {
-        let v = parse_line_plan("s1 fs_read: read a.txt\nreport: it says {{s9}}").unwrap();
+        let v = parse_line_plan("s1 fs_read: read a.txt\nreport: it says {{s9}}", &[]).unwrap();
         let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
         assert!(plan_report(&v, &steps).is_none());
     }
