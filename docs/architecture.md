@@ -4,7 +4,7 @@
 
 > The model proposes; the engine decides what is authorised, executes, observes and verifies.
 
-The runtime is the agent. Jev, GLiNER and the SLM are services it calls for *bounded* questions.
+The runtime is the agent. The decision model, GLiNER and the SLM are services it calls for *bounded* questions.
 No model owns control flow, permissions, or the claim that a task is done.
 
 ## Pipeline (`crates/dfae-runtime/src/pipeline.rs`)
@@ -29,6 +29,24 @@ No model owns control flow, permissions, or the claim that a task is done.
 9. **Answer** — templated (no model) unless reasoning steps produced material to compose; model-written
    answers are checked for ungrounded numbers/paths/URLs.
 10. **Learn** — calibration, episodic memory, validated fact promotion, skill crystallisation.
+
+## Conversation (`session.rs`, `pipeline.rs::run_chat`, `executor.rs::run_chat_reply`)
+
+Routing already says whether a request needs tools. If it does not (and nothing binds directly or matches a skill) — or if
+tool selection finds nothing that fits — the pipeline builds a one-step `PlanSource::Chat` plan **without a planning call**.
+Its single step is a reply: greetings, thanks, "how are you" and "what can you do" are answered by rules (0 tokens);
+anything else is one call with `CHAT_SYSTEM`, a one-line `CAN:` capability list (tool categories), `NOTE: no tool fits` when
+a tool-shaped request has no tool (so the model says so instead of inventing), and the session's last four turns as real
+chat messages (≤48/80 tokens each). Chat replies skip the evidence-grounding check (there is no tool evidence) and the
+continuation round. Before routing, `session::resolve` rewrites references to earlier turns using the entities of the
+session's finished tasks (newest wins): `it`/`that file` → last file, `that link` → last URL, `my city`/`here` (with a weather
+word) → the place given in this message or earlier. The rewrite is recorded as a `repaired` event on step `goal`; the user's own
+words stay in `request.goal` and are what the Chat view shows.
+
+Planner robustness that came with it: a read-only, approval-free tool the selector missed is admitted instead of failing the plan;
+a request routed as *changing something* whose plan has no side-effecting step is sent back once with the tool names
+(`missing_effect`); dangling `after` ids are dropped; replan ids are not double-prefixed; a model's reply that claims a change
+when no side-effecting step finished gets a deterministic "nothing was changed" note.
 
 ## Token economy (`crates/dfae-runtime/src/economy/`)
 
@@ -77,7 +95,7 @@ Delegation is a **plan step kind** (`Agent`); an agent is a child `TaskRecord` r
    in parallel, how many wait on a deterministic one, how many change state, whether there is a join, whether a model exists).
    Local rule: split for parallel model work (≥2), fan-out with a join (≥2 free agents), a pipeline of ≥3 that separates
    read-only from state-changing work; don't split when one plan does as well or everything is already Direct-mode.
-   With Jev the same question is asked of the hosted model; either way the answer is calibrated on past outcomes.
+   With the decision model the same question is asked of it; either way the answer is calibrated on past outcomes.
 4. **Dispatch** — each agent routes itself, then **fixes its role** (`pick_role`: a deterministic binding that changes
    state → operator; risky/maintenance → operator; no tools needed → analyst; "verify/check…" → verifier; else researcher),
    narrows its tool scope, and waits for a worker slot (`Dispatcher::acquire_agent`: role pool, then global pool).
@@ -162,5 +180,5 @@ capped per profile and truncated; observations get a per-step share.
 
 ## Tokens
 
-Every model call (SLM, strong, Jev) is a `LedgerEntry` with provider-reported usage when available (otherwise
+Every model call (SLM, strong, decision model) is a `LedgerEntry` with provider-reported usage when available (otherwise
 estimated), emitted as an event and aggregated per task and globally. See `evaluation.md` for the baseline model.

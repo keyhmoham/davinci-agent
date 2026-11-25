@@ -7,7 +7,7 @@
 //! the decision model, then the SLM, then (only when needed) a stronger model.
 
 use crate::engine::{ContextBase, Inner, TaskCtx};
-use crate::{answer, planner, prompts, skills};
+use crate::{answer, planner, prompts, session, skills};
 use chrono::Utc;
 use dfae_core::*;
 use dfae_decision::Decided;
@@ -83,8 +83,12 @@ impl Inner {
 
         // ---- 1. extraction (GLiNER + rules; agents inherit their slice) --------
         let entities = self.stage_extract(ctx, &goal).await;
+        // ---- 1b. conversation: what "it", "that file" and "my city" refer to ---------
+        let is_member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
+        let history = if is_member { Vec::new() } else { self.session_history(ctx).await };
+        let (goal, entities) = self.stage_resolve(ctx, goal, entities, &history).await;
         // ---- 2. retrieval ---------------------------------------------------
-        self.stage_retrieve(ctx, &goal, &entities, req.profile.unwrap_or_default()).await;
+        self.stage_retrieve(ctx, &goal, &entities, req.profile.unwrap_or_default(), &history).await;
 
         // ---- 3. route -------------------------------------------------------
         let state = self.decision_state(&goal, &entities);
@@ -109,6 +113,11 @@ impl Inner {
             if req.mode == ModeRequest::Assisted || req.mode == ModeRequest::Escalated { None } else { bind_direct(&metas, &goal, &entities) };
         let skill = if matches!(req.mode, ModeRequest::Auto | ModeRequest::Direct) { self.find_skill(ctx, &goal, &entities).await } else { None };
         let skill_direct = skill.as_ref().map(|s| !s.plan.has_reasoning()).unwrap_or(false);
+
+        // ---- 4b. conversation: nothing to run, so nothing to plan ----------------------
+        if !is_agent && calls.is_none() && skill.is_none() && !routing.needs_tools && req.mode == ModeRequest::Auto {
+            return self.run_chat(ctx, &goal, false).await;
+        }
 
         // ---- 5. mode ---------------------------------------------------------
         let mut mstate = state.clone();
@@ -192,7 +201,9 @@ impl Inner {
         }
         self.set_status(ctx, TaskStatus::Verifying).await;
         let mut verification = self.stage_verify(ctx).await;
+        let is_chat = ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false);
         if exec_err.is_none()
+            && !is_chat
             && verification.completion_confidence.map(|p| p < 0.35).unwrap_or(false)
             && let Ok(true) = self.continue_plan(ctx, goal).await
         {
@@ -352,7 +363,67 @@ impl Inner {
         entities
     }
 
-    async fn stage_retrieve(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity], profile: ContextProfile) {
+    /// Earlier finished turns of this conversation (oldest first), without sub-agent tasks.
+    async fn session_history(&self, ctx: &Arc<TaskCtx>) -> Vec<TaskRecord> {
+        let session = ctx.rec.lock().await.session_id.clone();
+        let mut v: Vec<TaskRecord> = self
+            .store
+            .list_tasks(60)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|t| t.session_id == session && t.task_id != ctx.id && t.status.is_terminal() && t.team.as_ref().and_then(|x| x.link.as_ref()).is_none())
+            .collect();
+        v.sort_by_key(|t| t.created_at);
+        v
+    }
+
+    /// Resolve "it" / "that file" / "my city" from the session before anything else looks at the request.
+    async fn stage_resolve(&self, ctx: &Arc<TaskCtx>, goal: String, entities: Vec<Entity>, history: &[TaskRecord]) -> (String, Vec<Entity>) {
+        if history.is_empty() && !entities.iter().any(|e| e.label == "location") {
+            return (goal, entities);
+        }
+        let facts = session::facts_from(history.iter());
+        let (new_goal, new_entities, notes) = session::resolve(&goal, &entities, &facts);
+        if notes.is_empty() {
+            return (goal, entities);
+        }
+        {
+            let mut r = ctx.rec.lock().await;
+            r.goal = new_goal.clone();
+            r.entities = new_entities.clone();
+        }
+        self.emit(ctx, EventKind::Repaired { step_id: "goal".into(), note: format!("understood from the conversation: {}", notes.join("; ")) }).await;
+        (new_goal, new_entities)
+    }
+
+    /// What the agent can do, in a few words (tool categories).
+    pub(crate) fn capabilities(&self, ctx: &Arc<TaskCtx>) -> String {
+        let mut cats: Vec<String> = self.scoped_metas(ctx).into_iter().map(|m| m.category).collect();
+        cats.sort();
+        cats.dedup();
+        cats.join(", ")
+    }
+
+    /// A conversational turn: one reply, no planning. `gap` = a tool-shaped request no tool fits.
+    async fn run_chat(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, gap: bool) -> Result<(), String> {
+        let mode = ExecMode::Assisted;
+        let reason = "conversation: no tool needed, so no plan".to_string();
+        {
+            let mut r = ctx.rec.lock().await;
+            r.mode = Some(mode);
+            r.mode_reason = Some(reason.clone());
+        }
+        self.emit(ctx, EventKind::Mode { mode, reason, skill_id: None }).await;
+        let mut plan = planner::chat_plan(goal, gap);
+        plan.estimate = Some(self.cost.estimate_plan(&plan));
+        ctx.rec.lock().await.plan = Some(plan.clone());
+        self.emit(ctx, EventKind::PlanCreated { plan }).await;
+        self.persist(ctx).await;
+        self.execute_and_conclude(ctx, goal, mode).await
+    }
+
+    async fn stage_retrieve(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity], profile: ContextProfile, history: &[TaskRecord]) {
         let session = ctx.rec.lock().await.session_id.clone();
         let cands = self
             .store
@@ -376,13 +447,16 @@ impl Inner {
             .collect();
         // earlier turns of the same session (cheap conversational continuity)
         let mut prior: Vec<String> = Vec::new();
-        if let Ok(tasks) = self.store.list_tasks(40).await {
-            let mut same: Vec<&TaskRecord> = tasks.iter().filter(|t| t.session_id == session && t.task_id != ctx.id && t.status.is_terminal()).collect();
-            same.sort_by_key(|t| t.created_at);
-            for t in same.into_iter().rev().take(4).rev() {
-                prior.push(format!("{} → {}", tokens::truncate_tokens(&t.goal, 24), tokens::truncate_tokens(t.final_answer.as_deref().unwrap_or(""), 30)));
-            }
+        for t in history.iter().rev().take(4).rev() {
+            prior.push(format!("{} → {}", tokens::truncate_tokens(&t.goal, 24), tokens::truncate_tokens(t.final_answer.as_deref().unwrap_or(""), 30)));
         }
+        let turns: Vec<(String, String)> = history
+            .iter()
+            .rev()
+            .take(4)
+            .rev()
+            .map(|t| (tokens::truncate_tokens(&t.goal, 48), tokens::truncate_tokens(t.final_answer.as_deref().or(t.error.as_deref()).unwrap_or(""), 80)))
+            .collect();
         let upstream = ctx
             .rec
             .lock()
@@ -392,7 +466,7 @@ impl Inner {
             .and_then(|t| t.link.as_ref())
             .map(|l| l.upstream.iter().map(|u| (u.label.clone(), u.summary.clone())).collect())
             .unwrap_or_default();
-        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, upstream };
+        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, upstream };
         if profile != ContextProfile::Minimal {
             ctx.rec.lock().await.retrieved = refs.clone();
             self.emit(ctx, EventKind::Retrieval { items: refs }).await;
@@ -478,6 +552,11 @@ impl Inner {
                 allowed.push(c.tool.clone());
             }
         }
+        // no tool fits: this is a conversation (or a request we have no tool for) — answer it, don't plan it
+        let is_member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
+        if allowed.is_empty() && !is_member {
+            return Ok((planner::chat_plan(goal, true), ExecMode::Assisted));
+        }
         *ctx.allowed.lock() = allowed.clone();
 
         let budget = ctx.rec.lock().await.budget.clone();
@@ -526,27 +605,72 @@ impl Inner {
         allowed: &[String],
     ) -> Result<Vec<Step>, String> {
         let v = self.gen_json(ctx, tier, req.clone()).await?;
+        let _ = allowed; // the live list is ctx.allowed: admitting a tool below widens it
         let problems = match planner::parse_plan(&v, goal, source, "", &self.tools) {
-            Ok(mut steps) => {
-                // code fixes what code can fix (types, unknown arguments, values the request supplies)
-                self.repair_plan_args(ctx, &mut steps, goal).await;
-                let remaining = self.remaining_budget(ctx).await;
-                match planner::validate_plan(&steps, &self.tools, allowed, &remaining) {
-                    Ok(()) => return Ok(steps),
-                    Err(errs) => errs,
-                }
-            }
+            Ok(steps) => match self.finish_plan(ctx, steps, goal, true).await {
+                Ok(steps) => return Ok(steps),
+                Err(errs) => errs,
+            },
             Err(e) => vec![e],
         };
         req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
         req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
         req.purpose = "plan_repair".into();
         let v2 = self.gen_json(ctx, tier, req).await?;
-        let mut steps = planner::parse_plan(&v2, goal, source, "", &self.tools)?;
+        let steps = planner::parse_plan(&v2, goal, source, "", &self.tools)?;
+        // the second attempt is judged on validity alone: a plan that is merely less ambitious is still a plan
+        self.finish_plan(ctx, steps, goal, false).await.map_err(|e| e.join("; "))
+    }
+
+    /// Everything code can do for a freshly parsed plan before a model is asked again:
+    /// fix arguments, admit harmless tools the selector missed, drop dangling dependencies,
+    /// then validate (and, on the first attempt, check that a request to change something plans a change).
+    async fn finish_plan(&self, ctx: &Arc<TaskCtx>, mut steps: Vec<Step>, goal: &str, expect_effect: bool) -> Result<Vec<Step>, Vec<String>> {
         self.repair_plan_args(ctx, &mut steps, goal).await;
+        self.admit_readonly_tools(ctx, &steps).await;
+        let dropped = planner::prune_unknown_deps(&mut steps);
+        if !dropped.is_empty() {
+            self.emit(
+                ctx,
+                EventKind::Repaired { step_id: "plan".into(), note: format!("dropped dependencies on steps that do not exist: {}", dropped.join(", ")) },
+            )
+            .await;
+        }
+        let allowed = ctx.allowed.lock().clone();
         let remaining = self.remaining_budget(ctx).await;
-        planner::validate_plan(&steps, &self.tools, allowed, &remaining).map_err(|e| e.join("; "))?;
+        planner::validate_plan(&steps, &self.tools, &allowed, &remaining)?;
+        if expect_effect {
+            let changes = ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && r.risk != Risk::Low).unwrap_or(false);
+            if changes && let Some(p) = planner::missing_effect(&steps, &self.tools, &allowed) {
+                return Err(vec![p]);
+            }
+        }
         Ok(steps)
+    }
+
+    /// A model that names a real, harmless tool the selector did not offer (it is read-only, needs no
+    /// approval, and is inside this agent's scope) gets it, instead of a failed task and a repair call.
+    async fn admit_readonly_tools(&self, ctx: &Arc<TaskCtx>, steps: &[Step]) {
+        for s in steps.iter().filter(|s| s.kind == StepKind::Tool) {
+            let Some(name) = s.tool.as_deref() else { continue };
+            let Some(m) = self.tools.meta(name) else { continue };
+            let harmless = !m.side_effects && !m.requires_approval && m.risk == Risk::Low && ctx.in_scope(name);
+            let admitted = harmless && {
+                let mut a = ctx.allowed.lock();
+                let fresh = !a.iter().any(|x| x == name);
+                if fresh {
+                    a.push(name.to_string());
+                }
+                fresh
+            };
+            if admitted {
+                self.emit(
+                    ctx,
+                    EventKind::Repaired { step_id: s.id.clone(), note: format!("'{name}' was not pre-selected, but it is read-only, so it is allowed") },
+                )
+                .await;
+            }
+        }
     }
 
     /// Evidence was judged insufficient: ask a model for the missing steps (once).

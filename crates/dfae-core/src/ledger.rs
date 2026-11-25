@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 pub enum Component {
     Slm,
     Strong,
-    Jev,
+    /// The decision model.
+    #[serde(alias = "jev")]
+    Decision,
     Gliner,
 }
 
@@ -50,7 +52,8 @@ pub struct LedgerSummary {
     pub saved_pct: f32,
     pub slm_calls: u32,
     pub strong_calls: u32,
-    pub jev_calls: u32,
+    #[serde(alias = "jev_calls")]
+    pub decision_calls: u32,
     pub gliner_calls: u32,
     pub cache_hits: u32,
 }
@@ -86,9 +89,9 @@ impl Ledger {
                     s.strong_tokens += t;
                     s.strong_calls += 1;
                 }
-                Component::Jev => {
+                Component::Decision => {
                     s.decision_tokens += t;
-                    s.jev_calls += 1;
+                    s.decision_calls += 1;
                 }
                 Component::Gliner => s.gliner_calls += 1,
             }

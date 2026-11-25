@@ -157,11 +157,21 @@ impl Inner {
         };
         let mut text = text;
         let mut unverified = Vec::new();
-        if from_model {
+        // a conversational reply has no tool evidence to be checked against
+        if from_model && plan.source != PlanSource::Chat {
             unverified = ungrounded_claims(&text, &evidence_full, &goal);
             if !unverified.is_empty() {
                 text.push_str(&format!("\n⚠ Not found in the collected evidence: {}", unverified.join(", ")));
             }
+        }
+        // a model must not tell the user something was changed when no step that changes anything finished
+        let asked_to_change = snapshot.route.as_ref().map(|r| r.needs_tools && r.risk != Risk::Low).unwrap_or(false);
+        let did_change = plan.steps.iter().any(|s| {
+            s.status == StepStatus::Succeeded
+                && (s.kind == StepKind::Agent || s.tool.as_deref().and_then(|t| self.tools.meta(t)).map(|m| m.side_effects).unwrap_or(false))
+        });
+        if from_model && asked_to_change && !did_change && plan.source != PlanSource::Chat {
+            text.push_str("\n⚠ Nothing was changed: no step that modifies anything completed.");
         }
         let result = {
             let mut r = ctx.rec.lock().await;

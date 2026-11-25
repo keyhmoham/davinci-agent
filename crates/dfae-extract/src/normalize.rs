@@ -4,6 +4,13 @@ use dfae_core::Entity;
 pub fn normalize_entities(mut es: Vec<Entity>) -> Vec<Entity> {
     for e in &mut es {
         e.label = e.label.trim().to_lowercase();
+        // quoted text is a literal the user gave (file content, a search term): keep it verbatim
+        if e.label == "quoted" {
+            let t = e.text.trim();
+            let wrapped = ['"', '\'', '`'].into_iter().any(|q| t.len() >= 2 && t.starts_with(q) && t.ends_with(q));
+            e.text = if wrapped { t[1..t.len() - 1].to_string() } else { t.to_string() };
+            continue;
+        }
         // Trim wrapping quotes/brackets and trailing sentence punctuation — never a
         // leading '.', which belongs to relative paths (`./src`, `../etc/x`).
         e.text =
@@ -65,6 +72,13 @@ mod tests {
 
     fn e(label: &str, text: &str, s: usize, t: usize, score: f32) -> Entity {
         Entity { label: label.into(), text: text.into(), start: Some(s), end: Some(t), score, source: "t".into() }
+    }
+
+    #[test]
+    fn quoted_literals_are_not_trimmed() {
+        let m = normalize_entities(vec![e("quoted", "hello keyhan !", 0, 14, 0.9), e("file path", "a.txt.", 0, 6, 0.9)]);
+        assert_eq!(m[0].text, "hello keyhan !");
+        assert_eq!(m[1].text, "a.txt");
     }
 
     #[test]

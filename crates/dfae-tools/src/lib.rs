@@ -11,6 +11,7 @@ mod native;
 mod policy;
 mod registry;
 mod sandbox;
+mod web;
 
 pub use binder::{DirectCall, bind_direct};
 pub use calc::{evaluate as evaluate_expression, format_number};

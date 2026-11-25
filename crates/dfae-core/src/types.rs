@@ -309,6 +309,8 @@ pub enum PlanSource {
     Replan,
     /// Sub-goals delegated to a team of agents.
     Team,
+    /// A conversational reply: one step, no planning call.
+    Chat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,7 +354,7 @@ pub struct DecisionRecord {
     pub id: String,
     pub kind: String,
     pub ts: DateTime<Utc>,
-    /// `jev`, `local`, or `local-fallback`.
+    /// `open-model`, `local`, or `local-fallback`.
     pub provider: String,
     /// Compact map `question -> answer` (choice/score/probability).
     pub answers: Value,

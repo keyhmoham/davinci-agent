@@ -189,7 +189,7 @@ async fn ask(api: &Api, goal: String, mode: ModeRequest, auto: bool) -> i32 {
                     s.baseline_tokens,
                     s.saved_pct,
                     s.slm_calls + s.strong_calls,
-                    s.jev_calls
+                    s.decision_calls
                 );
             }
             return if *status == TaskStatus::Completed { 0 } else { 1 };
