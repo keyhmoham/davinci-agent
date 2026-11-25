@@ -129,8 +129,33 @@ const TYPE_LEXICON: &[(&str, &[&str])] = &[
 const HIGH_RISK: &[&str] =
     &["delete", "remove", "drop", "rm", "format", "shutdown", "truncate", "overwrite", "kill", "reboot", "destroy", "wipe", "erase", "purge"];
 const MODERATE_RISK: &[&str] = &[
-    "write", "create", "save", "deploy", "patch", "install", "restart", "update", "edit", "modify", "upgrade", "migrate", "remember", "append", "rename",
-    "move", "chmod",
+    "write",
+    "create",
+    "save",
+    "deploy",
+    "patch",
+    "install",
+    "restart",
+    "update",
+    "edit",
+    "modify",
+    "upgrade",
+    "migrate",
+    "remember",
+    "append",
+    "rename",
+    "move",
+    "chmod",
+    "replace",
+    "substitute",
+    "change",
+    "fix",
+    "refactor",
+    "rewrite",
+    "correct",
+    "insert",
+    "mkdir",
+    "copy",
 ];
 const REASONING_VERBS: &[&str] = &[
     "analyze",
@@ -241,8 +266,17 @@ impl LocalDecider {
             s.tools.iter().map(|t| format!("{} {} {} {}", t.name.replace('_', " "), t.description, t.category, t.keywords.join(" "))).collect();
         // Score only the words the tools' vocabulary knows: chatter around the request ("hi, I'm Sam from
         // New York, tell me the weather") must not dilute a clear match.
+        // File names, URLs and the like are data, not wording: `test.txt` must not make the `test` tool look relevant.
+        let mut wording = s.request.clone();
+        for e in s
+            .entities
+            .iter()
+            .filter(|e| matches!(e.label.as_str(), "file path" | "path" | "directory" | "url" | "expression" | "version" | "ip address" | "email"))
+        {
+            wording = wording.replace(&e.text, " ");
+        }
         let vocab: HashSet<String> = docs.iter().flat_map(|d| content_tokens(d)).collect();
-        let query = content_tokens(&s.request).into_iter().filter(|t| vocab.contains(t)).collect::<Vec<_>>().join(" ");
+        let query = content_tokens(&wording).into_iter().filter(|t| vocab.contains(t)).collect::<Vec<_>>().join(" ");
         let bm = if query.is_empty() { vec![0.0; docs.len()] } else { bm25_scores(&query, &docs) };
         s.tools
             .iter()

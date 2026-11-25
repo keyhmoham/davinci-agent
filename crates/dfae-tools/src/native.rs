@@ -565,6 +565,8 @@ impl Tool for Shell {
             )
         };
         m.risk = Risk::Moderate;
+        // a full bash can change anything in the workspace; the restricted allowlist is read-only apart from a few approved commands
+        m.side_effects = sandbox;
         kw(
             &mut m,
             &[

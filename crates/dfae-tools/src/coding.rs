@@ -201,12 +201,51 @@ impl Tool for FsEdit {
         m.risk = Risk::Moderate;
         m.side_effects = true;
         m.reversible = false;
-        kw(&mut m, &["edit", "replace", "change", "modify", "update", "fix", "rename", "refactor", "patch", "substitute"]);
+        kw(
+            &mut m,
+            &[
+                "edit",
+                "replace",
+                "change",
+                "modify",
+                "update",
+                "fix",
+                "rename",
+                "refactor",
+                "patch",
+                "substitute",
+                "swap",
+                "alter",
+                "correct",
+                "word",
+                "text",
+                "occurrence",
+                "occurrences",
+                "string",
+            ],
+        );
+        // "replace [all] [the word] "A" with "B" in FILE" — quoted or bare words, FILE before or after;
+        // a phrase with all/every/each replaces every occurrence, otherwise the text must be unique
+        let verb = r#"(?:replace|change|substitute|swap)"#;
+        let with = r#"(?:with|to|by|for|into)"#;
+        let kind = r#"(?:the\s+)?(?:(?:word|text|string|phrase|term|name)\s+)?"#;
+        let place = format!(r#"(?:in|inside|within|from|of)\s+(?:the\s+)?(?:file\s+)?["'`]?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))"#);
+        let quoted = |all: bool| {
+            let all = if all { r#"(?P<replace_all>all|every|each)\s+(?:the\s+)?(?:occurrences?\s+of\s+)?"# } else { "" };
+            format!(r#"(?i)\b{verb}\s+{all}{kind}["'`](?P<old_string>[^"'`]+)["'`]\s+{with}\s+["'`](?P<new_string>[^"'`]+)["'`]\s+{place}"#)
+        };
         pats(
             &mut m,
-            &[format!(
-                r#"(?i)\b(?:replace|change)\s+["'`](?P<old_string>[^"'`]+)["'`]\s+(?:with|to|by)\s+["'`](?P<new_string>[^"'`]+)["'`]\s+(?:in|inside|within|from)\s+(?:the\s+)?(?:file\s+)?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))"#
-            )],
+            &[
+                quoted(true),
+                quoted(false),
+                // file first: `in a.txt, replace "A" with "B"`
+                format!(
+                    r#"(?i)\b(?:in|inside|within)\s+(?:the\s+)?(?:file\s+)?["'`]?(?P<path>[\w./\-]+\.(?:{FILE_EXT}))["'`]?\s*[,:]?\s*{verb}\s+{kind}["'`](?P<old_string>[^"'`]+)["'`]\s+{with}\s+["'`](?P<new_string>[^"'`]+)["'`]"#
+                ),
+                // bare single words: `replace foo with bar in a.txt`
+                format!(r#"(?i)\b{verb}\s+{kind}(?P<old_string>[^\s"'`]+)\s+{with}\s+(?P<new_string>[^\s"'`]+)\s+{place}"#),
+            ],
         );
         m
     }

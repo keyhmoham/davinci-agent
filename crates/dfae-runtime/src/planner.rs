@@ -153,6 +153,18 @@ pub fn prune_unknown_deps(steps: &mut [Step]) -> Vec<String> {
     dropped
 }
 
+/// Does the request ask for something to be changed (a file written, edited, moved, deleted…)? Independent of the
+/// decision layer's risk estimate, which is a different question.
+pub fn asks_for_change(goal: &str) -> bool {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\b(?:replace|substitute|swap|change|edit|modify|update|fix|correct|rewrite|refactor|rename|insert|append|prepend|create|make|write|save|add|remove|delete|erase|move|copy|mkdir|install|deploy|patch|restart|commit|overwrite)\b",
+        )
+        .unwrap()
+    });
+    RE.is_match(goal)
+}
+
 /// "patch it if necessary", "propose a fix": a change that may not happen is not a change that is missing.
 pub fn is_conditional(goal: &str) -> bool {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -344,6 +356,16 @@ mod tests {
         assert_eq!(prune_unknown_deps(&mut steps), vec!["r1_2 -> r1_9"]);
         assert_eq!(steps[1].depends_on, vec!["r1_1"]);
         validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
+    }
+
+    #[test]
+    fn change_verbs_are_recognised_whatever_the_risk_estimate_says() {
+        for g in ["now replace the word \"world\" with \"keyhan\" in test.txt.", "rename foo to bar", "delete a.txt", "add a line to notes.md"] {
+            assert!(asks_for_change(g), "{g}");
+        }
+        for g in ["read test.txt", "what is 2 + 2?", "list the files"] {
+            assert!(!asks_for_change(g), "{g}");
+        }
     }
 
     #[test]

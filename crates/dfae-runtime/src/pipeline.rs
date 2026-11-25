@@ -655,8 +655,9 @@ impl Inner {
         planner::validate_plan(&steps, &self.tools, &allowed, &remaining)?;
         if expect_effect {
             let member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
-            let changes =
-                !member && !planner::is_conditional(goal) && ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && r.risk != Risk::Low).unwrap_or(false);
+            let wants_change =
+                ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools && (r.risk != Risk::Low || planner::asks_for_change(goal))).unwrap_or(false);
+            let changes = !member && !planner::is_conditional(goal) && wants_change;
             if changes && let Some(p) = planner::missing_effect(&steps, &self.tools, &allowed) {
                 return Err(vec![p]);
             }
