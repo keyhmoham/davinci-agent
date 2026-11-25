@@ -40,12 +40,19 @@ pub struct GenerationRequest {
     pub json: bool,
     /// What the call is for (`plan`, `step`, `answer`, ...); used by the ledger.
     pub purpose: String,
+    /// `system` is a large, stable prefix that is worth caching: providers with explicit caching mark it
+    /// (Anthropic `cache_control`); the others cache a long identical prefix on their own.
+    pub cache: bool,
+    /// A JSON schema the output must follow (constrained decoding on servers that support it).
+    pub schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Part of `prompt_tokens` the provider served from its prompt cache (billed at a fraction).
+    pub cached_tokens: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +68,10 @@ pub trait LanguageModel: Send + Sync {
     async fn generate(&self, request: GenerationRequest) -> Result<GenerationResponse, ModelError>;
     async fn health(&self) -> bool {
         true
+    }
+    /// Does this provider bill a long repeated prompt prefix at a fraction (prompt caching)?
+    fn caches_prompts(&self) -> bool {
+        false
     }
 }
 

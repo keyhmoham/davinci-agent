@@ -100,6 +100,14 @@ impl ToolMetadata {
         format!("{}: {}", self.name, first.trim_end_matches('.'))
     }
 
+    /// A catalogue line for a prompt prefix that is cached (so its length is cheap): the parameter names, which are
+    /// optional (`?`), and the whole description.
+    pub fn catalog_line(&self) -> String {
+        let params: Vec<String> = self.params.iter().map(|p| if p.required { p.name.clone() } else { format!("{}?", p.name) }).collect();
+        let desc: String = self.description.chars().take(420).collect();
+        format!("{}({}): {}", self.name, params.join(", "), desc.trim_end_matches('.'))
+    }
+
     /// The signature plus what each parameter means: for self-hosted models, where extra prompt text costs nothing.
     pub fn signature_detailed(&self) -> String {
         let help: Vec<String> = self.params.iter().filter(|p| !p.description.trim().is_empty()).map(|p| format!("{}: {}", p.name, p.description)).collect();

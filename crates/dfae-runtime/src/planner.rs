@@ -79,7 +79,7 @@ pub fn plan_from_calls(goal: &str, calls: &[DirectCall]) -> Plan {
         }
         steps.push(s);
     }
-    Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None }
+    Plan { goal: goal.into(), steps, source: PlanSource::Direct, revision: 0, estimate: None, report: None }
 }
 
 /// Tools a planner needs next to `tool` to use it properly.
@@ -100,7 +100,7 @@ pub fn companions(tool: &str) -> &'static [&'static str] {
 /// needs a capability none of the tools has, so the reply says so honestly.
 pub fn chat_plan(goal: &str, gap: bool) -> Plan {
     let desc = if gap { "reply; no tool fits this request" } else { "reply" };
-    Plan { goal: goal.into(), steps: vec![Step::reasoning("s1", desc)], source: PlanSource::Chat, revision: 0, estimate: None }
+    Plan { goal: goal.into(), steps: vec![Step::reasoning("s1", desc)], source: PlanSource::Chat, revision: 0, estimate: None, report: None }
 }
 
 /// Parse a model-produced plan. `prefix` is prepended to every new step id
@@ -181,6 +181,97 @@ pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str,
         s.strong = raw.get("strong").and_then(|b| b.as_bool()).unwrap_or(false);
     }
     Ok(steps)
+}
+
+static LINE_STEP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?P<id>[A-Za-z][A-Za-z0-9_]*)\s+(?P<tool>[A-Za-z_][A-Za-z0-9_]*|-)(?P<meta>(?:\s+(?:after=[A-Za-z0-9_,]*|strong))*)\s*:\s*(?P<do>.*)$")
+        .unwrap()
+});
+
+/// Parse the compact line format of a brief plan into the same JSON shape `parse_brief_plan` reads:
+///
+/// ```text
+/// s1 fs_mkdir: create the directory site
+/// s2 fs_write after=s1: write site/index.html, a page that says hello
+///   expect: site/index.html exists
+/// s3 - after=s2 strong: summarise what was built
+/// report: The page is in site/index.html.
+/// ```
+///
+/// A model that answers in JSON anyway is accepted as is. Roughly a quarter of the output tokens of the JSON form.
+pub fn parse_line_plan(text: &str) -> Result<Value, String> {
+    if let Some(v) = dfae_models::extract_json(text)
+        && v.get("steps").is_some()
+    {
+        return Ok(v);
+    }
+    let mut steps: Vec<Value> = Vec::new();
+    let mut report: Option<String> = None;
+    let mut in_report = false;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("```") {
+            continue;
+        }
+        if in_report {
+            report = report.map(|r| format!("{r}\n{t}"));
+            continue;
+        }
+        let lower = t.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("report:") {
+            let at = t.len() - rest.len();
+            report = Some(t[at..].trim().to_string());
+            in_report = true;
+            continue;
+        }
+        let indented = line.starts_with(char::is_whitespace);
+        if indented || lower.starts_with("expect:") {
+            let Some(last) = steps.last_mut() else { continue };
+            if let Some(rest) = lower.strip_prefix("expect:") {
+                last["expect"] = Value::String(t[t.len() - rest.len()..].trim().to_string());
+            } else if let Some(d) = last["do"].as_str() {
+                // a long sentence the model wrapped
+                last["do"] = Value::String(format!("{d} {t}"));
+            }
+            continue;
+        }
+        if let Some(c) = LINE_STEP.captures(t) {
+            let mut after: Vec<String> = Vec::new();
+            let mut strong = false;
+            for part in c["meta"].split_whitespace() {
+                if let Some(ids) = part.strip_prefix("after=") {
+                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(str::to_string));
+                } else if part == "strong" {
+                    strong = true;
+                }
+            }
+            let tool = if &c["tool"] == "-" { Value::Null } else { Value::String(c["tool"].to_string()) };
+            steps.push(json!({"id": &c["id"], "tool": tool, "do": c["do"].trim(), "after": after, "strong": strong}));
+        }
+    }
+    if steps.is_empty() {
+        return Err("no plan lines found (expected `<id> <tool|-> [after=ids]: <intent>`)".into());
+    }
+    let mut v = json!({"steps": steps});
+    if let Some(r) = report.filter(|r| !r.is_empty()) {
+        v["report"] = Value::String(r);
+    }
+    Ok(v)
+}
+
+/// The planner's pre-written final reply, if it is usable: every `{{id}}` in it names a step of the plan.
+pub fn plan_report(v: &Value, steps: &[Step]) -> Option<String> {
+    let r = v.get("report").and_then(|r| r.as_str()).map(str::trim).filter(|r| !r.is_empty())?;
+    let ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    // ids in the report follow the same renumbering as the steps only for a first plan; a re-plan sets its own
+    TEMPLATE.captures_iter(r).all(|c| ids.contains(&c[1])).then(|| r.to_string())
+}
+
+/// Does every `{{id}}` in a report name a step of the plan?
+pub fn report_refs_exist(report: &str, steps: &[Step]) -> bool {
+    let ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    TEMPLATE.captures_iter(report).all(|c| ids.contains(&c[1]))
 }
 
 static PATHLIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\w.\-]+(?:/[\w.\-]+)+/?|[\w\-]+\.[A-Za-z0-9]{1,6}\b").unwrap());
@@ -591,5 +682,59 @@ mod tests {
         let v = json!({"a": "x {{s1}} y", "b": ["{{s2}}"]});
         let out = substitute(&v, &|id| Some(format!("<{id}>")));
         assert_eq!(out, json!({"a": "x <s1> y", "b": ["<s2>"]}));
+    }
+}
+
+#[cfg(test)]
+mod line_format_tests {
+    use super::*;
+    use dfae_memory::InMemoryStore;
+    use dfae_tools::{PolicyConfig, PolicyEngine, register_native};
+    use std::sync::Arc;
+
+    fn registry() -> ToolRegistry {
+        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), std::env::temp_dir()));
+        let mut r = ToolRegistry::new();
+        register_native(&mut r, policy, Arc::new(InMemoryStore::new()));
+        r
+    }
+
+    const PLAN: &str = "```\ns1 fs_mkdir: create the directory site\ns2 fs_write after=s1: write site/index.html, a page that says hello\n  expect: site/index.html exists\ns3 shell after=s2 strong: run `python3 -m http.server 8000` in site\nreport: Served at http://localhost:8000 ({{s3}})\n```";
+
+    #[test]
+    fn lines_become_the_same_plan_the_json_form_gives() {
+        let r = registry();
+        let v = parse_line_plan(PLAN).unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[1].tool.as_deref(), Some("fs_write"));
+        assert_eq!(steps[1].depends_on, vec!["s1"]);
+        assert_eq!(steps[1].expect.as_deref(), Some("site/index.html exists"));
+        assert!(steps[2].strong && steps[2].brief);
+        assert!(steps[2].description.contains("http.server 8000"));
+        assert_eq!(plan_report(&v, &steps).as_deref(), Some("Served at http://localhost:8000 ({{s3}})"));
+    }
+
+    #[test]
+    fn a_reasoning_step_uses_a_dash_and_wrapped_sentences_join() {
+        let v = parse_line_plan("s1 fs_read: read a.txt\ns2 - after=s1: count the words\n  and say the number").unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
+        assert_eq!(steps[1].kind, StepKind::Reasoning);
+        assert_eq!(steps[1].description, "count the words and say the number");
+        assert!(plan_report(&v, &steps).is_none());
+    }
+
+    #[test]
+    fn json_output_is_still_accepted_and_prose_is_an_error() {
+        let v = parse_line_plan(r#"{"steps":[{"id":"s1","tool":"fs_read","do":"read a.txt"}],"report":"{{s1}}"}"#).unwrap();
+        assert!(v["report"].is_string());
+        assert!(parse_line_plan("Sure, here is my plan: first read the file").is_err());
+    }
+
+    #[test]
+    fn a_report_that_names_a_missing_step_is_dropped() {
+        let v = parse_line_plan("s1 fs_read: read a.txt\nreport: it says {{s9}}").unwrap();
+        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
+        assert!(plan_report(&v, &steps).is_none());
     }
 }

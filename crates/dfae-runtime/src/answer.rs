@@ -38,6 +38,25 @@ pub fn evidence_block(rec: &TaskRecord, per_step_tokens: usize) -> String {
     lines.join("\n")
 }
 
+/// The reply the planner wrote ahead of time, with each `{{id}}` replaced by that step's output. `None` unless every
+/// step of the plan succeeded and every placeholder could be filled: a report describes the run that was planned.
+pub fn render_report(plan: &Plan) -> Option<String> {
+    let report = plan.report.as_deref()?;
+    if plan.steps.is_empty() || plan.steps.iter().any(|s| s.status != StepStatus::Succeeded) {
+        return None;
+    }
+    static REF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}").unwrap());
+    let mut missing = false;
+    let out = REF.replace_all(report, |c: &regex::Captures| match plan.steps.iter().find(|s| s.id == c[1]) {
+        Some(s) => tokens::truncate_tokens(s.output.as_deref().or(s.summary.as_deref()).unwrap_or("").trim(), 700),
+        None => {
+            missing = true;
+            String::new()
+        }
+    });
+    (!missing && !out.trim().is_empty()).then(|| out.trim().to_string())
+}
+
 /// Deterministic answer built from step outputs (no model involved).
 pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
     let Some(plan) = &rec.plan else {
@@ -117,6 +136,14 @@ pub fn ungrounded_claims(answer: &str, evidence: &str, goal: &str) -> Vec<String
 }
 
 impl Inner {
+    /// Did any step that changes something finish?
+    fn did_change(&self, plan: &Plan) -> bool {
+        plan.steps.iter().any(|s| {
+            s.status == StepStatus::Succeeded
+                && (s.kind == StepKind::Agent || s.tool.as_deref().and_then(|t| self.tools.meta(t)).map(|m| m.side_effects).unwrap_or(false))
+        })
+    }
+
     pub(crate) async fn stage_answer(self: &Arc<Self>, ctx: &Arc<TaskCtx>, mode: ExecMode, exec_err: Option<&str>) {
         let snapshot = ctx.rec.lock().await.clone();
         let goal = snapshot.goal.clone();
@@ -124,6 +151,22 @@ impl Inner {
             ctx.rec.lock().await.final_answer = Some(templated_answer(&snapshot, exec_err));
             return;
         };
+        // the planner wrote the reply together with the plan and the run went as planned: no answer call at all
+        if exec_err.is_none()
+            && self.cfg.economy.plan_report
+            && let Some(text) = render_report(&plan)
+        {
+            let text = crate::style::compact(&text);
+            let result = {
+                let mut r = ctx.rec.lock().await;
+                r.final_answer = Some(text);
+                r.verification.clone()
+            };
+            if let Some(v) = result {
+                self.emit(ctx, EventKind::Verification { result: v }).await;
+            }
+            return;
+        }
         // a lone reasoning leaf *is* the answer: no extra model call
         let leaves: Vec<&Step> = plan.steps.iter().filter(|s| !plan.steps.iter().any(|o| o.depends_on.contains(&s.id))).collect();
         let single_leaf = if leaves.len() == 1 && leaves[0].kind == StepKind::Reasoning && leaves[0].status == StepStatus::Succeeded {
@@ -135,23 +178,66 @@ impl Inner {
         // only tool output is ground truth: a model's own prose must never vouch for itself
         let evidence_full: String = plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
         let mut from_model = false;
-        let text = if exec_err.is_some() || !plan.has_reasoning() {
+        // A plan of tool steps only has no prose in it; for a task the external model planned, the self-hosted one
+        // writes the reply from the evidence (free), kept only if it states nothing the evidence does not contain.
+        let tools_only_local = exec_err.is_none()
+            && !plan.has_reasoning()
+            && plan.source != PlanSource::Chat
+            && self.cfg.economy.answer_local_first
+            && self.pick_tier(mode) == Some(Tier::Strong)
+            && self.models.has(Tier::Slm)
+            && (plan.steps.len() > 1 || self.did_change(&plan));
+        let composed_locally = if tools_only_local {
+            let user = format!("REQUEST: {goal}\nEVIDENCE:\n{}", evidence_block(&snapshot, 800));
+            match self.generate_text(ctx, Tier::Slm, self.gen_request(Tier::Slm, prompts::ANSWER_SYSTEM, user, "answer_local")).await {
+                Ok(t) => {
+                    let t = crate::style::compact(t.trim());
+                    (!t.is_empty() && ungrounded_claims(&t, &evidence_full, &goal).is_empty()).then_some(t)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let text = if let Some(t) = composed_locally {
+            from_model = true;
+            t
+        } else if exec_err.is_some() || !plan.has_reasoning() {
             templated_answer(&snapshot, exec_err)
         } else if let Some(t) = single_leaf {
             from_model = true;
             t
         } else if let Some(tier) = self.pick_tier(mode) {
-            // the paid model gets tight evidence; a self-hosted one gets what the steps produced
-            let ev = evidence_block(&snapshot, if tier == Tier::Strong { 220 } else { 800 });
-            let user = format!("REQUEST: {goal}\nEVIDENCE:\n{ev}");
-            match self.generate_text(ctx, tier, self.gen_request(tier, prompts::ANSWER_SYSTEM, user, "answer")).await {
-                Ok(t) => {
-                    from_model = true;
-                    t.trim().to_string()
+            // The self-hosted model writes the answer first (it is free, and gets the full evidence); the external one
+            // is asked only when the draft states a number, path or address that the evidence does not contain.
+            let local = if tier == Tier::Strong && self.cfg.economy.answer_local_first && self.models.has(Tier::Slm) {
+                let user = format!("REQUEST: {goal}\nEVIDENCE:\n{}", evidence_block(&snapshot, 800));
+                match self.generate_text(ctx, Tier::Slm, self.gen_request(Tier::Slm, prompts::ANSWER_SYSTEM, user, "answer_local")).await {
+                    Ok(t) => {
+                        let t = crate::style::compact(t.trim());
+                        (!t.is_empty() && ungrounded_claims(&t, &evidence_full, &goal).is_empty()).then_some(t)
+                    }
+                    Err(_) => None,
                 }
-                Err(e) => {
-                    self.emit(ctx, EventKind::Warning { message: format!("answer synthesis failed ({e}); returning raw evidence") }).await;
-                    templated_answer(&snapshot, None)
+            } else {
+                None
+            };
+            if let Some(t) = local {
+                from_model = true;
+                t
+            } else {
+                // the paid model gets tight evidence; a self-hosted one gets what the steps produced
+                let ev = evidence_block(&snapshot, if tier == Tier::Strong { 220 } else { 800 });
+                let user = format!("REQUEST: {goal}\nEVIDENCE:\n{ev}");
+                match self.generate_text(ctx, tier, self.gen_request(tier, prompts::ANSWER_SYSTEM, user, "answer")).await {
+                    Ok(t) => {
+                        from_model = true;
+                        t.trim().to_string()
+                    }
+                    Err(e) => {
+                        self.emit(ctx, EventKind::Warning { message: format!("answer synthesis failed ({e}); returning raw evidence") }).await;
+                        templated_answer(&snapshot, None)
+                    }
                 }
             }
         } else {
@@ -168,10 +254,7 @@ impl Inner {
         }
         // a model must not tell the user something was changed when no step that changes anything finished
         let asked_to_change = snapshot.route.as_ref().map(|r| r.needs_tools && r.changes && !r.conditional).unwrap_or(false);
-        let did_change = plan.steps.iter().any(|s| {
-            s.status == StepStatus::Succeeded
-                && (s.kind == StepKind::Agent || s.tool.as_deref().and_then(|t| self.tools.meta(t)).map(|m| m.side_effects).unwrap_or(false))
-        });
+        let did_change = self.did_change(&plan);
         if from_model && asked_to_change && !did_change && plan.source != PlanSource::Chat {
             text.push_str("\n⚠ Nothing was changed: no step that modifies anything completed.");
         }

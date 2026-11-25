@@ -101,6 +101,9 @@ pub(crate) struct Inner {
     pub dispatcher: Dispatcher,
     pub cost: crate::economy::CostModel,
     pub live: Mutex<HashMap<String, Arc<TaskCtx>>>,
+    /// Consecutive planner calls that sent the cacheable prefix and got no cache hit (see `prefix_enabled`).
+    pub prefix_misses: std::sync::atomic::AtomicU32,
+    pub prefix_policy: Mutex<crate::economy::prefix::PrefixPolicy>,
 }
 
 /// The agent engine. Cheap to clone.
@@ -155,6 +158,8 @@ impl Engine {
                 policy: deps.policy,
                 bus: EventBus::new(),
                 live: Mutex::new(HashMap::new()),
+                prefix_misses: std::sync::atomic::AtomicU32::new(0),
+                prefix_policy: Mutex::new(Default::default()),
             }),
         }
     }
@@ -467,7 +472,30 @@ impl Inner {
         }
     }
 
+    /// Should this planner call carry the long cacheable prefix? Only when the provider caches prompts and has not been
+    /// seen to ignore the prefix (three prefixed calls in a row without a cache hit), and — unless forced with
+    /// `DFAE_PLAN_PREFIX=always` — only while traffic is dense enough for the cache to stay warm (`PrefixPolicy`).
+    pub(crate) fn prefix_enabled(&self) -> bool {
+        let eco = &self.cfg.economy;
+        if !eco.plan_prefix || !self.models.caches_prompts(Tier::Strong) || self.prefix_misses.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+            return false;
+        }
+        eco.plan_prefix_always || self.prefix_policy.lock().decide(std::time::Instant::now())
+    }
+
     pub(crate) async fn add_ledger(&self, ctx: &Arc<TaskCtx>, entry: LedgerEntry) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if entry.component == Component::Strong
+            && matches!(entry.purpose.as_str(), "plan" | "plan_escalated" | "plan_repair" | "replan" | "replan_repair")
+            && entry.prompt_tokens >= 1200
+        {
+            // a planner call this large carried the prefix: did the provider serve it from cache?
+            if entry.cached_tokens > 0 {
+                self.prefix_misses.store(0, Relaxed);
+            } else {
+                self.prefix_misses.fetch_add(1, Relaxed);
+            }
+        }
         if matches!(entry.component, Component::Slm | Component::Strong) {
             self.emit(
                 ctx,
@@ -560,6 +588,26 @@ impl Inner {
         }
     }
 
+    /// A plan reply. In the compact line format one call yields text that is parsed here (the model never has to produce
+    /// JSON syntax); as JSON the gateway's own repair applies. The outer `Err` is a failed model call; the inner one is
+    /// a reply that could not be read (with the raw text, for the repair round).
+    pub(crate) async fn gen_plan(
+        &self,
+        ctx: &Arc<TaskCtx>,
+        tier: Tier,
+        mut req: GenerationRequest,
+        lines: bool,
+    ) -> Result<(Result<Value, String>, String), String> {
+        if !lines {
+            let v = self.gen_json(ctx, tier, req).await?;
+            let raw = v.to_string();
+            return Ok((Ok(v), raw));
+        }
+        req.json = false;
+        let text = self.generate_text(ctx, tier, req).await?;
+        Ok((crate::planner::parse_line_plan(&text), text))
+    }
+
     pub(crate) fn pick_tier(&self, mode: ExecMode) -> Option<Tier> {
         let (first, second) = if mode == ExecMode::Escalated { (Tier::Strong, Tier::Slm) } else { (Tier::Slm, Tier::Strong) };
         if self.models.has(first) {
@@ -585,6 +633,8 @@ impl Inner {
             temperature: 0.1,
             json: false,
             purpose: purpose.into(),
+            cache: false,
+            schema: None,
         }
     }
 

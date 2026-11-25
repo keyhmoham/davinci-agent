@@ -825,29 +825,38 @@ impl Inner {
         };
         let prefix = format!("r{replans}_");
         let ctx_text = self.context_text(ctx, false, tier).await;
-        let sigs = if tier == Tier::Strong { self.tools.signatures(&allowed) } else { self.tools.signatures_detailed(&allowed) };
         // the external model re-plans in intents, as it planned; a self-hosted one in concrete steps
         let brief = tier == Tier::Strong;
-        let sigs = if brief { self.tools.brief_lines(&allowed) } else { sigs };
-        let user = prompts::replan_user(&sigs, &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
-        let mut req = self.gen_request(tier, if brief { prompts::BRIEF_REPLAN_SYSTEM } else { prompts::REPLAN_SYSTEM }, user, "replan");
-        req.json = true;
+        let lines = brief && self.cfg.economy.plan_lines;
+        let mut req = if brief {
+            self.brief_request(ctx, &allowed, &ctx_text, budget.max_steps.min(12), Some((&done, problem, &prefix)), "replan")
+        } else {
+            let user = prompts::replan_user(&self.tools.signatures_detailed(&allowed), &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
+            let mut req = self.gen_request(tier, prompts::REPLAN_SYSTEM, user, "replan");
+            req.json = true;
+            req
+        };
+        let mut new_report: Option<String> = None;
         // Like the first plan, a re-plan gets one repair round: what was wrong with it is told to the model.
         let mut merged: Option<Vec<Step>> = None;
         let mut last_problem = String::new();
         for attempt in 0..2 {
-            let v = self.gen_json(ctx, tier, req.clone()).await?;
-            let parsed = if brief {
-                planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
-            } else {
-                planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
-            };
+            let (reply, raw) = self.gen_plan(ctx, tier, req.clone(), lines).await?;
+            let parsed = reply.and_then(|v| {
+                let steps = if brief {
+                    planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
+                } else {
+                    planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
+                }?;
+                Ok((steps, v))
+            });
             let problems: Vec<String> = match parsed {
                 Err(e) => vec![e],
-                Ok(mut new_steps) => {
+                Ok((mut new_steps, v)) => {
                     if new_steps.is_empty() {
                         return Ok(false);
                     }
+                    new_report = planner::plan_report(&v, &new_steps);
                     self.repair_plan_args(ctx, &mut new_steps, goal).await;
                     let mut all: Vec<Step> = {
                         let r = ctx.rec.lock().await;
@@ -871,8 +880,9 @@ impl Inner {
             };
             last_problem = problems.join("; ");
             if attempt == 0 {
-                req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
-                req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
+                req.messages.push(Message::assistant(tokens::truncate_tokens(&raw, 500)));
+                let again = if lines { "Return the corrected plan lines only." } else { "Return the corrected JSON only." };
+                req.messages.push(Message::user(format!("Invalid plan:\n- {}\n{again}", problems.join("\n- "))));
                 req.purpose = "replan_repair".into();
             }
         }
@@ -881,6 +891,9 @@ impl Inner {
             let mut r = ctx.rec.lock().await;
             let p = r.plan.as_mut().ok_or("no plan")?;
             p.steps = merged;
+            // the pre-written reply of the old plan describes steps that no longer stand; the re-plan may bring its own,
+            // but only its own new steps are ids it can refer to
+            p.report = if self.cfg.economy.plan_report { new_report.filter(|r| planner::report_refs_exist(r, &p.steps)) } else { None };
             p.revision += 1;
             p.clone()
         };

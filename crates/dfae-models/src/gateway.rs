@@ -38,6 +38,14 @@ impl ModelGateway {
         }
     }
 
+    /// Does this tier's provider bill a repeated prompt prefix at a fraction?
+    pub fn caches_prompts(&self, tier: Tier) -> bool {
+        match tier {
+            Tier::Slm => self.slm.as_ref().map(|m| m.caches_prompts()).unwrap_or(false),
+            Tier::Strong => self.strong.as_ref().map(|m| m.caches_prompts()).unwrap_or(false),
+        }
+    }
+
     pub fn model_name(&self, tier: Tier) -> Option<String> {
         match tier {
             Tier::Slm => self.slm.as_ref().map(|m| m.name().to_string()),
@@ -69,10 +77,10 @@ impl ModelGateway {
         let started = Instant::now();
         let resp = model.generate(req).await?;
         let latency_ms = started.elapsed().as_millis() as u64;
-        let (p, c) = if resp.usage.prompt_tokens + resp.usage.completion_tokens > 0 {
-            (resp.usage.prompt_tokens, resp.usage.completion_tokens)
+        let (p, c, cached) = if resp.usage.prompt_tokens + resp.usage.completion_tokens > 0 {
+            (resp.usage.prompt_tokens, resp.usage.completion_tokens, resp.usage.cached_tokens.min(resp.usage.prompt_tokens))
         } else {
-            (est_prompt, tokens::estimate_tokens(&resp.text) as u64)
+            (est_prompt, tokens::estimate_tokens(&resp.text) as u64, 0)
         };
         Ok(Generated {
             entry: LedgerEntry {
@@ -82,6 +90,7 @@ impl ModelGateway {
                 purpose,
                 prompt_tokens: p,
                 completion_tokens: c,
+                cached_tokens: cached,
                 latency_ms,
                 cached: false,
                 origin: None,
@@ -171,7 +180,16 @@ mod tests {
     }
 
     fn req() -> GenerationRequest {
-        GenerationRequest { system: "s".into(), messages: vec![Message::user("u")], max_tokens: 100, temperature: 0.0, json: true, purpose: "plan".into() }
+        GenerationRequest {
+            system: "s".into(),
+            messages: vec![Message::user("u")],
+            max_tokens: 100,
+            temperature: 0.0,
+            json: true,
+            purpose: "plan".into(),
+            cache: false,
+            schema: None,
+        }
     }
 
     #[tokio::test]

@@ -364,6 +364,7 @@ impl Inner {
                     purpose: "extract".into(),
                     prompt_tokens: 0,
                     completion_tokens: 0,
+                    cached_tokens: 0,
                     latency_ms: latency,
                     cached,
                     origin: None,
@@ -641,19 +642,22 @@ impl Inner {
                 )
                 .await;
             }
-            let (sigs, system) = if brief {
-                (self.tools.brief_lines(&allowed), prompts::BRIEF_PLAN_SYSTEM)
+            let ctx_text = format!("{ctx_text}{}", self.workspace_line(ctx).await);
+            let purpose = if attempt == 0 { "plan" } else { "plan_escalated" };
+            let req = if brief {
+                self.brief_request(ctx, &allowed, &ctx_text, budget.max_steps.min(12), None, purpose)
             } else {
-                (self.tools.signatures_detailed(&allowed), prompts::PLAN_SYSTEM_LOCAL)
+                let sigs = self.tools.signatures_detailed(&allowed);
+                let user = prompts::plan_user(&sigs, &ctx_text, budget.max_steps.min(12));
+                let mut req = self.gen_request(tier, prompts::PLAN_SYSTEM_LOCAL, user, purpose);
+                req.json = true;
+                req
             };
-            let user = prompts::plan_user(&sigs, &ctx_text, budget.max_steps.min(12));
-            let mut req = self.gen_request(tier, system, user, if attempt == 0 { "plan" } else { "plan_escalated" });
-            req.json = true;
             let source = if tier == Tier::Strong { PlanSource::Strong } else { PlanSource::Slm };
             match self.try_plan(ctx, tier, req, goal, source, &allowed, brief).await {
-                Ok(steps) => {
+                Ok((steps, report)) => {
                     let _ = entities;
-                    return Ok((Plan { goal: goal.into(), steps, source, revision: 0, estimate: None }, used_mode));
+                    return Ok((Plan { goal: goal.into(), steps, source, revision: 0, estimate: None, report }, used_mode));
                 }
                 Err(e) => {
                     last_err = e;
@@ -694,25 +698,77 @@ impl Inner {
         source: PlanSource,
         allowed: &[String],
         brief: bool,
-    ) -> Result<Vec<Step>, String> {
+    ) -> Result<(Vec<Step>, Option<String>), String> {
+        let lines = brief && self.cfg.economy.plan_lines;
         let parse =
             |v: &Value| if brief { planner::parse_brief_plan(v, goal, source, "", &self.tools) } else { planner::parse_plan(v, goal, source, "", &self.tools) };
-        let v = self.gen_json(ctx, tier, req.clone()).await?;
+        let (reply, raw) = self.gen_plan(ctx, tier, req.clone(), lines).await?;
         let _ = allowed; // the live list is ctx.allowed: admitting a tool below widens it
-        let problems = match parse(&v) {
-            Ok(steps) => match self.finish_plan(ctx, steps, goal, true).await {
-                Ok(steps) => return Ok(steps),
+        let problems = match reply.and_then(|v| parse(&v).map(|s| (s, v))) {
+            Ok((steps, v)) => match self.finish_plan(ctx, steps, goal, true).await {
+                Ok(steps) => {
+                    let report = if self.cfg.economy.plan_report { planner::plan_report(&v, &steps) } else { None };
+                    return Ok((steps, report));
+                }
                 Err(errs) => errs,
             },
             Err(e) => vec![e],
         };
-        req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
-        req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
+        req.messages.push(Message::assistant(tokens::truncate_tokens(&raw, 500)));
+        let again = if lines { "Return the corrected plan lines only." } else { "Return the corrected JSON only." };
+        req.messages.push(Message::user(format!("Invalid plan:\n- {}\n{again}", problems.join("\n- "))));
         req.purpose = "plan_repair".into();
-        let v2 = self.gen_json(ctx, tier, req).await?;
+        let (reply2, _) = self.gen_plan(ctx, tier, req, lines).await?;
+        let v2 = reply2?;
         let steps = parse(&v2)?;
         // the second attempt is judged on validity alone: a plan that is merely less ambitious is still a plan
-        self.finish_plan(ctx, steps, goal, false).await.map_err(|e| e.join("; "))
+        let steps = self.finish_plan(ctx, steps, goal, false).await.map_err(|e| e.join("; "))?;
+        let report = if self.cfg.economy.plan_report { planner::plan_report(&v2, &steps) } else { None };
+        Ok((steps, report))
+    }
+
+    /// What the workspace holds, one line, for a request that has to touch it (empty when the request needs no tools).
+    pub(crate) async fn workspace_line(&self, ctx: &Arc<TaskCtx>) -> String {
+        if !self.cfg.economy.workspace_snapshot {
+            return String::new();
+        }
+        let needs_tools = ctx.rec.lock().await.route.as_ref().map(|r| r.needs_tools).unwrap_or(false);
+        if !needs_tools {
+            return String::new();
+        }
+        let s = crate::workspace::snapshot(self.policy.workspace(), 24);
+        if s.is_empty() { s } else { format!("\n{s}") }
+    }
+
+    /// Everything stable about planning for the external model (rules, the whole tool catalogue, examples) is the system
+    /// prompt, byte-identical from task to task so the provider's cache serves it; what changes — the shortlist of
+    /// likely tools, the context, and for a re-plan what is done and what went wrong — is the user message.
+    pub(crate) fn brief_request(
+        &self,
+        ctx: &Arc<TaskCtx>,
+        allowed: &[String],
+        ctx_text: &str,
+        max_steps: u32,
+        replan: Option<(&str, &str, &str)>,
+        purpose: &str,
+    ) -> GenerationRequest {
+        let eco = &self.cfg.economy;
+        let catalog = self.prefix_enabled().then(|| {
+            let mut names: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
+            names.sort();
+            self.tools.catalog_lines(&names)
+        });
+        let system = prompts::brief_system(eco.plan_lines, eco.plan_report, catalog.as_deref());
+        let user = match (&catalog, replan) {
+            (Some(_), None) => prompts::plan_user_shortlist(allowed, ctx_text, max_steps),
+            (Some(_), Some((done, problem, prefix))) => prompts::replan_user_shortlist(allowed, ctx_text, done, problem, prefix, max_steps),
+            (None, None) => prompts::plan_user(&self.tools.brief_lines(allowed), ctx_text, max_steps),
+            (None, Some((done, problem, prefix))) => prompts::replan_user_brief(&self.tools.brief_lines(allowed), ctx_text, done, problem, prefix, max_steps),
+        };
+        let mut req = self.gen_request(Tier::Strong, &system, user, purpose);
+        req.json = !eco.plan_lines;
+        req.cache = catalog.is_some();
+        req
     }
 
     /// Everything code can do for a freshly parsed plan before a model is asked again:

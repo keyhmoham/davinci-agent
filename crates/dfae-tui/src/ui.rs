@@ -1375,7 +1375,14 @@ mod tests {
         rec.entities.push(Entity { label: "file path".into(), text: "a.txt".into(), start: None, end: None, score: 1.0, source: "rules".into() });
         let mut s = Step::tool("s1", "fs_write", "write", serde_json::json!({"path": "a.txt", "content": "hi"}));
         s.status = StepStatus::WaitingApproval;
-        rec.plan = Some(Plan { goal: "g".into(), steps: vec![s, Step::reasoning("s2", "explain")], source: PlanSource::Direct, revision: 0, estimate: None });
+        rec.plan = Some(Plan {
+            goal: "g".into(),
+            steps: vec![s, Step::reasoning("s2", "explain")],
+            source: PlanSource::Direct,
+            revision: 0,
+            estimate: None,
+            report: None,
+        });
         let now = chrono::Utc::now();
         rec.approvals.push(Approval {
             id: "ap1".into(),
@@ -1530,7 +1537,7 @@ mod tests {
             c2.depends_on = vec!["c1".into()];
             let mut j = Step::reasoning("join", "summarize them");
             j.depends_on = vec!["c1".into(), "c2".into()];
-            d.plan = Some(Plan { goal: "g".into(), steps: vec![c1, c2, j], source: PlanSource::Team, revision: 0, estimate: None });
+            d.plan = Some(Plan { goal: "g".into(), steps: vec![c1, c2, j], source: PlanSource::Team, revision: 0, estimate: None, report: None });
             d.team = Some(TeamInfo {
                 role: AgentRole::Coordinator,
                 link: None,

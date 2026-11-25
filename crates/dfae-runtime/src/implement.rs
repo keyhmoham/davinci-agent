@@ -61,6 +61,7 @@ impl Inner {
                         purpose: "extract_step".into(),
                         prompt_tokens: 0,
                         completion_tokens: 0,
+                        cached_tokens: 0,
                         latency_ms: res.latency_ms,
                         cached: res.cached,
                         origin: None,

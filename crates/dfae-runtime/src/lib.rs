@@ -20,6 +20,7 @@ pub mod skills;
 mod style;
 pub mod team;
 mod verify;
+mod workspace;
 
 pub use bootstrap::build_engine;
 pub use bus::EventBus;

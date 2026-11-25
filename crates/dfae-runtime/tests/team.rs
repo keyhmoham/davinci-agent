@@ -592,7 +592,7 @@ async fn an_interrupted_team_adopts_finished_agents_and_never_reruns_unknown_one
     s2.kind = StepKind::Agent;
     s2.status = StepStatus::Running;
     s2.args = json!({"child": orphan.task_id});
-    parent.plan = Some(Plan { goal: parent.goal.clone(), steps: vec![s1, s2], source: PlanSource::Team, revision: 0, estimate: None });
+    parent.plan = Some(Plan { goal: parent.goal.clone(), steps: vec![s1, s2], source: PlanSource::Team, revision: 0, estimate: None, report: None });
     parent.team = Some(TeamInfo::coordinator("test"));
     for rec in [&parent, &done, &orphan] {
         r.store.put_task(rec).await.unwrap();

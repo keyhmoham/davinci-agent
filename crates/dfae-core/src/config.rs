@@ -80,6 +80,23 @@ pub struct EconomyConfig {
     /// more (`NEED <step>`). Off by default: it trades a possible extra call for
     /// smaller prompts and should be measured on your workload before enabling.
     pub lazy_context: bool,
+    /// The external planner answers in a compact line format instead of JSON (`DFAE_PLAN_FORMAT=json` for JSON).
+    pub plan_lines: bool,
+    /// The external planner's system prompt carries the whole stable tool catalogue and examples, so a provider
+    /// with prompt caching bills it at a fraction after the first call (`DFAE_PLAN_PREFIX=narrow` lists only the
+    /// tools judged relevant instead).
+    pub plan_prefix: bool,
+    /// Send the prefix on every planner call, not only while traffic keeps the provider's cache warm (`DFAE_PLAN_PREFIX=always`).
+    pub plan_prefix_always: bool,
+    /// The plan carries the final reply as a template; when every step succeeds it is rendered and no answer call is made.
+    /// Off by default: the planner pays for the reply in (five-times-priced) output tokens even when a local model would
+    /// have written an equally good one for free. For deployments whose self-hosted model writes poor answers.
+    pub plan_report: bool,
+    /// The final answer is composed by the self-hosted model and checked against the evidence; the external model
+    /// is asked only when that check fails.
+    pub answer_local_first: bool,
+    /// The plan prompt shows what the workspace contains, so the planner does not spend steps exploring it.
+    pub workspace_snapshot: bool,
 }
 
 /// Team orchestration and dispatch limits.
@@ -192,6 +209,12 @@ impl Config {
             economy: EconomyConfig {
                 repair: !matches!(env("DFAE_REPAIR").as_deref(), Some("off" | "false" | "0")),
                 lazy_context: env_bool("DFAE_LAZY_CONTEXT", false),
+                plan_lines: !matches!(env("DFAE_PLAN_FORMAT").as_deref(), Some("json")),
+                plan_prefix: !matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("narrow" | "off")),
+                plan_prefix_always: matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("always")),
+                plan_report: matches!(env("DFAE_PLAN_REPORT").as_deref(), Some("on" | "true" | "1")),
+                answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
+                workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),

@@ -346,6 +346,10 @@ pub struct Plan {
     /// What finishing this plan is expected to cost (set when the plan is accepted).
     #[serde(default)]
     pub estimate: Option<CostEstimate>,
+    /// The final reply as the planner wrote it ahead of time, with `{{sN}}` where a step's output belongs.
+    /// When every step succeeds it is rendered and used as the answer: no answer call is made.
+    #[serde(default)]
+    pub report: Option<String>,
 }
 
 /// Expected *remaining* generative cost of a plan, priced by the learned cost model.

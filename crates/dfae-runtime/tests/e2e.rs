@@ -444,7 +444,7 @@ async fn interrupted_tasks_resume_from_their_checkpoint() {
     let mut s2 = Step::tool("s2", "fs_write", "write", json!({"path": "w.txt", "content": "x"}));
     s2.status = StepStatus::Running; // crashed mid-write: outcome unknown, must NOT be re-run
     s2.depends_on = vec!["s1".into()];
-    rec.plan = Some(Plan { goal: "read a.txt".into(), steps: vec![s1, s2], source: PlanSource::Direct, revision: 0, estimate: None });
+    rec.plan = Some(Plan { goal: "read a.txt".into(), steps: vec![s1, s2], source: PlanSource::Direct, revision: 0, estimate: None, report: None });
     let id = rec.task_id.clone();
     r.store.put_task(&rec).await.unwrap();
     assert_eq!(r.engine.resume_unfinished().await, vec![id.clone()]);

@@ -8,7 +8,7 @@ use dfae_decision::{Calibrator, Decider, LocalDecider};
 use dfae_extract::HybridExtractor;
 use dfae_memory::InMemoryStore;
 use dfae_models::{ModelGateway, ScriptedModel};
-use dfae_runtime::{Engine, EngineDeps, prompts};
+use dfae_runtime::{Engine, EngineDeps};
 use dfae_tools::{PolicyConfig, PolicyEngine, ToolRegistry, register_native};
 use serde_json::json;
 use std::sync::Arc;
@@ -46,12 +46,13 @@ fn rig(picky: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
+    cfg.economy.plan_prefix_always = true;
     tweak(&mut cfg);
     let store = Arc::new(InMemoryStore::new());
     let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf()));
     let mut reg = ToolRegistry::new();
     register_native(&mut reg, policy.clone(), store.clone());
-    let (slm, strong) = (ScriptedModel::new("slm", vec![]), ScriptedModel::new("strong", vec![]));
+    let (slm, strong) = (ScriptedModel::new("slm", vec![]), ScriptedModel::new("strong", vec![]).caching());
     let provider: Option<Arc<dyn DecisionProvider>> = picky.then(|| Arc::new(Picky(LocalDecider::new(cfg.thresholds.clone()))) as Arc<dyn DecisionProvider>);
     let engine = Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(provider, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
@@ -98,17 +99,20 @@ async fn medium_tasks_are_planned_by_the_external_model_and_carried_out_by_the_l
     // acting phase: the SLM writes the reasoning step and fills in the one argument rules cannot (the content)
     r.slm.push("8080");
     r.slm.push(&json!({"content": "{{s2}}"}).to_string());
-    r.strong.push("Wrote 8080 to ports.txt.");
+    // the answer is written locally and checked against the evidence; the external model is not asked for it
+    r.slm.push("Wrote 8080 to ports.txt.");
     let t = run(&r, GOAL).await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(t.final_answer.as_deref(), Some("Wrote 8080 to ports.txt."));
     assert_eq!(t.mode, Some(ExecMode::Escalated), "a medium task goes to the external model by default: {:?}", t.mode_reason);
     assert_eq!(std::fs::read_to_string(r.ws.path().join("ports.txt")).unwrap(), "8080");
 
     // the planner saw a lean brief-plan prompt: one line per tool, no signatures, no arguments requested
     let plan_req = r.strong.requests.lock()[0].clone();
-    assert_eq!(plan_req.system, prompts::BRIEF_PLAN_SYSTEM);
+    assert!(plan_req.system.contains("plan lines") && plan_req.cache, "the stable rules, catalogue and examples are the cacheable system prompt");
+    assert!(plan_req.system.contains("fs_read(path") && plan_req.system.contains("fs_edit("), "the whole catalogue is in the prefix");
     let tools = &plan_req.messages[0].content;
-    assert!(tools.contains("fs_read:") && !tools.contains("path:str*"), "{tools}");
+    assert!(tools.contains("LIKELY TOOLS:") && tools.contains("fs_read") && !tools.contains("path:str*"), "{tools}");
     // the plan is intents the program implemented
     let plan = t.plan.as_ref().unwrap();
     assert_eq!(plan.source, PlanSource::Strong);
@@ -118,9 +122,9 @@ async fn medium_tasks_are_planned_by_the_external_model_and_carried_out_by_the_l
     assert_eq!(s("s2").how.as_deref(), Some("reasoning"));
     assert_eq!(s("s3").how.as_deref(), Some("rules+slm"), "path by rules, content by the SLM");
     assert!(s("s1").expect.is_some() && !s("s1").brief);
-    // the external model was used for the plan and the final answer only; every step ran locally
-    assert_eq!(t.usage.model_calls, 2);
-    assert_eq!(r.slm.calls(), 2);
+    // the external model was used for the plan only; every step and the answer were done locally
+    assert_eq!(t.usage.model_calls, 1);
+    assert_eq!(r.slm.calls(), 3);
     let kinds: Vec<String> =
         events(&r, &t.task_id).iter().filter_map(|e| serde_json::to_value(e).ok()).filter_map(|v| v["type"].as_str().map(String::from)).collect();
     for expect in ["phase", "step_implemented"] {
@@ -188,8 +192,8 @@ async fn a_result_that_misses_the_planners_expectation_goes_back_to_the_external
     let t = run(&r, "Read config.toml and check that the status is fine, using backup.toml if the first one is not, and report which file you used").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     let replan = r.strong.requests.lock().iter().find(|q| q.purpose == "replan").cloned().expect("the planner was asked to re-plan");
-    assert_eq!(replan.system, prompts::BRIEF_REPLAN_SYSTEM);
     let problem = &replan.messages[0].content;
+    assert!(problem.contains("Re-plan:"), "the re-plan rules are in the message, so one cached system prompt serves both: {problem}");
     assert!(problem.contains("does not meet what was expected") && problem.contains("status = BAD"), "the planner is told what was actually found: {problem}");
     assert_eq!(t.plan.as_ref().unwrap().step("s1").unwrap().status, StepStatus::Succeeded, "the result is kept, not thrown away");
     assert!(t.final_answer.as_deref().unwrap().contains("status = fine"), "{:?}", t.final_answer);

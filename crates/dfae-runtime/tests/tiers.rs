@@ -24,11 +24,12 @@ fn rig() -> Rig {
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
+    cfg.economy.plan_prefix_always = true;
     let store = Arc::new(InMemoryStore::new());
     let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf()));
     let mut reg = ToolRegistry::new();
     register_native(&mut reg, policy.clone(), store.clone());
-    let (slm, strong) = (ScriptedModel::new("slm", vec![]), ScriptedModel::new("strong", vec![]));
+    let (slm, strong) = (ScriptedModel::new("slm", vec![]), ScriptedModel::new("strong", vec![]).caching());
     let engine = Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
         extractor: Arc::new(HybridExtractor::new(None)),
@@ -82,9 +83,9 @@ async fn the_planner_prompt_is_generous_for_the_self_hosted_model_and_lean_for_t
     let t = run(&r, "Read big.log and summarise it", ModeRequest::Escalated).await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     let paid = r.strong.requests.lock()[0].clone();
-    assert_eq!(paid.system, prompts::BRIEF_PLAN_SYSTEM);
-    assert!(!paid.system.contains("Examples") && !paid.messages[0].content.contains("params —"));
-    assert!(paid.system.len() < local.system.len(), "the paid prompt is the shorter one");
+    // the paid prompt's stable part (rules, whole catalogue, examples) is one cacheable prefix; what changes per task is short
+    assert!(paid.cache && paid.system.contains("fs_read(path") && !paid.messages[0].content.contains("params —"));
+    assert!(paid.messages[0].content.len() < local.messages[0].content.len(), "the per-task part of the paid prompt is the shorter one");
     assert_eq!(t.usage.model_calls, 2, "the brief plan and the one step the planner kept for itself are the paid calls");
 }
 

@@ -19,7 +19,16 @@ async fn serve(app: Router) -> String {
 }
 
 fn req(json_mode: bool) -> GenerationRequest {
-    GenerationRequest { system: "SYS".into(), messages: vec![Message::user("hello")], max_tokens: 50, temperature: 0.0, json: json_mode, purpose: "t".into() }
+    GenerationRequest {
+        system: "SYS".into(),
+        messages: vec![Message::user("hello")],
+        max_tokens: 50,
+        temperature: 0.0,
+        json: json_mode,
+        purpose: "t".into(),
+        cache: false,
+        schema: None,
+    }
 }
 
 #[tokio::test]

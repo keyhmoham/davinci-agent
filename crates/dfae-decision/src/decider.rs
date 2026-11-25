@@ -133,6 +133,7 @@ impl Decider {
             purpose: req.kind.as_str().into(),
             prompt_tokens: if from_cache { 0 } else { resp.input_tokens },
             completion_tokens: if from_cache { 0 } else { resp.output_tokens },
+            cached_tokens: 0,
             latency_ms: resp.latency_ms,
             cached: from_cache,
             origin: None,
