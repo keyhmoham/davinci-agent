@@ -15,14 +15,19 @@ deny_names = [".git", ".env", "id_rsa", "id_ed25519", ".ssh", ".aws"]
 
 [shell]
 # executed without a shell (no pipes, redirects, globbing or substitution)
-allowed = ["ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami", "hostname", "stat", "du", "sort", "uniq", "diff", "cut", "tr", "basename", "dirname", "nproc", "id"]
+allowed = ["ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami", "hostname", "stat", "du", "sort", "diff", "cut", "tr", "basename", "dirname", "nproc", "id"]
 # run only after a human approves the exact command
 approval = ["mkdir", "touch", "cp", "mv"]
 # commands whose path-like arguments must stay inside the read roots
-path_checked = ["cat", "head", "tail", "wc", "grep", "find", "ls", "stat", "du", "sort", "uniq", "diff", "cut", "tr"]
-denied_args = ["-exec", "-execdir", "-ok", "-delete", "-fprint", "-fprintf", "-fls", "--exec", "--delete", "-o"]
+path_checked = ["cat", "head", "tail", "wc", "grep", "find", "ls", "stat", "du", "sort", "diff", "cut", "tr"]
 timeout_secs = 10
 max_output_bytes = 65536
+
+# per-command arguments that would make a read-only command write or execute
+[shell.denied_args]
+find = ["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]
+sort = ["-o", "--output"]
+date = ["-s", "--set"]
 
 [network]
 # fetched without approval. "*.example.com" matches subdomains.

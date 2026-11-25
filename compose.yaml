@@ -95,6 +95,8 @@ services:
       - "127.0.0.1:${DFAE_PORT:-8080}:8080"
     # tools run inside this container as an unprivileged user
     read_only: true
+    mem_limit: ${DFAE_MEM_LIMIT:-2g}
+    pids_limit: 512
     tmpfs:
       - /tmp
     cap_drop: [ALL]

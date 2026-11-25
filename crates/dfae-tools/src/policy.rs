@@ -32,8 +32,10 @@ pub struct ShellPolicy {
     pub approval: Vec<String>,
     /// Commands whose path-like arguments must stay inside the read roots.
     pub path_checked: Vec<String>,
-    /// Arguments that turn a safe command into an unsafe one (`find -exec`).
-    pub denied_args: Vec<String>,
+    /// Per-command arguments that turn a read-only command into a writing or
+    /// executing one (`find -exec`, `sort -o`). Matches `ARG`, `ARG=value`, and
+    /// joined short forms (`-ofile`).
+    pub denied_args: std::collections::BTreeMap<String, Vec<String>>,
     pub timeout_secs: u64,
     pub max_output_bytes: usize,
 }
@@ -74,11 +76,18 @@ impl Default for ShellPolicy {
         Self {
             allowed: v(&[
                 "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "uname", "df", "free", "uptime", "ps", "pwd", "whoami", "hostname", "stat",
-                "du", "sort", "uniq", "diff", "cut", "tr", "basename", "dirname", "nproc", "id",
+                "du", "sort", "diff", "cut", "tr", "basename", "dirname", "nproc", "id",
             ]),
             approval: v(&["mkdir", "touch", "cp", "mv"]),
-            path_checked: v(&["cat", "head", "tail", "wc", "grep", "find", "ls", "stat", "du", "sort", "uniq", "diff", "cut", "tr"]),
-            denied_args: v(&["-exec", "-execdir", "-ok", "-delete", "-fprint", "-fprintf", "-fls", "--exec", "--delete", "-o"]),
+            path_checked: v(&["cat", "head", "tail", "wc", "grep", "find", "ls", "stat", "du", "sort", "diff", "cut", "tr"]),
+            denied_args: [
+                ("find", v(&["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"])),
+                ("sort", v(&["-o", "--output"])),
+                ("date", v(&["-s", "--set"])),
+            ]
+            .into_iter()
+            .map(|(k, a)| (k.to_string(), a))
+            .collect(),
             timeout_secs: 10,
             max_output_bytes: 64 * 1024,
         }
@@ -216,21 +225,36 @@ impl PolicyEngine {
         if !allowed && !needs_approval {
             return PolicyDecision::Deny(format!("command '{bin}' is not on the allowlist"));
         }
+        let denied: &[String] = sh.denied_args.get(bin.as_str()).map(|v| v.as_slice()).unwrap_or(&[]);
         for a in &argv[1..] {
-            if sh.denied_args.iter().any(|d| d == a) {
-                return PolicyDecision::Deny(format!("argument '{a}' is not permitted"));
+            let hit = denied.iter().any(|d| {
+                a == d
+                    || a.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with('='))
+                    || (d.len() == 2 && !a.starts_with("--") && a.len() > 2 && a.starts_with(d.as_str()))
+            });
+            if hit {
+                return PolicyDecision::Deny(format!("argument '{a}' is not permitted for {bin}"));
             }
         }
         if sh.path_checked.iter().any(|c| c == bin) || needs_approval {
+            // Every non-flag argument — and the value of `--flag=value` — is
+            // resolved (symlinks included) and must stay inside the roots. This
+            // also catches `du --files0-from=/etc/passwd` and links that point out.
             for a in &argv[1..] {
-                if a.starts_with('-') && !a.contains('/') {
+                let candidate: &str = if a.starts_with('-') {
+                    match a.split_once('=') {
+                        Some((_, v)) => v,
+                        None => continue,
+                    }
+                } else {
+                    a
+                };
+                if candidate.is_empty() {
                     continue;
                 }
-                if a.starts_with('/') || a.contains("..") || a.starts_with('~') {
-                    let res = if needs_approval { guard.write_path(a).map(|_| ()) } else { guard.read_path(a).map(|_| ()) };
-                    if let Err(e) = res {
-                        return PolicyDecision::Deny(e.message);
-                    }
+                let res = if needs_approval { guard.write_path(candidate).map(|_| ()) } else { guard.read_path(candidate).map(|_| ()) };
+                if let Err(e) = res {
+                    return PolicyDecision::Deny(e.message);
                 }
             }
         }
@@ -442,8 +466,36 @@ mod tests {
         assert!(matches!(c("/bin/ls"), PolicyDecision::Deny(_)));
         assert!(matches!(c("cat /etc/passwd"), PolicyDecision::Deny(_)));
         assert!(matches!(c("find . -exec rm {} ;"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("find . -okdir rm {} ;"), PolicyDecision::Deny(_)));
+        // reading / writing outside through option values
+        assert!(matches!(c("du --files0-from=/etc/passwd"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("grep -f /etc/passwd x"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("grep --file=/etc/passwd x"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("sort -o out.txt in.txt"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("sort -oout.txt in.txt"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("sort --output=out.txt in.txt"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("date -s 2020-01-01"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("uniq in.txt out.txt"), PolicyDecision::Deny(_)), "uniq can write its second operand and is not allowlisted");
+        // ordinary flags that merely look similar stay allowed
+        assert_eq!(c("grep -o foo notes.txt"), PolicyDecision::Allow);
+        assert_eq!(c("grep -rn TODO ."), PolicyDecision::Allow);
+        assert_eq!(c("find . -name '*.rs' -type f"), PolicyDecision::Allow);
+        assert_eq!(c("sort notes.txt"), PolicyDecision::Allow);
+        assert_eq!(c("head -n 5 notes.txt"), PolicyDecision::Allow);
+        assert_eq!(c("ls -o"), PolicyDecision::Allow);
         assert!(matches!(c("mkdir out"), PolicyDecision::RequireApproval(_)));
         assert!(matches!(c("ls; rm -rf /"), PolicyDecision::Deny(_)));
+    }
+
+    #[test]
+    fn shell_cannot_follow_a_symlink_out_of_the_workspace() {
+        let (e, d) = engine();
+        std::os::unix::fs::symlink("/etc/passwd", d.path().join("pw")).unwrap();
+        std::os::unix::fs::symlink("/etc", d.path().join("etc")).unwrap();
+        let c = |s: &str| e.check(&meta("shell"), &serde_json::json!({"command": s}), false);
+        assert!(matches!(c("cat pw"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("ls etc"), PolicyDecision::Deny(_)));
+        assert!(matches!(c("grep root etc/passwd"), PolicyDecision::Deny(_)));
     }
 
     #[test]

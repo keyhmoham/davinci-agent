@@ -1,0 +1,10 @@
+what is 12 * (3 + 4)?
+what time is it and list the files in ./
+run `df -h`
+show system status
+remember that the staging database lives on host db-staging-01
+what do you remember about the staging database?
+write 'hello from dfae' to notes/hello.txt
+read notes/hello.txt
+read the file notes/hello.txt and tell me how many words it contains
+check system health and explain whether anything looks unusual
