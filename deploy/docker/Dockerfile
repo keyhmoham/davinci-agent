@@ -1,10 +1,9 @@
-# syntax=docker/dockerfile:1.7
 #
 # Targets:  server (the engine + HTTP API)   tui (the terminal client)
 #
 # Build cache mounts keep incremental image builds fast.
 
-FROM rust:1-bookworm AS build
+FROM docker.arvancloud.ir/rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -19,9 +18,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # coreutils/findutils/diffutils/grep/procps provide the allowlisted shell tools
 # (ls, df, grep, find, ps, free, ...). There is deliberately no shell scripting
 # toolchain, package manager access or compiler in the runtime image.
-FROM debian:bookworm-slim AS runtime-base
+FROM docker.arvancloud.ir/debian:bookworm-slim AS runtime-base
+
+RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' /etc/apt/sources.list.d/debian.sources \
+    && sed -i 's|http://deb.debian.org/debian-security|https://mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources
+
+# Temporarily use HTTP to bootstrap trusted certificates
+RUN sed -i 's|https://|http://|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update
+
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tini procps findutils diffutils grep coreutils \
+ && apt-get install -y --no-install-recommends tini procps findutils diffutils grep coreutils \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --uid 10001 --create-home --shell /usr/sbin/nologin dfae \
  && mkdir -p /workspace && chown dfae:dfae /workspace
