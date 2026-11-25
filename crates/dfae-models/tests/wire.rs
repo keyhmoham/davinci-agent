@@ -183,12 +183,21 @@ async fn diagnosis_says_what_is_wrong_not_just_that_something_is() {
     let m = OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", Some("nope".into()), Duration::from_secs(5));
     let why = m.diagnose().await.unwrap_err();
     assert!(why.contains("401") && why.contains("key was refused"), "{why}");
-    // a server that lists other models
-    let app = Router::new().route("/v1/models", get(|| async { Json(json!({"data": [{"id": "other-model"}]})) }));
+    // a gateway that lists `openai/gpt-x` and takes `gpt-x`, or lists nothing like it but answers for it: usable
+    let app = Router::new()
+        .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "alibaba/qwen-3-14b"}, {"id": "openai/gpt-x"}]})) }))
+        .route("/v1/chat/completions", post(|| async { Json(json!({"model": "gpt-y", "choices": [{"message": {"content": "h"}}]})) }));
+    let base = serve(app).await;
+    assert!(OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", None, Duration::from_secs(5)).diagnose().await.is_ok(), "provider prefix");
+    assert!(OpenAiCompat::new(&format!("{base}/v1"), "gpt-y", None, Duration::from_secs(5)).diagnose().await.is_ok(), "unlisted but answers");
+    // a server that lists other models and has no such one
+    let app = Router::new()
+        .route("/v1/models", get(|| async { Json(json!({"data": [{"id": "other-model"}]})) }))
+        .route("/v1/chat/completions", post(|| async { (StatusCode::NOT_FOUND, Json(json!({"error": "model not found"}))) }));
     let base = serve(app).await;
     let m = OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", None, Duration::from_secs(5));
     let why = m.diagnose().await.unwrap_err();
-    assert!(why.contains("gpt-x") && why.contains("other-model"), "{why}");
+    assert!(why.contains("gpt-x") && why.contains("404") && why.contains("1 models"), "{why}");
     // a gateway with no listing is not declared down
     let base = serve(Router::new()).await;
     assert!(OpenAiCompat::new(&format!("{base}/v1"), "gpt-x", None, Duration::from_secs(5)).diagnose().await.is_ok());
