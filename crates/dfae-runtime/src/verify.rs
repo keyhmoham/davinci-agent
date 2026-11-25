@@ -33,16 +33,25 @@ impl Inner {
         let (mut ok, mut failed, mut skipped) = (0usize, 0usize, 0usize);
         if let Some(plan) = &rec.plan {
             for s in &plan.steps {
-                let label = s.tool.as_deref().unwrap_or("reasoning");
+                let label = s.tool.as_deref().unwrap_or(if s.kind == StepKind::Agent { "agent" } else { "reasoning" });
                 match s.status {
                     StepStatus::Succeeded => {
                         ok += 1;
-                        if s.kind == StepKind::Tool {
+                        // a delegated step counts as evidence only if the agent itself verified its work
+                        let agent_verified = s.kind == StepKind::Agent && s.evidence.iter().any(|e| e.contains(":verified") || e.contains(":partial"));
+                        if s.kind == StepKind::Tool || agent_verified {
                             tool_ok += 1;
                         }
                         checks.push(CheckResult {
                             check_id: format!("{}:{}", s.id, label),
-                            description: if s.kind == StepKind::Tool { "tool reported success".into() } else { "reasoning step produced output".into() },
+                            description: match s.kind {
+                                StepKind::Tool => "tool reported success".into(),
+                                StepKind::Agent => format!(
+                                    "delegated agent finished ({})",
+                                    s.evidence.iter().find(|e| e.starts_with("child:")).map(|e| e.rsplit(':').next().unwrap_or("")).unwrap_or("unverified")
+                                ),
+                                StepKind::Reasoning => "reasoning step produced output".into(),
+                            },
                             status: CheckStatus::Passed,
                             evidence: tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), 24),
                         });

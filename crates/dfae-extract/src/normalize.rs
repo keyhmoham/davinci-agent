@@ -4,7 +4,10 @@ use dfae_core::Entity;
 pub fn normalize_entities(mut es: Vec<Entity>) -> Vec<Entity> {
     for e in &mut es {
         e.label = e.label.trim().to_lowercase();
-        e.text = e.text.trim().trim_matches(|c: char| ",.;:!?\"'`()[]".contains(c)).to_string();
+        // Trim wrapping quotes/brackets and trailing sentence punctuation — never a
+        // leading '.', which belongs to relative paths (`./src`, `../etc/x`).
+        e.text =
+            e.text.trim().trim_start_matches(['"', '\'', '`', '(', '[']).trim_end_matches([',', ';', ':', '!', '?', '"', '\'', '`', ')', ']', '.']).to_string();
     }
     es.retain(|e| !e.text.is_empty() && !e.label.is_empty());
     let mut out: Vec<Entity> = Vec::new();
@@ -87,6 +90,14 @@ mod tests {
         let m = merge_entities(vec![], rules);
         assert_eq!(m.len(), 2);
         assert!(m.iter().any(|x| x.label == "constraint"));
+    }
+
+    #[test]
+    fn relative_paths_keep_their_leading_dots() {
+        let m =
+            normalize_entities(vec![e("file path", "../../etc/x.txt,", 0, 16, 1.0), e("file path", "./src.", 20, 26, 1.0), e("quoted", "\"hi\"", 30, 34, 1.0)]);
+        let texts: Vec<_> = m.iter().map(|x| x.text.as_str()).collect();
+        assert_eq!(texts, vec!["../../etc/x.txt", "./src", "hi"]);
     }
 
     #[test]

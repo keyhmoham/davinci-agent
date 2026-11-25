@@ -126,6 +126,10 @@ pub fn validate_plan(steps: &[Step], registry: &ToolRegistry, allowed: &[String]
     if steps.len() as u32 > budget.max_steps {
         errs.push(format!("plan has {} steps; the limit is {}", steps.len(), budget.max_steps));
     }
+    let agent_steps = steps.iter().filter(|s| s.kind == StepKind::Agent).count() as u32;
+    if agent_steps > budget.max_children {
+        errs.push(format!("plan delegates to {agent_steps} agents; the limit is {}", budget.max_children));
+    }
     let tool_steps = steps.iter().filter(|s| s.kind == StepKind::Tool).count() as u32;
     if tool_steps > budget.max_tool_calls {
         errs.push(format!("plan has {tool_steps} tool steps; the limit is {}", budget.max_tool_calls));

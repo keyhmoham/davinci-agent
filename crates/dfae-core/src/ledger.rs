@@ -25,6 +25,10 @@ pub struct LedgerEntry {
     /// True when the answer came from a cache (no tokens spent).
     #[serde(default)]
     pub cached: bool,
+    /// Set on entries rolled up from a subagent (its task id). Global
+    /// aggregation skips them: the agent's own record already counts them.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -56,9 +60,19 @@ impl Ledger {
         self.entries.push(e);
     }
 
+    /// Totals including everything rolled up from subagents (the team's cost).
     pub fn summary(&self) -> LedgerSummary {
+        self.summarize(true)
+    }
+
+    /// Totals for this task's own calls only (what global stats aggregate).
+    pub fn summary_own(&self) -> LedgerSummary {
+        self.summarize(false)
+    }
+
+    fn summarize(&self, include_rolled_up: bool) -> LedgerSummary {
         let mut s = LedgerSummary::default();
-        for e in &self.entries {
+        for e in self.entries.iter().filter(|e| include_rolled_up || e.origin.is_none()) {
             let t = e.prompt_tokens + e.completion_tokens;
             if e.cached {
                 s.cache_hits += 1;
@@ -128,6 +142,7 @@ mod tests {
             completion_tokens: 50,
             latency_ms: 1,
             cached: false,
+            origin: None,
         });
         let s = l.summary();
         assert_eq!(s.generative_tokens, 150);

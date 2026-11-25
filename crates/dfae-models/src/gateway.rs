@@ -84,6 +84,7 @@ impl ModelGateway {
                 completion_tokens: c,
                 latency_ms,
                 cached: false,
+                origin: None,
             },
             text: resp.text,
         })

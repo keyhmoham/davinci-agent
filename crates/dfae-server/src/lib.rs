@@ -28,6 +28,7 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/health", get(health))
         .route("/v1/info", get(info))
         .route("/v1/tools", get(tools))
+        .route("/v1/dispatch", get(dispatch))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
@@ -93,11 +94,17 @@ async fn info(State(s): State<AppState>) -> Json<Value> {
             "gliner": cfg.gliner_url.is_some(),
             "database": cfg.database_url.is_some(),
             "budget": cfg.budget,
+            "team": cfg.team,
             "thresholds": cfg.thresholds,
             "allow_auto_approve": cfg.allow_auto_approve,
         },
         "tools": s.engine.tools().iter().map(|t| json!({"name": t.name, "description": t.description, "risk": t.risk, "side_effects": t.side_effects, "signature": t.signature()})).collect::<Vec<_>>(),
     }))
+}
+
+/// Admission queue and per-role worker pools.
+async fn dispatch(State(s): State<AppState>) -> Json<dfae_runtime::DispatchSnapshot> {
+    Json(s.engine.dispatch())
 }
 
 async fn tools(State(s): State<AppState>) -> Json<Vec<ToolMetadata>> {
@@ -127,6 +134,10 @@ struct TaskSummary {
     pending_approvals: usize,
     ledger: LedgerSummary,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// Team view: `coordinator` for a task that delegated, a worker role for an agent.
+    role: Option<AgentRole>,
+    parent_id: Option<String>,
+    agents: usize,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +153,9 @@ async fn list_tasks(State(s): State<AppState>, Query(q): Query<ListQ>) -> Json<V
             .map(|t| TaskSummary {
                 pending_approvals: t.approvals.iter().filter(|a| a.status == ApprovalStatus::Pending).count(),
                 ledger: t.ledger.summary(),
+                role: t.team.as_ref().map(|i| i.role),
+                parent_id: t.team.as_ref().and_then(|i| i.link.as_ref()).map(|l| l.parent_id.clone()),
+                agents: t.team.as_ref().map(|i| i.children.len()).unwrap_or(0),
                 verification: t.verification.as_ref().map(|v| v.status),
                 task_id: t.task_id,
                 session_id: t.session_id,
@@ -255,11 +269,14 @@ async fn calibration(State(s): State<AppState>) -> Json<Value> {
 
 async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
     let st = s.engine.stats().await;
+    let d = s.engine.dispatch();
     let t = &st.totals;
     let body = format!(
         "# TYPE dfae_tasks gauge\ndfae_tasks {}\ndfae_tasks_completed {}\ndfae_tasks_failed {}\ndfae_tasks_verified {}\n\
          dfae_mode_tasks{{mode=\"direct\"}} {}\ndfae_mode_tasks{{mode=\"assisted\"}} {}\ndfae_mode_tasks{{mode=\"escalated\"}} {}\n\
          dfae_tokens{{kind=\"slm\"}} {}\ndfae_tokens{{kind=\"strong\"}} {}\ndfae_tokens{{kind=\"decision\"}} {}\n\
+         dfae_teams {}\ndfae_agents {}\ndfae_team_cache_hits {}\n\
+         dfae_dispatch_tasks{{state=\"running\"}} {}\ndfae_dispatch_tasks{{state=\"queued\"}} {}\ndfae_dispatch_agents{{state=\"running\"}} {}\ndfae_dispatch_agents_spawned {}\n\
          dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"slm\"}} {}\ndfae_model_calls{{kind=\"strong\"}} {}\ndfae_model_calls{{kind=\"jev\"}} {}\n",
         st.tasks,
         st.completed,
@@ -271,6 +288,13 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
         t.slm_tokens,
         t.strong_tokens,
         t.decision_tokens,
+        st.teams,
+        st.agents,
+        st.team_cache_hits,
+        d.tasks.running,
+        d.queued,
+        d.agents.running,
+        d.agents_spawned,
         t.baseline_tokens,
         t.saved_tokens,
         t.slm_calls,

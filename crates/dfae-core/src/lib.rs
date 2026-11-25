@@ -13,6 +13,7 @@ pub mod ledger;
 pub mod memory;
 pub mod providers;
 pub mod safety;
+pub mod team;
 pub mod text;
 pub mod tokens;
 pub mod tool;
@@ -25,6 +26,7 @@ pub use events::*;
 pub use ledger::*;
 pub use memory::*;
 pub use providers::*;
+pub use team::*;
 pub use tool::*;
 pub use types::*;
 

@@ -50,6 +50,7 @@ fn meta(name: &str, description: &str, category: &str, params: Vec<ParamSpec>) -
         params,
         keywords: vec![],
         direct_patterns: vec![],
+        cacheable: false,
     }
 }
 
@@ -92,6 +93,7 @@ impl Tool for Calc {
             "math",
             vec![ParamSpec::new("expression", ParamType::String, true, "arithmetic expression").hints(&["expression"])],
         );
+        m.cacheable = true;
         kw(&mut m, &["calculate", "compute", "math", "arithmetic", "sum", "multiply", "divide", "evaluate"]);
         let f = "sqrt|abs|sin|cos|tan|ln|log|round|floor|ceil|pi";
         pats(
@@ -179,6 +181,7 @@ impl Tool for FsList {
                 ParamSpec::new("path", ParamType::String, false, "directory (default: workspace root)").hints(&["file path", "directory"]).default(json!(".")),
             ],
         );
+        m.cacheable = true;
         kw(&mut m, &["files", "directory", "folder", "list", "ls", "contents"]);
         let path = r"(?P<path>(?:\.{1,2}|~)?/[\w./\-]*|[\w\-]+/[\w./\-]*|\.)";
         pats(
@@ -236,6 +239,7 @@ impl Tool for FsRead {
                 ParamSpec::new("max_bytes", ParamType::Integer, false, "read at most N bytes (default 20000)"),
             ],
         );
+        m.cacheable = true;
         kw(&mut m, &["read", "file", "cat", "open", "contents", "text", "view"]);
         pats(
             &mut m,
@@ -399,6 +403,7 @@ impl Tool for FsSearch {
                 ParamSpec::new("max_results", ParamType::Integer, false, "default 50"),
             ],
         );
+        m.cacheable = true;
         kw(&mut m, &["search", "grep", "find", "text", "occurrences", "match"]);
         pats(
             &mut m,

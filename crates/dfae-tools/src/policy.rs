@@ -415,6 +415,7 @@ mod tests {
             params: vec![],
             keywords: vec![],
             direct_patterns: vec![],
+            cacheable: false,
         }
     }
 

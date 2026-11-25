@@ -82,6 +82,8 @@ pub struct ContextInput<'a> {
     pub prior_turns: &'a [String],
     /// `(label, compressed output)` of completed steps.
     pub observations: &'a [(String, String)],
+    /// Results of the agents this one depends on `(label, summary)`.
+    pub upstream: &'a [(String, String)],
     pub profile: ContextProfile,
 }
 
@@ -124,6 +126,14 @@ pub fn build_context(input: &ContextInput) -> ContextPackage {
     let ent = render_entities(input.entities);
     if !ent.is_empty() {
         push("entities", format!("ENT: {ent}"), 1);
+    }
+    if !input.upstream.is_empty() {
+        // essential: this is what the agent was handed to work from
+        let mut lines = vec!["UPSTREAM:".to_string()];
+        for (label, summary) in input.upstream {
+            lines.push(format!(" {label}: {}", truncate_tokens(summary, 90)));
+        }
+        push("upstream", lines.join("\n"), 1);
     }
     if !input.observations.is_empty() {
         let mut lines = vec!["OBS:".to_string()];
@@ -175,9 +185,10 @@ pub fn build_context(input: &ContextInput) -> ContextPackage {
         "goal" => 0,
         "constraints" => 1,
         "entities" => 2,
-        "prior" => 3,
-        "memories" => 4,
-        _ => 5,
+        "upstream" => 3,
+        "prior" => 4,
+        "memories" => 5,
+        _ => 6,
     });
     let total_tokens = sections.iter().map(|s| s.tokens).sum();
     ContextPackage { sections, total_tokens, dropped }
@@ -207,8 +218,15 @@ mod tests {
             })
             .collect();
         let obs = vec![("s1 fs_list".to_string(), "x ".repeat(2000))];
-        let input =
-            ContextInput { goal: "deploy redis", entities: &ents, memories: &mems, prior_turns: &[], observations: &obs, profile: ContextProfile::Minimal };
+        let input = ContextInput {
+            goal: "deploy redis",
+            entities: &ents,
+            memories: &mems,
+            prior_turns: &[],
+            observations: &obs,
+            upstream: &[],
+            profile: ContextProfile::Minimal,
+        };
         let pkg = build_context(&input);
         assert!(pkg.total_tokens <= ContextProfile::Minimal.token_budget());
         let r = pkg.render();
@@ -220,6 +238,23 @@ mod tests {
         let pkg = build_context(&input);
         assert!(pkg.render().contains("memory number 0"));
         assert!(pkg.total_tokens <= ContextProfile::Reasoning.token_budget());
+    }
+
+    #[test]
+    fn upstream_results_survive_even_the_minimal_budget() {
+        let up = vec![("c1: read todo.md".to_string(), "- [ ] write docs".to_string())];
+        let input = ContextInput {
+            goal: "explain what is open",
+            entities: &[],
+            memories: &[],
+            prior_turns: &[],
+            observations: &[],
+            upstream: &up,
+            profile: ContextProfile::Minimal,
+        };
+        let r = build_context(&input).render();
+        assert!(r.contains("UPSTREAM:") && r.contains("write docs"), "{r}");
+        assert!(r.find("GOAL").unwrap() < r.find("UPSTREAM").unwrap());
     }
 
     #[test]

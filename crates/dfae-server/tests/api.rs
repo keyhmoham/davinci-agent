@@ -104,3 +104,24 @@ async fn memory_api() {
     assert!(r[0]["item"]["text"].as_str().unwrap().contains("90 days"));
     assert_eq!(c.post(format!("{base}/v1/memory")).json(&json!({"text": "x", "kind": "procedural"})).send().await.unwrap().status(), 400);
 }
+
+#[tokio::test]
+async fn dispatch_and_team_fields_are_exposed() {
+    let (base, _ws) = spawn(None).await;
+    let c = reqwest::Client::new();
+    let d: Value = c.get(format!("{base}/v1/dispatch")).send().await.unwrap().json().await.unwrap();
+    assert!(d["tasks"]["capacity"].as_u64().unwrap() >= 1);
+    assert_eq!(d["roles"]["operator"]["capacity"], 1, "side-effecting agents are serialised by default");
+    assert!(d["roles"]["researcher"]["capacity"].as_u64().unwrap() > 1);
+    let id = c.post(format!("{base}/v1/tasks")).json(&json!({"goal": "what is 2 + 2"})).send().await.unwrap().json::<Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_done(&c, &base, &id).await;
+    let list: Vec<Value> = c.get(format!("{base}/v1/tasks")).send().await.unwrap().json().await.unwrap();
+    assert!(list[0]["role"].is_null() && list[0]["parent_id"].is_null() && list[0]["agents"] == 0, "a plain task is not a team");
+    let m = c.get(format!("{base}/metrics")).send().await.unwrap().text().await.unwrap();
+    assert!(m.contains("dfae_teams 0") && m.contains("dfae_dispatch_agents{state=\"running\"} 0"), "{m}");
+    let info: Value = c.get(format!("{base}/v1/info")).send().await.unwrap().json().await.unwrap();
+    assert_eq!(info["config"]["team"]["enabled"], true);
+}

@@ -113,6 +113,7 @@ impl Decider {
             completion_tokens: if from_cache { 0 } else { resp.output_tokens },
             latency_ms: resp.latency_ms,
             cached: from_cache,
+            origin: None,
         });
         (resp, record, entry)
     }
@@ -270,6 +271,14 @@ impl Decider {
     pub async fn assess_completion(&self, state: DecisionState) -> Decided<f32> {
         let (r, record, entry) = self.decide(completion_request(state)).await;
         Decided { value: r.noul("complete").unwrap_or(0.0) as f32, record, entry }
+    }
+
+    /// Should the request be split across a team of agents? The answer is
+    /// calibrated against how earlier splits actually turned out.
+    pub async fn assess_decomposition(&self, state: DecisionState) -> Decided<f32> {
+        let (r, record, entry) = self.decide(decomposition_request(state)).await;
+        let raw = r.noul("split").unwrap_or(0.0);
+        Decided { value: self.calibrator.calibrate("assess_decomposition:split", raw) as f32, record, entry }
     }
 
     pub async fn assess_escalation(&self, state: DecisionState) -> Decided<f32> {

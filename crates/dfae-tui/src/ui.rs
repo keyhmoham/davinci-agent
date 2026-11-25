@@ -80,6 +80,17 @@ fn spinner(app: &App) -> &'static str {
     SPINNER[(app.tick as usize) % SPINNER.len()]
 }
 
+fn role_badge(r: Option<AgentRole>) -> (&'static str, Color) {
+    match r {
+        Some(AgentRole::Coordinator) => ("T", ACCENT),
+        Some(AgentRole::Researcher) => ("R", ACCENT),
+        Some(AgentRole::Operator) => ("O", WARN),
+        Some(AgentRole::Analyst) => ("A", VIOLET),
+        Some(AgentRole::Verifier) => ("V", OK),
+        None => ("", DIM),
+    }
+}
+
 fn status_icon(app: &App, s: TaskStatus) -> (String, Color) {
     match s {
         TaskStatus::Completed => ("✔".into(), OK),
@@ -124,6 +135,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.tab {
         Tab::Timeline => draw_timeline(f, content, app),
         Tab::Plan => draw_plan(f, content, app),
+        Tab::Team => draw_team(f, content, app),
         Tab::Context => draw_cognition(f, content, app),
         Tab::Tokens => draw_tokens(f, content, app),
         Tab::Memory => draw_memory(f, content, app),
@@ -163,6 +175,21 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ));
         right.push(Span::raw(" "));
     }
+    if let Some(d) = &app.dispatch {
+        let running = d["agents"]["running"].as_u64().unwrap_or(0);
+        let queued = d["queued"].as_u64().unwrap_or(0);
+        if running > 0 || queued > 0 {
+            right.push(Span::styled(
+                format!(
+                    " agents {running}/{}{} ",
+                    d["agents"]["capacity"].as_u64().unwrap_or(0),
+                    if queued > 0 { format!(" · {queued} queued") } else { String::new() }
+                ),
+                Style::new().fg(Color::Black).bg(ACCENT).bold(),
+            ));
+            right.push(Span::raw(" "));
+        }
+    }
     let (txt, col) = if app.connected { ("online", OK) } else { ("offline", BAD) };
     right.push(Span::styled(format!("● {txt} "), Style::new().fg(col)));
     right.push(Span::styled(trunc(&app.base_url, 28), Style::new().fg(DIM)));
@@ -180,16 +207,29 @@ fn draw_tasks(f: &mut Frame, area: Rect, app: &App) {
         .map(|t| {
             let (icon, col) = status_icon(app, t.status);
             let (m, mc) = mode_badge(t.mode);
+            let nested = t.parent_id.as_ref().map(|p| app.tasks.iter().any(|x| &x.task_id == p)).unwrap_or(false);
+            let (rl, rc) = role_badge(t.role);
+            let indent = if nested { " └ " } else { "" };
             let l1 = Line::from(vec![
+                Span::styled(indent.to_string(), Style::new().fg(DIM)),
                 Span::styled(format!("{icon} "), Style::new().fg(col)),
+                Span::styled(rl.to_string(), Style::new().fg(rc).bold()),
                 Span::styled(format!("{m} "), Style::new().fg(mc).bold()),
-                Span::raw(trunc(&one_line(&t.goal), w.saturating_sub(4))),
+                Span::raw(trunc(&one_line(&t.goal), w.saturating_sub(4 + indent.chars().count() + rl.chars().count()))),
             ]);
             let s = &t.ledger;
             let detail = format!(
-                "  {} tok · {}{}",
+                "{}  {} tok · {}{}{}",
+                if nested { "   " } else { "" },
                 fmt_tokens(s.generative_tokens),
-                if s.baseline_tokens > 0 { format!("{:.0}% saved", s.saved_pct) } else { "…".into() },
+                if t.parent_id.is_some() {
+                    t.role.map(|r| r.as_str().to_string()).unwrap_or_default()
+                } else if s.baseline_tokens > 0 {
+                    format!("{:.0}% saved", s.saved_pct)
+                } else {
+                    "…".into()
+                },
+                if t.agents > 0 { format!(" · {} agents", t.agents) } else { String::new() },
                 if t.pending_approvals > 0 { " · ⚠ approval" } else { "" }
             );
             ListItem::new(vec![l1, Line::from(Span::styled(trunc(&detail, w + 2), Style::new().fg(DIM)))])
@@ -337,10 +377,53 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     plan.steps.len(),
                     if plan.steps.len() == 1 { "" } else { "s" },
                     plan.source,
-                    plan.steps.iter().map(|s| s.tool.clone().unwrap_or_else(|| "reason".into())).collect::<Vec<_>>().join(" → ")
+                    plan.steps
+                        .iter()
+                        .map(|s| s.tool.clone().unwrap_or_else(|| if s.kind == StepKind::Agent { "agent".into() } else { "reason".into() }))
+                        .collect::<Vec<_>>()
+                        .join(" → ")
                 ),
                 Style::new(),
             ),
+            EventKind::Queued { position } => push(badge("queued", WARN), format!("waiting for a free slot (position {position})"), Style::new().fg(WARN)),
+            EventKind::TeamFormed { goals, reason } => {
+                push(badge("team", ACCENT), reason.clone(), Style::new().fg(ACCENT).bold());
+                for g in goals {
+                    let dep = if g.depends_on.is_empty() { String::new() } else { format!(" ← {}", g.depends_on.join(",")) };
+                    let tag = if g.synth {
+                        "join"
+                    } else if g.direct {
+                        "no model"
+                    } else {
+                        "model"
+                    };
+                    out.push(Line::from(vec![
+                        Span::raw("        "),
+                        Span::styled(format!("   {:<5}", g.id), Style::new().fg(DIM)),
+                        Span::styled(format!("[{tag}] "), Style::new().fg(if g.direct { OK } else { WARN })),
+                        Span::raw(trunc(&format!("{}{dep}", g.goal), body_w.saturating_sub(18))),
+                    ]));
+                }
+            }
+            EventKind::AgentSpawned { step_id, child_id, goal, attempt } => push(
+                badge("agent", ACCENT),
+                format!("{step_id} → {}{} {}", dfae_core::short(child_id), if *attempt > 1 { format!(" (attempt {attempt})") } else { String::new() }, goal),
+                Style::new(),
+            ),
+            EventKind::RoleAssigned { role, tools } => push(badge("role", ACCENT), format!("{} · {tools} tools in scope", role.as_str()), Style::new()),
+            EventKind::AgentDone { step_id, role, status, mode, generative_tokens, .. } => {
+                let ok = *status == TaskStatus::Completed;
+                push(
+                    badge("agent", if ok { OK } else { BAD }),
+                    format!(
+                        "{step_id} {} {} · {} · {generative_tokens} generative tok",
+                        if ok { "✔" } else { "✘" },
+                        role.as_str(),
+                        mode.map(|m| format!("{m:?}").to_lowercase()).unwrap_or_else(|| "-".into())
+                    ),
+                    Style::new().fg(if ok { OK } else { BAD }),
+                );
+            }
             EventKind::PlanRevised { plan, reason } => push(badge("replan", WARN), format!("rev {} — {reason}", plan.revision), Style::new().fg(WARN)),
             EventKind::StepUpdate { step_id, status, tool, summary, error, attempts } => {
                 let (icon, col) = match status {
@@ -459,6 +542,7 @@ fn welcome() -> Vec<Line<'static>> {
         d("        list the files in ./  and what time is it"),
         d("        write 'hello' to notes/hello.txt        (asks for approval)"),
         d("        remember that the staging db is db-staging-01"),
+        d("        read a.txt, b.txt and c.txt and summarize them   (forms a team)"),
         d("  F1 for help · Tab switches views · F2 cycles execution mode"),
     ]
 }
@@ -521,10 +605,14 @@ fn draw_plan(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(s.id.clone()),
                 Cell::from(format!("W{}", lv[i])),
                 Cell::from(Span::styled(
-                    s.tool.clone().unwrap_or_else(|| "reasoning".into()),
-                    Style::new().fg(if s.kind == StepKind::Tool { ACCENT } else { VIOLET }),
+                    s.tool.clone().unwrap_or_else(|| if s.kind == StepKind::Agent { "agent".into() } else { "reasoning".into() }),
+                    Style::new().fg(match s.kind {
+                        StepKind::Tool => ACCENT,
+                        StepKind::Agent => OK,
+                        StepKind::Reasoning => VIOLET,
+                    }),
                 )),
-                Cell::from(trunc(&one_line(&args_brief(&s.args)), 40)),
+                Cell::from(if s.kind == StepKind::Agent { trunc(&one_line(&s.description), 40) } else { trunc(&one_line(&args_brief(&s.args)), 40) }),
                 Cell::from(s.depends_on.join(",")),
                 Cell::from(if s.attempts > 1 { format!("×{}", s.attempts) } else { String::new() }),
                 Cell::from(dur),
@@ -660,6 +748,164 @@ fn draw_cognition(f: &mut Frame, area: Rect, app: &App) {
             .block(block(" Decisions ")),
         dec,
     );
+}
+
+// ----------------------------------------------------------------- team ----
+
+fn pool_bar(label_s: &str, running: u64, cap: u64, peak: u64, width: usize) -> Line<'static> {
+    let w = width.saturating_sub(40).clamp(4, 24);
+    let filled = if cap == 0 { 0 } else { ((running as f64 / cap as f64) * w as f64).round() as usize };
+    let color = if running >= cap && cap > 0 { WARN } else { OK };
+    Line::from(vec![
+        Span::styled(format!(" {label_s:<12}"), Style::new().fg(DIM)),
+        Span::styled("█".repeat(filled.min(w)), Style::new().fg(color)),
+        Span::styled("░".repeat(w - filled.min(w)), Style::new().fg(Color::Rgb(60, 66, 76))),
+        Span::raw(format!(" {running}/{cap}")),
+        Span::styled(format!("  peak {peak}"), Style::new().fg(DIM)),
+    ])
+}
+
+fn draw_team(f: &mut Frame, area: Rect, app: &App) {
+    let [head, agents, pools] = Layout::vertical([Constraint::Length(6), Constraint::Min(4), Constraint::Length(9)]).areas(area);
+    let team = app.detail.as_ref().and_then(|d| d.team.as_ref());
+
+    // ---- header: what is this task's place in a team? --------------------------
+    let mut l: Vec<Line> = Vec::new();
+    match (app.detail.as_ref(), team) {
+        (Some(d), Some(t)) if t.link.is_none() => {
+            let s = d.ledger.summary();
+            l.push(Line::from(vec![
+                Span::styled(" coordinator ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+                Span::raw(format!(" {}", t.reason.clone().unwrap_or_default())),
+            ]));
+            l.push(Line::from(vec![
+                label(" team cost "),
+                Span::raw(format!(
+                    "{} generative tokens across {} agents vs ~{} for one naive agent ({:.0}% saved)",
+                    fmt_tokens(s.generative_tokens),
+                    t.children.len(),
+                    fmt_tokens(s.baseline_tokens),
+                    s.saved_pct
+                )),
+            ]));
+            l.push(Line::from(vec![
+                label(" shared    "),
+                Span::raw(format!("{} reads served from the team's cache · {} of {} agents allowed", t.cache_hits, d.usage.children, d.budget.max_children)),
+            ]));
+        }
+        (Some(_), Some(t)) => {
+            let link = t.link.as_ref().expect("checked above");
+            let (rl, rc) = role_badge(Some(t.role));
+            l.push(Line::from(vec![
+                Span::styled(format!(" {rl} {} ", t.role.as_str()), Style::new().fg(Color::Black).bg(rc).bold()),
+                Span::raw(format!(" agent of {} (step {}) · depth {}", dfae_core::short(&link.parent_id), link.parent_step, link.depth)),
+            ]));
+            let tools = app.events.iter().find_map(|e| if let EventKind::RoleAssigned { tools, .. } = &e.kind { Some(*tools) } else { None });
+            l.push(Line::from(vec![
+                label(" scope     "),
+                Span::raw(match tools {
+                    Some(n) => format!("{n} tools (least privilege for this role)"),
+                    None => "assigning…".into(),
+                }),
+            ]));
+            if link.upstream.is_empty() {
+                l.push(Line::from(vec![label(" upstream  "), Span::styled("none — runs independently", Style::new().fg(DIM))]));
+            }
+            for u in link.upstream.iter().take(2) {
+                l.push(Line::from(vec![
+                    label(" upstream  "),
+                    Span::raw(trunc(&format!("{} → {}", u.label, one_line(&u.summary)), area.width.saturating_sub(16) as usize)),
+                ]));
+            }
+        }
+        _ => {
+            l.push(Line::from(Span::styled(" This task is not part of a team.", Style::new().fg(DIM))));
+            l.push(Line::from(Span::styled(" Teams form automatically when a request splits into sub-tasks that parallelise,", Style::new().fg(DIM))));
+            l.push(Line::from(Span::styled(" fan out over items with a join, or separate read-only from state-changing work.", Style::new().fg(DIM))));
+            l.push(Line::from(Span::styled(" Try: read a.txt, b.txt and c.txt and summarize them      (/team off disables)", Style::new().fg(DIM))));
+        }
+    }
+    f.render_widget(Paragraph::new(l).block(block(" Team ")), head);
+
+    // ---- agents ---------------------------------------------------------------------
+    let tokens_of = |id: &str| app.tasks.iter().find(|t| t.task_id == id).map(|t| t.ledger.generative_tokens);
+    let rows: Vec<Row> = app
+        .detail
+        .as_ref()
+        .and_then(|d| d.plan.as_ref().map(|p| (d, p)))
+        .map(|(d, p)| {
+            p.steps
+                .iter()
+                .filter(|s| s.kind == StepKind::Agent)
+                .map(|s| {
+                    let child_id = s.args.get("child").and_then(|c| c.as_str()).unwrap_or("");
+                    let cref = d.team.as_ref().and_then(|t| t.children.iter().rev().find(|c| c.step_id == s.id));
+                    let (rl, rc) = role_badge(cref.and_then(|c| c.role));
+                    let (icon, ic) = match s.status {
+                        StepStatus::Running => (spinner(app), ACCENT),
+                        StepStatus::Succeeded => ("✔", OK),
+                        StepStatus::Failed => ("✘", BAD),
+                        StepStatus::Pending if s.depends_on.is_empty() => ("○", DIM),
+                        StepStatus::Pending => ("⧗", DIM),
+                        _ => ("⊘", DIM),
+                    };
+                    let mode = cref.and_then(|c| c.mode).map(|m| mode_badge(Some(m))).unwrap_or(("·", DIM));
+                    Row::new(vec![
+                        Cell::from(Span::styled(icon, Style::new().fg(ic))),
+                        Cell::from(s.id.clone()),
+                        Cell::from(Span::styled(
+                            cref.and_then(|c| c.role).map(|r| format!("{rl} {}", r.as_str())).unwrap_or_else(|| "…".into()),
+                            Style::new().fg(rc),
+                        )),
+                        Cell::from(Span::styled(mode.0, Style::new().fg(mode.1).bold())),
+                        Cell::from(tokens_of(child_id).map(fmt_tokens).unwrap_or_else(|| "-".into())),
+                        Cell::from(if s.attempts > 1 { format!("×{}", s.attempts) } else { String::new() }),
+                        Cell::from(if s.depends_on.is_empty() { String::new() } else { format!("← {}", s.depends_on.join(",")) }),
+                        Cell::from(trunc(&one_line(&s.description), 48)),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(2),
+                Constraint::Length(5),
+                Constraint::Length(14),
+                Constraint::Length(2),
+                Constraint::Length(7),
+                Constraint::Length(3),
+                Constraint::Length(8),
+                Constraint::Min(16),
+            ],
+        )
+        .header(Row::new(["", "step", "role", "m", "tok", "try", "after", "sub-goal"]).style(Style::new().fg(DIM)))
+        .block(block(" Agents ")),
+        agents,
+    );
+
+    // ---- dispatcher -------------------------------------------------------------------
+    let u = |v: &Value| v.as_u64().unwrap_or(0);
+    let mut p: Vec<Line> = Vec::new();
+    match &app.dispatch {
+        Some(d) => {
+            let w = pools.width as usize;
+            p.push(pool_bar("tasks", u(&d["tasks"]["running"]), u(&d["tasks"]["capacity"]), u(&d["tasks"]["peak"]), w));
+            p.push(pool_bar("agents", u(&d["agents"]["running"]), u(&d["agents"]["capacity"]), u(&d["agents"]["peak"]), w));
+            for role in ["researcher", "operator", "analyst", "verifier"] {
+                let r = &d["roles"][role];
+                p.push(pool_bar(&format!("  {role}"), u(&r["running"]), u(&r["capacity"]), u(&r["peak"]), w));
+            }
+            p.push(Line::from(vec![
+                label(" queue       "),
+                Span::raw(format!("{} waiting (max {}) · {} agents dispatched in total", u(&d["queued"]), u(&d["max_queued"]), u(&d["agents_spawned"]))),
+            ]));
+        }
+        None => p.push(Line::from(Span::styled(" dispatcher state unavailable", Style::new().fg(DIM)))),
+    }
+    f.render_widget(Paragraph::new(p).block(block(" Dispatcher · worker pools (operators are serialised) ")), pools);
 }
 
 // --------------------------------------------------------------- tokens ----
@@ -858,6 +1104,15 @@ fn draw_input(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(" Ask ", Style::new().fg(ACCENT).bold()),
         Span::styled("mode:", Style::new().fg(DIM)),
         Span::styled(format!("{m} "), Style::new().fg(mc).bold()),
+        Span::styled("team:", Style::new().fg(DIM)),
+        Span::styled(
+            match app.delegate {
+                None => "auto ",
+                Some(true) => "on ",
+                Some(false) => "off ",
+            },
+            Style::new().fg(if app.delegate == Some(false) { WARN } else { ACCENT }).bold(),
+        ),
         Span::styled(format!("session:{} ", dfae_core::short(&app.session_id)), Style::new().fg(DIM)),
         if app.auto_approve { Span::styled("AUTO-APPROVE ", Style::new().fg(Color::Black).bg(BAD).bold()) } else { Span::raw("") },
     ]);
@@ -954,6 +1209,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         k("Ctrl+U / Ctrl+W", "clear line / delete word"),
         Line::from(""),
         k("/mode <m>", "auto | direct | assisted | escalated"),
+        k("/team <m>", "auto | on | off — subagent delegation (auto by default)"),
         k("/memory <q>", "search long-term memory"),
         k("/remember <fact>", "store a fact"),
         k("/new", "start a new session (fresh conversational context)"),
@@ -1020,6 +1276,10 @@ mod tests {
             pending_approvals: 1,
             ledger: Default::default(),
             session_id: rec.session_id.clone(),
+            created_at: None,
+            role: None,
+            parent_id: None,
+            agents: 0,
         }];
         app.events = vec![Event {
             task_id: rec.task_id.clone(),
@@ -1046,6 +1306,9 @@ mod tests {
                 app.tab = tab;
                 let out = render(&app, w, h);
                 assert!(!out.is_empty());
+                let mut t = team_app();
+                t.tab = tab;
+                assert!(!render(&t, w, h).is_empty());
             }
         }
     }
@@ -1088,6 +1351,152 @@ mod tests {
         assert!(render(&app, 120, 40).contains("fs_write(path:str*"));
         app.tab = Tab::Tokens;
         assert!(render(&app, 120, 40).contains("naive LLM agent"));
+    }
+
+    fn team_app() -> App {
+        let mut app = sample();
+        {
+            let d = app.detail.as_mut().unwrap();
+            d.approvals.clear();
+            d.status = TaskStatus::Running;
+            d.final_answer = None;
+            let mut c1 = Step::reasoning("c1", "read a.txt");
+            c1.kind = StepKind::Agent;
+            c1.status = StepStatus::Succeeded;
+            c1.args = serde_json::json!({"child": "kid-1"});
+            let mut c2 = Step::reasoning("c2", "explain what it says");
+            c2.kind = StepKind::Agent;
+            c2.depends_on = vec!["c1".into()];
+            let mut j = Step::reasoning("join", "summarize them");
+            j.depends_on = vec!["c1".into(), "c2".into()];
+            d.plan = Some(Plan { goal: "g".into(), steps: vec![c1, c2, j], source: PlanSource::Team, revision: 0 });
+            d.team = Some(TeamInfo {
+                role: AgentRole::Coordinator,
+                link: None,
+                reason: Some("3 sub-tasks (1 need no model, 1 dependent, + join) · split confidence 0.70".into()),
+                cache_hits: 2,
+                children: vec![ChildRef {
+                    task_id: "kid-1".into(),
+                    step_id: "c1".into(),
+                    goal: "read a.txt".into(),
+                    role: Some(AgentRole::Researcher),
+                    mode: Some(ExecMode::Direct),
+                    status: TaskStatus::Completed,
+                }],
+            });
+        }
+        let parent = app.tasks[0].clone();
+        app.tasks[0].role = Some(AgentRole::Coordinator);
+        app.tasks[0].agents = 1;
+        app.tasks[0].pending_approvals = 0;
+        let mut kid = parent.clone();
+        kid.task_id = "kid-1".into();
+        kid.goal = "read a.txt".into();
+        kid.parent_id = Some(parent.task_id.clone());
+        kid.role = Some(AgentRole::Researcher);
+        kid.pending_approvals = 0;
+        kid.status = TaskStatus::Completed;
+        app.tasks.push(kid);
+        app.dispatch = Some(serde_json::json!({
+            "tasks": {"running": 1, "capacity": 8, "peak": 1}, "queued": 2, "max_queued": 64,
+            "agents": {"running": 3, "capacity": 8, "peak": 4}, "agents_spawned": 11,
+            "roles": {"researcher": {"running": 2, "capacity": 4, "peak": 3}, "operator": {"running": 1, "capacity": 1, "peak": 1},
+                      "analyst": {"running": 0, "capacity": 4, "peak": 1}, "verifier": {"running": 0, "capacity": 2, "peak": 0}}
+        }));
+        app
+    }
+
+    #[test]
+    fn team_view_shows_agents_dependencies_and_worker_pools() {
+        let mut app = team_app();
+        app.tab = Tab::Team;
+        let out = render(&app, 150, 46);
+        for expect in [
+            "coordinator",
+            "3 sub-tasks",
+            "2 reads served from the team's cache",
+            "Agents",
+            "R researcher",
+            "read a.txt",
+            "← c1",
+            "Dispatcher",
+            "operator",
+            "1/1",
+            "researcher",
+            "2/4",
+            "2 waiting",
+            "11 agents dispatched",
+        ] {
+            assert!(out.contains(expect), "missing {expect:?} in:\n{out}");
+        }
+    }
+
+    #[test]
+    fn agents_are_nested_under_their_coordinator_and_show_their_role() {
+        let mut app = team_app();
+        app.tab = Tab::Timeline;
+        let out = render(&app, 150, 40);
+        assert!(out.contains("└"), "agents are drawn as children:\n{out}");
+        assert!(out.contains("1 agents"), "the coordinator shows how many agents it has");
+        assert!(out.contains("team:auto"));
+        // an agent's own Team view explains its place
+        app.selected = 1;
+        app.detail.as_mut().unwrap().team = Some(TeamInfo {
+            role: AgentRole::Operator,
+            link: Some(TeamLink {
+                parent_id: "parent-1234".into(),
+                parent_step: "c3".into(),
+                depth: 1,
+                upstream: vec![Upstream { label: "c2: check the server".into(), summary: "it is affected".into() }],
+                entities: vec![],
+                inherited_taint: false,
+            }),
+            children: vec![],
+            reason: None,
+            cache_hits: 0,
+        });
+        app.tab = Tab::Team;
+        let out = render(&app, 150, 40);
+        for expect in ["operator", "agent of parent-1", "step c3", "upstream", "it is affected"] {
+            assert!(out.contains(expect), "missing {expect:?}:\n{out}");
+        }
+    }
+
+    #[test]
+    fn delegation_events_read_well_in_the_timeline() {
+        let mut app = team_app();
+        let now = chrono::Utc::now();
+        let tid = app.detail.as_ref().unwrap().task_id.clone();
+        let mk = |seq, kind| Event { task_id: tid.clone(), seq, ts: now, kind };
+        app.events = vec![
+            mk(
+                1,
+                EventKind::TeamFormed {
+                    reason: "2 sub-tasks".into(),
+                    goals: vec![
+                        TeamGoal { id: "c1".into(), goal: "read a.txt".into(), depends_on: vec![], direct: true, synth: false },
+                        TeamGoal { id: "join".into(), goal: "summarize them".into(), depends_on: vec!["c1".into()], direct: false, synth: true },
+                    ],
+                },
+            ),
+            mk(2, EventKind::AgentSpawned { step_id: "c1".into(), child_id: "abcdef123456".into(), goal: "read a.txt".into(), attempt: 2 }),
+            mk(
+                3,
+                EventKind::AgentDone {
+                    step_id: "c1".into(),
+                    child_id: "abcdef123456".into(),
+                    role: AgentRole::Researcher,
+                    status: TaskStatus::Completed,
+                    mode: Some(ExecMode::Direct),
+                    generative_tokens: 0,
+                },
+            ),
+        ];
+        app.tab = Tab::Timeline;
+        let out = render(&app, 150, 40);
+        for expect in ["[no model]", "[join]", "← c1", "attempt 2", "researcher", "0 generative tok"] {
+            assert!(out.contains(expect), "missing {expect:?}:\n{out}");
+        }
     }
 
     #[test]

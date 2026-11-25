@@ -3,17 +3,21 @@
 //! The runtime is the agent; models are specialised cognitive services inside
 //! it. See `docs/architecture.md` for the pipeline.
 
+mod agents;
 mod answer;
 mod bootstrap;
 mod bus;
+mod dispatch;
 mod engine;
 mod executor;
 mod pipeline;
 pub mod planner;
 pub mod prompts;
 pub mod skills;
+pub mod team;
 mod verify;
 
 pub use bootstrap::build_engine;
 pub use bus::EventBus;
+pub use dispatch::{DispatchSnapshot, Dispatcher, PoolStat};
 pub use engine::{ComponentHealth, Engine, EngineDeps, HealthReport, StatsReport};

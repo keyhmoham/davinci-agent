@@ -26,6 +26,15 @@ pub struct TaskRow {
     pub ledger: dfae_core::LedgerSummary,
     #[allow(dead_code)]
     pub session_id: String,
+    #[serde(default)]
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `coordinator` for a task that delegated; a worker role for an agent.
+    #[serde(default)]
+    pub role: Option<dfae_core::AgentRole>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub agents: usize,
 }
 
 impl Api {
@@ -57,6 +66,9 @@ impl Api {
     }
     pub async fn info(&self) -> Result<Value, String> {
         self.send(self.rb(reqwest::Method::GET, "/v1/info")).await
+    }
+    pub async fn dispatch(&self) -> Result<Value, String> {
+        self.send(self.rb(reqwest::Method::GET, "/v1/dispatch")).await
     }
     pub async fn stats(&self) -> Result<Value, String> {
         self.send(self.rb(reqwest::Method::GET, "/v1/stats")).await

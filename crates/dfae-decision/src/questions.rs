@@ -104,6 +104,15 @@ pub fn completion_request(state: DecisionState) -> DecisionRequest {
     DecisionRequest { kind: DecisionKind::AssessCompletion, state, questions: q }
 }
 
+pub fn decomposition_request(state: DecisionState) -> DecisionRequest {
+    let mut q = BTreeMap::new();
+    q.insert(
+        "split".into(),
+        Question::noul("Should the request be split into the listed sub-tasks, each handled by its own specialist agent, instead of planned as one task? Prefer splitting when parts are independent or some need no language model."),
+    );
+    DecisionRequest { kind: DecisionKind::AssessDecomposition, state, questions: q }
+}
+
 pub fn escalation_request(state: DecisionState) -> DecisionRequest {
     let mut q = BTreeMap::new();
     q.insert("escalate".into(), Question::noul("Should this task be escalated to a stronger model?"));

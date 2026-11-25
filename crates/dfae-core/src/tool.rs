@@ -63,6 +63,10 @@ pub struct ToolMetadata {
     /// text — the basis of the SLM-free Direct mode.
     #[serde(default)]
     pub direct_patterns: Vec<String>,
+    /// Read-only and deterministic enough that agents of one team may share
+    /// the result (invalidated whenever any team member performs a side effect).
+    #[serde(default)]
+    pub cacheable: bool,
 }
 
 impl ToolMetadata {

@@ -263,6 +263,7 @@ impl Tool for Flaky {
             params: vec![],
             keywords: vec![],
             direct_patterns: vec![r"(?i)\bprobe the flaky upstream\b".into()],
+            cacheable: false,
         }
     }
     async fn execute(&self, _i: Value, _c: ToolContext) -> Result<ToolOutput, ToolError> {

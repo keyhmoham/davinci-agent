@@ -257,7 +257,7 @@ impl LocalDecider {
                 let c = self.complexity(s);
                 out.insert("complexity".into(), Answer::score(c * 2.0, 0.6));
                 let best_tool = self.tool_scores(s).iter().map(|(_, p)| *p).fold(0.0, f64::max);
-                let tool_type = matches!(tt.as_str(), "file_operations" | "system_diagnostics" | "calculation" | "maintenance" | "memory");
+                let tool_type = matches!(tt.as_str(), "file_operations" | "system_diagnostics" | "calculation" | "maintenance" | "memory" | "research");
                 let needs = if tool_type { best_tool.max(0.7) } else { best_tool * 0.9 };
                 out.insert("needs_tools".into(), Answer::noul(needs));
                 let (r, rc) = self.risk(s);
@@ -324,6 +324,42 @@ impl LocalDecider {
                 };
                 out.insert("complete".into(), Answer::noul(p));
             }
+            DecisionKind::AssessDecomposition => {
+                let f = s.team_facts.clone().unwrap_or_default();
+                let n = f.subgoals.len();
+                let p = if n < 2 || (f.direct == n && !f.has_synthesis) {
+                    // nothing to split, or Direct mode already handles it for free
+                    0.05
+                } else if !f.models_available && (f.direct < n || f.has_synthesis) {
+                    // the parts that need a model (incl. the join) could not run anyway
+                    0.05
+                } else {
+                    // A split is worth it when it buys parallel model work, replaces planned
+                    // tool steps with free deterministic agents, or separates read-only
+                    // from state-changing work (least privilege + serialised side effects).
+                    let mut p = 0.35f64;
+                    if f.parallel_model >= 2 {
+                        p += 0.30;
+                    }
+                    if f.direct >= 2 && f.has_synthesis {
+                        p += 0.30;
+                    }
+                    if f.direct >= 1 && f.parallel_model >= 1 {
+                        p += 0.10;
+                    }
+                    if f.dependent == 0 {
+                        p += 0.05;
+                    }
+                    let capability_pipeline = n >= 3 && f.dependent >= 1 && f.mutating >= 1 && f.mutating < n;
+                    if capability_pipeline {
+                        p += 0.40;
+                    } else if f.model_after_direct > 0 && f.parallel_model == 0 {
+                        p -= 0.15; // one plan does this as well, without the handoff
+                    }
+                    p.clamp(0.0, 0.95)
+                };
+                out.insert("split".into(), Answer::noul(p));
+            }
             DecisionKind::AssessEscalation => {
                 let f = s.step_facts.clone().unwrap_or_default();
                 let p = (0.25 * f.replans_used as f64 + 0.2 * f.attempts as f64).min(0.95);
@@ -389,6 +425,52 @@ mod tests {
         st.step_facts = Some(StepFacts { error_kind: "policy".into(), attempts: 0, max_attempts: 3, ..Default::default() });
         let r = d.answer(&recovery_request(st));
         assert!(matches!(&r["recovery"], Answer::Choice { choice, .. } if choice == "fail"));
+    }
+
+    fn facts(n: usize, direct: usize, dependent: usize, parallel_model: usize, model_after_direct: usize, mutating: usize, synth: bool) -> DecisionState {
+        DecisionState {
+            request: "x".into(),
+            team_facts: Some(TeamFacts {
+                subgoals: vec!["g".into(); n],
+                direct,
+                dependent,
+                parallel_model,
+                model_after_direct,
+                mutating,
+                has_synthesis: synth,
+                models_available: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn split_p(st: DecisionState) -> f64 {
+        match &dec().answer(&decomposition_request(st))["split"] {
+            Answer::Noul { noul } => *noul,
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn splits_only_when_it_helps() {
+        // fan-out over deterministic agents + one join
+        assert!(split_p(facts(3, 3, 0, 0, 0, 0, true)) >= 0.6);
+        // two independent model-needing parts run in parallel
+        assert!(split_p(facts(2, 0, 0, 2, 0, 0, false)) >= 0.6);
+        // research -> verify -> patch: separates read-only from state-changing work
+        assert!(split_p(facts(3, 0, 2, 0, 0, 1, false)) >= 0.6);
+        // "read x and tell me what it says": one plan does this as well
+        assert!(split_p(facts(2, 1, 1, 0, 1, 0, false)) < 0.6);
+        // a free step next to a single model step gains nothing
+        assert!(split_p(facts(2, 1, 0, 1, 0, 0, false)) < 0.6);
+        // an all-read-only pipeline stays one task
+        assert!(split_p(facts(3, 0, 2, 0, 0, 0, false)) < 0.6);
+        // everything deterministic: Direct mode already handles it for free
+        assert!(split_p(facts(3, 3, 0, 0, 0, 0, false)) < 0.1);
+        // a split that needs a model that is not there
+        let mut st = facts(2, 0, 0, 2, 0, 0, false);
+        st.team_facts.as_mut().unwrap().models_available = false;
+        assert!(split_p(st) < 0.1);
     }
 
     #[test]

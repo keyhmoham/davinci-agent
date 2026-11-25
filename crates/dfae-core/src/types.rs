@@ -1,6 +1,7 @@
 //! Task state, plans, checks and verification records.
 
 use crate::ledger::Ledger;
+use crate::team::TeamInfo;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -52,7 +53,7 @@ impl std::fmt::Display for TaskStatus {
 }
 
 /// How a task is executed — the three tiers of the intelligence cascade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecMode {
     /// Deterministic: decision model + code + tools. No generative model call.
@@ -113,6 +114,9 @@ pub struct TaskRequest {
     /// server refuses it unless `DFAE_ALLOW_AUTO_APPROVE=true`).
     #[serde(default)]
     pub auto_approve: bool,
+    /// Subagent delegation: `None` = decided automatically, `Some(false)` = never.
+    #[serde(default)]
+    pub delegate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -137,6 +141,8 @@ pub struct Entity {
 pub enum StepKind {
     Tool,
     Reasoning,
+    /// Delegation: the step is executed by a subagent (a child task).
+    Agent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +248,9 @@ pub struct Step {
     pub summary: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// Class of the failure (drives recovery; survives delegation).
+    #[serde(default)]
+    pub error_kind: Option<crate::ErrorKind>,
     #[serde(default)]
     pub evidence: Vec<String>,
     #[serde(default)]
@@ -271,6 +280,7 @@ impl Step {
             output: None,
             summary: None,
             error: None,
+            error_kind: None,
             evidence: vec![],
             started_at: None,
             finished_at: None,
@@ -293,6 +303,8 @@ pub enum PlanSource {
     Slm,
     Strong,
     Replan,
+    /// Sub-goals delegated to a team of agents.
+    Team,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,19 +391,28 @@ pub struct Budget {
     pub max_tool_calls: u32,
     pub max_replans: u32,
     pub max_seconds: u64,
+    /// Subagents one task may spawn (retries included).
+    #[serde(default = "default_max_children")]
+    pub max_children: u32,
+}
+
+fn default_max_children() -> u32 {
+    8
 }
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { max_steps: 30, max_model_calls: 10, max_tool_calls: 25, max_replans: 2, max_seconds: 600 }
+        Self { max_steps: 30, max_model_calls: 10, max_tool_calls: 25, max_replans: 2, max_seconds: 600, max_children: 8 }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BudgetUsage {
     pub model_calls: u32,
     pub tool_calls: u32,
     pub replans: u32,
+    pub children: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,6 +489,9 @@ pub struct TaskRecord {
     pub tainted: bool,
     pub final_answer: Option<String>,
     pub error: Option<String>,
+    /// Team view: set on coordinators and on the agents they spawn.
+    #[serde(default)]
+    pub team: Option<TeamInfo>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -500,6 +524,7 @@ impl TaskRecord {
             tainted: false,
             final_answer: None,
             error: None,
+            team: None,
             created_at: now,
             updated_at: now,
         }

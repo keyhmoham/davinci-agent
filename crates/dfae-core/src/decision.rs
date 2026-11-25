@@ -23,6 +23,7 @@ pub enum DecisionKind {
     AssessRecovery,
     AssessCompletion,
     AssessEscalation,
+    AssessDecomposition,
 }
 
 impl DecisionKind {
@@ -35,6 +36,7 @@ impl DecisionKind {
             Self::AssessRecovery => "assess_recovery",
             Self::AssessCompletion => "assess_completion",
             Self::AssessEscalation => "assess_escalation",
+            Self::AssessDecomposition => "assess_decomposition",
         }
     }
 }
@@ -188,6 +190,27 @@ pub struct StepFacts {
     pub strong_available: bool,
 }
 
+/// Facts about a candidate split of a request into sub-tasks for a team of agents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamFacts {
+    /// Sub-goal texts (already shortened).
+    pub subgoals: Vec<String>,
+    /// How many bind deterministically (no generative model needed).
+    pub direct: usize,
+    /// How many depend on an earlier sub-goal (pipeline, not parallel).
+    pub dependent: usize,
+    /// Model-needing sub-goals with no dependencies (they can run in parallel).
+    pub parallel_model: usize,
+    /// Model-needing sub-goals that wait on a deterministic one — a single plan
+    /// handles those just as well, so splitting them gains nothing.
+    pub model_after_direct: usize,
+    /// Sub-goals that change state (patch, write, deploy, …).
+    pub mutating: usize,
+    pub has_synthesis: bool,
+    /// A generative model exists for the sub-goals that need one.
+    pub models_available: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompletionFacts {
     pub steps_ok: usize,
@@ -214,6 +237,8 @@ pub struct DecisionState {
     pub step_facts: Option<StepFacts>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_facts: Option<CompletionFacts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_facts: Option<TeamFacts>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

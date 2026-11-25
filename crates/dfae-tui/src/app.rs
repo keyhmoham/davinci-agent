@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 pub enum Tab {
     Timeline,
     Plan,
+    Team,
     Context,
     Tokens,
     Memory,
@@ -19,11 +20,12 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 6] = [Tab::Timeline, Tab::Plan, Tab::Context, Tab::Tokens, Tab::Memory, Tab::Tools];
+    pub const ALL: [Tab; 7] = [Tab::Timeline, Tab::Plan, Tab::Team, Tab::Context, Tab::Tokens, Tab::Memory, Tab::Tools];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Timeline => "Timeline",
             Tab::Plan => "Plan",
+            Tab::Team => "Team",
             Tab::Context => "Cognition",
             Tab::Tokens => "Tokens",
             Tab::Memory => "Memory",
@@ -115,8 +117,11 @@ pub struct App {
     pub tab: Tab,
     pub input: InputBox,
     pub mode: ModeRequest,
+    /// Subagent delegation: `None` = automatic, `Some(false)` = off.
+    pub delegate: Option<bool>,
     pub auto_approve: bool,
     pub session_id: String,
+    pub dispatch: Option<Value>,
     pub health: Option<Value>,
     pub info: Option<Value>,
     pub stats: Option<Value>,
@@ -146,8 +151,10 @@ impl App {
             tab: Tab::Timeline,
             input: InputBox::default(),
             mode: ModeRequest::Auto,
+            delegate: None,
             auto_approve: false,
             session_id: new_id(),
+            dispatch: None,
             health: None,
             info: None,
             stats: None,
@@ -195,6 +202,7 @@ impl App {
 
     pub fn apply_tasks(&mut self, rows: Vec<TaskRow>) {
         let before = self.selected_id();
+        let rows = tree_order(rows);
         // keep a stable selection (by id) across refreshes
         let wanted = self.want_select.as_ref().and_then(|id| rows.iter().position(|r| &r.task_id == id));
         let new_sel = match wanted {
@@ -295,7 +303,7 @@ impl App {
             }
             KeyCode::Tab => self.tab = Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()],
             KeyCode::BackTab => self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()],
-            KeyCode::Char(c @ '1'..='6') if self.input.text.is_empty() && key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Char(c @ '1'..='7') if self.input.text.is_empty() && key.modifiers.contains(KeyModifiers::ALT) => {
                 self.tab = Tab::ALL[(c as usize) - ('1' as usize)];
             }
             KeyCode::Up => {
@@ -382,6 +390,7 @@ impl App {
             mode: self.mode,
             profile: None,
             auto_approve: self.auto_approve,
+            delegate: self.delegate,
         }))
     }
 
@@ -404,6 +413,16 @@ impl App {
                     "escalated" => self.mode = ModeRequest::Escalated,
                     _ => self.notify("usage: /mode auto|direct|assisted|escalated", true),
                 }
+                None
+            }
+            "team" => {
+                match arg {
+                    "auto" | "" => self.delegate = None,
+                    "off" => self.delegate = Some(false),
+                    "on" => self.delegate = Some(true),
+                    _ => self.notify("usage: /team auto|on|off", true),
+                }
+                self.tab = Tab::Team;
                 None
             }
             "autoapprove" => {
@@ -448,6 +467,21 @@ impl App {
             }
         }
     }
+}
+
+/// Parents first, each followed by its agents in the order they were dispatched.
+/// (The server lists newest first; agents whose parent is not in the list stay top-level.)
+pub fn tree_order(rows: Vec<TaskRow>) -> Vec<TaskRow> {
+    let ids: std::collections::HashSet<String> = rows.iter().map(|r| r.task_id.clone()).collect();
+    let is_child = |r: &TaskRow| r.parent_id.as_ref().map(|p| ids.contains(p)).unwrap_or(false);
+    let mut out = Vec::with_capacity(rows.len());
+    for top in rows.iter().filter(|r| !is_child(r)) {
+        out.push(top.clone());
+        let mut kids: Vec<&TaskRow> = rows.iter().filter(|c| c.parent_id.as_deref() == Some(top.task_id.as_str())).collect();
+        kids.sort_by_key(|c| c.created_at);
+        out.extend(kids.into_iter().cloned());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -519,11 +553,66 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::Quit));
     }
 
+    fn row(id: &str, parent: Option<&str>, secs: i64) -> TaskRow {
+        TaskRow {
+            task_id: id.into(),
+            goal: id.into(),
+            status: TaskStatus::Running,
+            mode: None,
+            verification: None,
+            pending_approvals: 0,
+            ledger: Default::default(),
+            session_id: "s".into(),
+            created_at: Some(chrono::DateTime::from_timestamp(1_700_000_000 + secs, 0).unwrap()),
+            role: None,
+            parent_id: parent.map(String::from),
+            agents: 0,
+        }
+    }
+
+    #[test]
+    fn agents_are_listed_under_their_coordinator_in_dispatch_order() {
+        // server order: newest first
+        let rows = vec![row("k2", Some("p"), 12), row("k1", Some("p"), 11), row("other", None, 20), row("p", None, 10), row("orphan", Some("gone"), 5)];
+        let ids: Vec<_> = tree_order(rows).into_iter().map(|r| r.task_id).collect();
+        assert_eq!(ids, vec!["other", "p", "k1", "k2", "orphan"]);
+    }
+
+    #[test]
+    fn selection_follows_the_task_even_when_the_tree_reorders() {
+        let mut app = App::new("http://x");
+        app.apply_tasks(vec![row("p", None, 1)]);
+        assert_eq!(app.selected_id().as_deref(), Some("p"));
+        app.apply_tasks(vec![row("k1", Some("p"), 3), row("p", None, 1)]);
+        assert_eq!(app.selected_id().as_deref(), Some("p"), "the new agent appears below its parent without moving the selection");
+        assert_eq!(app.tasks[1].task_id, "k1");
+    }
+
+    #[test]
+    fn team_command_sets_delegation() {
+        let mut app = App::new("http://x");
+        type_str(&mut app, "/team off");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.delegate, Some(false));
+        assert_eq!(app.tab, Tab::Team);
+        type_str(&mut app, "list files");
+        match app.handle_key(key(KeyCode::Enter)) {
+            Some(Action::Submit(r)) => assert_eq!(r.delegate, Some(false)),
+            other => panic!("{other:?}"),
+        }
+        type_str(&mut app, "/team auto");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.delegate, None);
+    }
+
     #[test]
     fn tabs_and_quit_keys() {
         let mut app = App::new("http://x");
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Plan);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Team);
+        app.handle_key(key(KeyCode::BackTab));
         app.handle_key(key(KeyCode::BackTab));
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Tools);
@@ -557,6 +646,10 @@ mod tests {
             pending_approvals: 1,
             ledger: Default::default(),
             session_id: "s".into(),
+            created_at: None,
+            role: None,
+            parent_id: None,
+            agents: 0,
         }];
         let tid = rec.task_id.clone();
         app.apply_detail(rec);

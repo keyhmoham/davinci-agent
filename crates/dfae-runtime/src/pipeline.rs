@@ -27,12 +27,43 @@ pub(crate) struct SkillMatch {
 
 impl Inner {
     pub(crate) async fn run_task(self: Arc<Self>, ctx: Arc<TaskCtx>) {
-        let outcome = match AssertUnwindSafe(self.pipeline(&ctx)).catch_unwind().await {
-            Ok(r) => r,
-            Err(_) => Err("internal error: the task pipeline panicked".to_string()),
+        // Top-level tasks pass through admission control (agents are limited by
+        // their worker pools instead). A queued task stays `created`.
+        let mut admitted = true;
+        let _admission = if ctx.depth == 0 {
+            match self.dispatcher.try_admit() {
+                Some(p) => Some(p),
+                None => {
+                    let position = self.dispatcher.snapshot().queued + 1;
+                    self.emit(&ctx, EventKind::Queued { position }).await;
+                    tokio::select! {
+                        _ = ctx.cancel.cancelled() => {
+                            admitted = false;
+                            None
+                        }
+                        (p, _) = self.dispatcher.admit() => Some(p),
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let outcome = if !admitted {
+            Err("cancelled".to_string())
+        } else {
+            match AssertUnwindSafe(self.pipeline(&ctx)).catch_unwind().await {
+                Ok(r) => r,
+                Err(_) => Err("internal error: the task pipeline panicked".to_string()),
+            }
         };
         self.finalize(&ctx, outcome).await;
         self.live.lock().remove(&ctx.id);
+        ctx.permit.lock().take(); // free the worker slot before the coordinator wakes
+        let done = ctx.done.lock().take();
+        if let Some(tx) = done {
+            let rec = ctx.rec.lock().await.clone();
+            let _ = tx.send(rec);
+        }
     }
 
     pub(crate) fn decision_state(&self, goal: &str, entities: &[Entity]) -> DecisionState {
@@ -50,7 +81,7 @@ impl Inner {
             (r.goal.clone(), r.request.clone())
         };
 
-        // ---- 1. extraction (GLiNER + rules) --------------------------------
+        // ---- 1. extraction (GLiNER + rules; agents inherit their slice) --------
         let entities = self.stage_extract(ctx, &goal).await;
         // ---- 2. retrieval ---------------------------------------------------
         self.stage_retrieve(ctx, &goal, &entities, req.profile.unwrap_or_default()).await;
@@ -60,11 +91,23 @@ impl Inner {
         let routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
         ctx.rec.lock().await.route = Some(routing.clone());
 
+        // ---- 3b. subagents -----------------------------------------------------
+        let is_agent = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
+        if is_agent {
+            // role → tool scope → worker slot (waits if the role's pool is busy)
+            self.stage_assign_role(ctx, &goal, &entities, &routing).await?;
+        } else if self.cfg.team.enabled && req.delegate != Some(false) && req.mode == ModeRequest::Auto {
+            // automatic delegation: split the request across a team when the decision layer agrees
+            if let Some(result) = self.stage_team(ctx, &goal, &entities, &state, req.delegate == Some(true)).await {
+                return result;
+            }
+        }
+
         // ---- 4. deterministic candidates -----------------------------------
-        let metas = self.tools.metas();
+        let metas = self.scoped_metas(ctx);
         let calls: Option<Vec<DirectCall>> =
             if req.mode == ModeRequest::Assisted || req.mode == ModeRequest::Escalated { None } else { bind_direct(&metas, &goal, &entities) };
-        let skill = if matches!(req.mode, ModeRequest::Auto | ModeRequest::Direct) { self.find_skill(&goal, &entities).await } else { None };
+        let skill = if matches!(req.mode, ModeRequest::Auto | ModeRequest::Direct) { self.find_skill(ctx, &goal, &entities).await } else { None };
         let skill_direct = skill.as_ref().map(|s| !s.plan.has_reasoning()).unwrap_or(false);
 
         // ---- 5. mode ---------------------------------------------------------
@@ -139,7 +182,7 @@ impl Inner {
 
     /// execute → verify (+ at most one continuation) → answer. Shared by fresh
     /// runs and by tasks resumed after a restart.
-    async fn execute_and_conclude(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, mode: ExecMode) -> Result<(), String> {
+    pub(crate) async fn execute_and_conclude(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, mode: ExecMode) -> Result<(), String> {
         let mut exec_err = self.execute_plan(ctx).await.err();
         if self.is_cancelled(ctx).await {
             return Err("cancelled".into());
@@ -175,10 +218,56 @@ impl Inner {
     }
 
     async fn resume_pipeline(self: &Arc<Self>, ctx: &Arc<TaskCtx>) -> Result<(), String> {
+        // delegated steps that were mid-flight: what became of their agents?
+        let mut agents: std::collections::HashMap<String, TaskRecord> = Default::default();
+        let running: Vec<String> = {
+            let r = ctx.rec.lock().await;
+            r.plan
+                .as_ref()
+                .map(|p| {
+                    p.steps
+                        .iter()
+                        .filter(|s| s.kind == StepKind::Agent && s.status == StepStatus::Running)
+                        .filter_map(|s| s.args.get("child").and_then(|c| c.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for id in running {
+            if let Ok(Some(c)) = self.store.get_task(&id).await {
+                agents.insert(id, c);
+            }
+        }
+        if ctx.rec.lock().await.team.as_ref().map(|t| t.link.is_none()).unwrap_or(false) {
+            let _ = ctx.shared.set(Arc::new(crate::team::TeamShared::default()));
+        }
         let (goal, mode) = {
             let mut r = ctx.rec.lock().await;
             let Some(plan) = r.plan.as_mut() else { return Err("interrupted by a restart before a plan existed".into()) };
             for s in &mut plan.steps {
+                if s.kind == StepKind::Agent && s.status == StepStatus::Running {
+                    let finished = s.args.get("child").and_then(|c| c.as_str()).and_then(|id| agents.get(id)).filter(|c| c.status == TaskStatus::Completed);
+                    match finished {
+                        // the agent completed before the restart: adopt its result
+                        Some(c) => {
+                            let answer = c.final_answer.clone().unwrap_or_default();
+                            s.status = StepStatus::Succeeded;
+                            s.summary = Some(tokens::compress_text(&answer, 300));
+                            s.output = Some(answer);
+                            s.evidence = vec![format!(
+                                "child:{}:{}",
+                                short(&c.task_id),
+                                c.verification.as_ref().map(|v| format!("{:?}", v.status).to_lowercase()).unwrap_or_else(|| "unverified".into())
+                            )];
+                        }
+                        // otherwise its outcome is unknown and its side effects cannot be ruled out
+                        None => {
+                            s.status = StepStatus::Failed;
+                            s.error = Some("interrupted by a restart; the agent's outcome is unknown and it was not re-run".into());
+                        }
+                    }
+                    continue;
+                }
                 match s.status {
                     // outcome unknown: never silently re-run something with side effects
                     StepStatus::Running => {
@@ -222,6 +311,13 @@ impl Inner {
     // ------------------------------------------------------------ stages ----
 
     async fn stage_extract(&self, ctx: &Arc<TaskCtx>, goal: &str) -> Vec<Entity> {
+        // an agent inherits the entities of its sub-goal from the coordinator: no extractor call
+        let inherited = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).map(|l| l.entities.clone()).filter(|e| !e.is_empty());
+        if let Some(entities) = inherited {
+            ctx.rec.lock().await.entities = entities.clone();
+            self.emit(ctx, EventKind::Extraction { entities: entities.clone(), backend: "inherited".into(), latency_ms: 0 }).await;
+            return entities;
+        }
         let labels = dfae_extract::labels_for(None);
         let res = self.extractor.extract(ExtractionRequest { text: goal.to_string(), labels, threshold: 0.4 }).await;
         let (entities, backend, latency, cached) = match res {
@@ -243,6 +339,7 @@ impl Inner {
                     completion_tokens: 0,
                     latency_ms: latency,
                     cached,
+                    origin: None,
                 },
             )
             .await;
@@ -283,7 +380,16 @@ impl Inner {
                 prior.push(format!("{} → {}", tokens::truncate_tokens(&t.goal, 24), tokens::truncate_tokens(t.final_answer.as_deref().unwrap_or(""), 30)));
             }
         }
-        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior };
+        let upstream = ctx
+            .rec
+            .lock()
+            .await
+            .team
+            .as_ref()
+            .and_then(|t| t.link.as_ref())
+            .map(|l| l.upstream.iter().map(|u| (u.label.clone(), u.summary.clone())).collect())
+            .unwrap_or_default();
+        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, upstream };
         if profile != ContextProfile::Minimal {
             ctx.rec.lock().await.retrieved = refs.clone();
             self.emit(ctx, EventKind::Retrieval { items: refs }).await;
@@ -301,7 +407,12 @@ impl Inner {
                     p.steps
                         .iter()
                         .filter(|s| s.status == StepStatus::Succeeded)
-                        .map(|s| (format!("{} {}", s.id, s.tool.as_deref().unwrap_or("reasoning")), s.summary.clone().unwrap_or_default()))
+                        .map(|s| {
+                            (
+                                format!("{} {}", s.id, s.tool.as_deref().unwrap_or(if s.kind == StepKind::Agent { "agent" } else { "reasoning" })),
+                                s.summary.clone().unwrap_or_default(),
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
@@ -319,12 +430,13 @@ impl Inner {
             memories: &base.memories,
             prior_turns: &base.prior_turns,
             observations: &obs,
+            upstream: &base.upstream,
             profile,
         });
         pkg.render()
     }
 
-    async fn find_skill(&self, goal: &str, entities: &[Entity]) -> Option<SkillMatch> {
+    async fn find_skill(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) -> Option<SkillMatch> {
         let slots = skills::slot_values(goal, entities);
         let masked = skills::mask_request(goal, &slots);
         let cands = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 3, session_id: None }).await.ok()?;
@@ -333,7 +445,9 @@ impl Inner {
                 continue;
             }
             let Some(skill) = c.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) else { continue };
-            if let Some(plan) = skills::instantiate(&skill, goal, entities) {
+            if let Some(plan) =
+                skills::instantiate(&skill, goal, entities).filter(|p| p.steps.iter().filter_map(|s| s.tool.as_deref()).all(|t| ctx.in_scope(t)))
+            {
                 return Some(SkillMatch { memory_id: c.item.id, similarity: c.similarity, plan });
             }
         }
@@ -353,7 +467,7 @@ impl Inner {
     ) -> Result<(Plan, ExecMode), String> {
         // tool selection (decision layer), unioned with deterministic matches
         let mut tstate = base_state.clone();
-        tstate.tools = self.tools.briefs();
+        tstate.tools = self.scoped_briefs(ctx);
         let picked = self.note(ctx, self.decider.select_tools(tstate).await).await;
         let mut allowed: Vec<String> = picked.into_iter().map(|(n, _)| n).collect();
         for c in calls.unwrap_or(&[]) {
@@ -428,11 +542,11 @@ impl Inner {
 
     /// Evidence was judged insufficient: ask a model for the missing steps (once).
     async fn continue_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str) -> Result<bool, String> {
-        let (replans, max) = {
+        let (replans, max, coordinator) = {
             let r = ctx.rec.lock().await;
-            (r.usage.replans, r.budget.max_replans)
+            (r.usage.replans, r.budget.max_replans, r.team.as_ref().map(|t| t.link.is_none()).unwrap_or(false))
         };
-        if replans >= max {
+        if replans >= max || coordinator {
             return Ok(false);
         }
         let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
@@ -474,16 +588,51 @@ impl Inner {
         if cancelled {
             ctx.rec.lock().await.final_answer.get_or_insert_with(|| "Task cancelled.".into());
         }
-        // token ledger: baseline for a naive tool-calling LLM agent
+        // coordinators: fold in what the team did (agents' modes, cache hits, the work they performed)
+        let child_ids: Vec<String> = {
+            let r = ctx.rec.lock().await;
+            match &r.team {
+                Some(t) if t.link.is_none() => t.children.iter().map(|c| c.task_id.clone()).collect(),
+                _ => vec![],
+            }
+        };
+        let mut team_steps_raw: Vec<u64> = Vec::new();
+        let mut team_mode: Option<ExecMode> = None;
+        for id in &child_ids {
+            if let Ok(Some(c)) = self.store.get_task(id).await {
+                team_mode = team_mode.max(c.mode);
+                if let Some(p) = &c.plan {
+                    team_steps_raw.extend(
+                        p.steps.iter().filter(|s| s.status.is_done()).map(|s| tokens::estimate_tokens(s.output.as_deref().unwrap_or("")).min(4000) as u64),
+                    );
+                }
+            }
+        }
         {
             let mut r = ctx.rec.lock().await;
-            let raw: Vec<u64> = r
+            if let Some(t) = r.team.as_mut().filter(|t| t.link.is_none()) {
+                t.cache_hits = ctx.shared.get().map(|s| s.hits.load(std::sync::atomic::Ordering::SeqCst)).unwrap_or(0);
+            }
+            if !child_ids.is_empty() {
+                r.mode = r.mode.max(team_mode);
+            }
+        }
+        // token ledger: baseline for a naive tool-calling LLM agent. For a team the
+        // baseline is ONE naive agent doing all of the work, not a sum of per-agent baselines.
+        {
+            let mut r = ctx.rec.lock().await;
+            let mut raw: Vec<u64> = r
                 .plan
                 .as_ref()
                 .map(|p| {
-                    p.steps.iter().filter(|s| s.status.is_done()).map(|s| tokens::estimate_tokens(s.output.as_deref().unwrap_or("")).min(4000) as u64).collect()
+                    p.steps
+                        .iter()
+                        .filter(|s| s.status.is_done() && s.kind != StepKind::Agent)
+                        .map(|s| tokens::estimate_tokens(s.output.as_deref().unwrap_or("")).min(4000) as u64)
+                        .collect()
                 })
                 .unwrap_or_default();
+            raw.extend(team_steps_raw);
             let b = naive_baseline_tokens(
                 350,
                 self.tools.full_schema_tokens() as u64,
@@ -511,7 +660,12 @@ impl Inner {
             return;
         }
         // 1. calibration: did the decisions the engine relied on hold up?
-        if let Some(m) = rec.mode {
+        let coordinator = rec.team.as_ref().map(|t| t.link.is_none()).unwrap_or(false);
+        if coordinator {
+            // the split itself is the decision that needs judging
+            self.decider.record_outcome(DecisionKind::AssessDecomposition, "split", success);
+        }
+        if let (Some(m), false) = (rec.mode, coordinator) {
             let key = match m {
                 ExecMode::Direct => "direct",
                 ExecMode::Assisted => "assisted",

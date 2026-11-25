@@ -19,6 +19,7 @@ enum Msg {
     Health(Result<Value, String>),
     Info(Value),
     Stats(Value),
+    Dispatch(Value),
     Tasks(Vec<TaskRow>),
     Detail(Box<TaskRecord>),
     Ev(Box<Event>),
@@ -102,6 +103,11 @@ fn describe(e: &Event) -> Option<String> {
         EventKind::Decision { record } => format!("decide    {} via {}", record.kind, record.provider),
         EventKind::Mode { mode, reason, .. } => format!("mode      {} — {reason}", format!("{mode:?}").to_uppercase()),
         EventKind::PlanCreated { plan } => format!("plan      {} steps ({:?})", plan.steps.len(), plan.source),
+        EventKind::TeamFormed { goals, reason } => format!("team      {} agents — {reason}", goals.iter().filter(|g| !g.synth).count()),
+        EventKind::AgentDone { step_id, role, status, generative_tokens, .. } => {
+            format!("agent     {step_id} ({}) → {status:?}, {generative_tokens} generative tokens", role.as_str())
+        }
+        EventKind::Queued { position } => format!("queued    position {position}"),
         EventKind::PlanRevised { reason, .. } => format!("replan    {reason}"),
         EventKind::StepUpdate { step_id, status, tool, error, .. } if status.is_done() => format!(
             "step      {step_id} {} → {status:?}{}",
@@ -115,7 +121,7 @@ fn describe(e: &Event) -> Option<String> {
 }
 
 async fn ask(api: &Api, goal: String, mode: ModeRequest, auto: bool) -> i32 {
-    let req = TaskRequest { goal, session_id: None, mode, profile: None, auto_approve: auto };
+    let req = TaskRequest { goal, session_id: None, mode, profile: None, auto_approve: auto, delegate: None };
     let id = match api.create(&req).await {
         Ok(id) => id,
         Err(e) => {
@@ -241,6 +247,9 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
                     }
                     if let Ok(s) = api.stats().await {
                         let _ = tx.send(Msg::Stats(s));
+                    }
+                    if let Ok(d) = api.dispatch().await {
+                        let _ = tx.send(Msg::Dispatch(d));
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(if ok { 2000 } else { 1000 })).await;
@@ -387,6 +396,7 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
             Msg::Health(Err(_)) => app.connected = false,
             Msg::Info(i) => app.info = Some(i),
             Msg::Stats(s) => app.stats = Some(s),
+            Msg::Dispatch(d) => app.dispatch = Some(d),
             Msg::Tasks(t) => app.apply_tasks(t),
             Msg::Detail(d) => app.apply_detail(*d),
             Msg::Ev(e) => app.push_event(*e),

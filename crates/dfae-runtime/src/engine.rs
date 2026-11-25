@@ -3,6 +3,8 @@
 //! `executor.rs`, verification in `verify.rs`.
 
 use crate::bus::EventBus;
+use crate::dispatch::{AgentPermit, DispatchSnapshot, Dispatcher};
+use crate::team::TeamShared;
 use chrono::Utc;
 use dfae_core::*;
 use dfae_decision::{Decided, Decider};
@@ -10,9 +12,9 @@ use dfae_models::{Generated, ModelGateway, Tier};
 use dfae_tools::{PolicyEngine, ToolRegistry};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -37,12 +39,47 @@ pub(crate) struct TaskCtx {
     pub allowed: Mutex<Vec<String>>,
     /// Compact context text for prompts (rebuilt as observations accumulate).
     pub base_ctx: Mutex<ContextBase>,
+    /// 0 for top-level tasks, 1 for subagents (agents cannot spawn agents).
+    pub depth: u8,
+    /// Tools this agent's role may use (`None` = unrestricted). Policy still applies.
+    pub scope: Mutex<Option<HashSet<String>>>,
+    /// State shared by a team (read cache); set once a team is formed.
+    pub shared: OnceLock<Arc<TeamShared>>,
+    /// Worker-pool slot held while an agent runs.
+    pub permit: Mutex<Option<AgentPermit>>,
+    /// Receives the final record when this task is a subagent.
+    pub done: Mutex<Option<oneshot::Sender<TaskRecord>>>,
+}
+
+impl TaskCtx {
+    pub fn new(rec: TaskRecord, cancel: CancellationToken, depth: u8) -> Arc<Self> {
+        Arc::new(Self {
+            id: rec.task_id.clone(),
+            rec: tokio::sync::Mutex::new(rec),
+            cancel,
+            seq: AtomicU64::new(0),
+            waiters: Mutex::new(HashMap::new()),
+            allowed: Mutex::new(vec![]),
+            base_ctx: Mutex::new(ContextBase::default()),
+            depth,
+            scope: Mutex::new(None),
+            shared: OnceLock::new(),
+            permit: Mutex::new(None),
+            done: Mutex::new(None),
+        })
+    }
+
+    pub fn in_scope(&self, tool: &str) -> bool {
+        self.scope.lock().as_ref().map(|s| s.contains(tool)).unwrap_or(true)
+    }
 }
 
 #[derive(Default, Clone)]
 pub(crate) struct ContextBase {
     pub memories: Vec<dfae_memory::RankedMemory>,
     pub prior_turns: Vec<String>,
+    /// Results of the agents this one depends on `(label, summary)`.
+    pub upstream: Vec<(String, String)>,
 }
 
 pub(crate) struct Inner {
@@ -54,6 +91,7 @@ pub(crate) struct Inner {
     pub tools: Arc<ToolRegistry>,
     pub policy: Arc<PolicyEngine>,
     pub bus: EventBus,
+    pub dispatcher: Dispatcher,
     pub live: Mutex<HashMap<String, Arc<TaskCtx>>>,
 }
 
@@ -82,6 +120,10 @@ pub struct StatsReport {
     pub completed: usize,
     pub failed: usize,
     pub verified: usize,
+    /// Teams formed / agents spawned / reads served from a team's shared cache.
+    pub teams: usize,
+    pub agents: usize,
+    pub team_cache_hits: u32,
     pub direct: usize,
     pub assisted: usize,
     pub escalated: usize,
@@ -94,6 +136,7 @@ impl Engine {
     pub fn new(deps: EngineDeps) -> Self {
         Self {
             inner: Arc::new(Inner {
+                dispatcher: Dispatcher::new(&deps.config.team),
                 cfg: deps.config,
                 store: deps.store,
                 extractor: deps.extractor,
@@ -131,18 +174,13 @@ impl Engine {
         if request.auto_approve && !self.inner.cfg.allow_auto_approve {
             return Err("auto_approve is disabled on this server (set DFAE_ALLOW_AUTO_APPROVE=true)".into());
         }
+        if self.inner.dispatcher.saturated() {
+            return Err(format!("the dispatch queue is full ({} tasks waiting); try again shortly", self.inner.cfg.team.max_queued_tasks));
+        }
         let rec = TaskRecord::new(request, self.inner.cfg.budget.clone());
         let id = rec.task_id.clone();
         let goal = rec.goal.clone();
-        let ctx = Arc::new(TaskCtx {
-            id: id.clone(),
-            rec: tokio::sync::Mutex::new(rec),
-            cancel: CancellationToken::new(),
-            seq: AtomicU64::new(0),
-            waiters: Mutex::new(HashMap::new()),
-            allowed: Mutex::new(vec![]),
-            base_ctx: Mutex::new(ContextBase::default()),
-        });
+        let ctx = TaskCtx::new(rec, CancellationToken::new(), 0);
         self.inner.live.lock().insert(id.clone(), ctx.clone());
         self.inner.persist(&ctx).await;
         self.inner.emit(&ctx, EventKind::TaskCreated { goal }).await;
@@ -154,20 +192,20 @@ impl Engine {
     /// Resume tasks left unfinished by a previous process. Returns their ids.
     pub async fn resume_unfinished(&self) -> Vec<String> {
         let mut ids = Vec::new();
-        for rec in self.inner.store.unfinished_tasks().await.unwrap_or_default() {
+        for mut rec in self.inner.store.unfinished_tasks().await.unwrap_or_default() {
             let id = rec.task_id.clone();
             if self.inner.live.lock().contains_key(&id) {
                 continue;
             }
-            let ctx = Arc::new(TaskCtx {
-                id: id.clone(),
-                rec: tokio::sync::Mutex::new(rec),
-                cancel: CancellationToken::new(),
-                seq: AtomicU64::new(0),
-                waiters: Mutex::new(HashMap::new()),
-                allowed: Mutex::new(vec![]),
-                base_ctx: Mutex::new(ContextBase::default()),
-            });
+            // A subagent cannot be re-attached to the coordinator that was awaiting it.
+            // Its parent adopts the result if it had finished, or marks the step failed.
+            if rec.team.as_ref().and_then(|t| t.link.as_ref()).is_some() {
+                rec.status = TaskStatus::Cancelled;
+                rec.error = Some("orphaned by a restart".into());
+                let _ = self.inner.store.put_task(&rec).await;
+                continue;
+            }
+            let ctx = TaskCtx::new(rec, CancellationToken::new(), 0);
             self.inner.live.lock().insert(id.clone(), ctx.clone());
             let inner = self.inner.clone();
             tokio::spawn(async move { inner.resume_task(ctx).await });
@@ -297,6 +335,17 @@ impl Engine {
         let mut s = StatsReport { tasks: tasks.len(), decision_provider: self.inner.decider.provider_name().into(), ..Default::default() };
         let mut totals = LedgerSummary::default();
         for t in &tasks {
+            let (is_coordinator, is_agent) = match &t.team {
+                Some(i) => (i.link.is_none(), i.link.is_some()),
+                None => (false, false),
+            };
+            if is_coordinator {
+                s.teams += 1;
+                s.team_cache_hits += t.team.as_ref().map(|i| i.cache_hits).unwrap_or(0);
+            }
+            if is_agent {
+                s.agents += 1;
+            }
             match t.status {
                 TaskStatus::Completed => s.completed += 1,
                 TaskStatus::Failed => s.failed += 1,
@@ -305,13 +354,19 @@ impl Engine {
             if t.verification.as_ref().map(|v| v.status == VerificationStatus::Verified).unwrap_or(false) {
                 s.verified += 1;
             }
-            match t.mode {
+            // a coordinator's mode is the max of its agents' (already counted)
+            match t.mode.filter(|_| !is_coordinator) {
                 Some(ExecMode::Direct) => s.direct += 1,
                 Some(ExecMode::Assisted) => s.assisted += 1,
                 Some(ExecMode::Escalated) => s.escalated += 1,
                 None => {}
             }
-            let l = t.ledger.summary();
+            // own calls only: rolled-up agent entries are counted on the agent's record;
+            // an agent's baseline is excluded because the coordinator's models the whole request
+            let mut l = t.ledger.summary_own();
+            if is_agent {
+                l.baseline_tokens = 0;
+            }
             totals.slm_tokens += l.slm_tokens;
             totals.strong_tokens += l.strong_tokens;
             totals.decision_tokens += l.decision_tokens;
@@ -328,6 +383,11 @@ impl Engine {
         s.totals = totals;
         s.memory = self.inner.store.stats().await.unwrap_or_default();
         s
+    }
+
+    /// Dispatcher state: admission queue and per-role worker pools.
+    pub fn dispatch(&self) -> DispatchSnapshot {
+        self.inner.dispatcher.snapshot()
     }
 
     pub fn calibration(&self) -> Value {

@@ -51,6 +51,29 @@ pub struct Thresholds {
     pub tool_min_relevance: f32,
 }
 
+/// Team orchestration and dispatch limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamConfig {
+    /// Automatic delegation to subagents (`DFAE_TEAM=off` disables it).
+    pub enabled: bool,
+    /// Top-level tasks running at once; the rest wait in the dispatch queue.
+    pub max_concurrent_tasks: usize,
+    /// Waiting tasks beyond this are rejected (load shedding).
+    pub max_queued_tasks: usize,
+    /// Subagents running at once, across all teams.
+    pub max_agents: usize,
+    /// Per-role worker pool sizes. `operator=1` serialises side-effecting agents.
+    pub role_slots: std::collections::BTreeMap<String, usize>,
+    /// Longest wait for one subagent.
+    pub agent_timeout_secs: u64,
+}
+
+impl TeamConfig {
+    pub fn slots_for(&self, role: &str) -> usize {
+        self.role_slots.get(role).copied().unwrap_or(2).max(1)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub bind: String,
@@ -67,9 +90,15 @@ pub struct Config {
     pub strong: ModelConfig,
     pub budget: Budget,
     pub thresholds: Thresholds,
+    pub team: TeamConfig,
     pub max_parallel: usize,
     pub approval_ttl_secs: u64,
     pub log_json: bool,
+}
+
+/// `researcher=4,operator=1` -> map. Malformed entries are ignored.
+fn parse_slots(s: &str) -> std::collections::BTreeMap<String, usize> {
+    s.split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(k, v)| v.trim().parse::<usize>().ok().map(|n| (k.trim().to_string(), n))).collect()
 }
 
 impl Config {
@@ -111,12 +140,21 @@ impl Config {
                 max_tool_calls: env_parse("DFAE_MAX_TOOL_CALLS", 25),
                 max_replans: env_parse("DFAE_MAX_REPLANS", 2),
                 max_seconds: env_parse("DFAE_MAX_SECONDS", 600),
+                max_children: env_parse("DFAE_MAX_CHILDREN", 8),
             },
             thresholds: Thresholds {
                 direct_min_confidence: env_parse("DFAE_DIRECT_MIN_CONF", 0.6),
                 skill_min_similarity: env_parse("DFAE_SKILL_MIN_SIM", 0.82),
                 escalate_below: env_parse("DFAE_ESCALATE_BELOW", 0.35),
                 tool_min_relevance: env_parse("DFAE_TOOL_MIN_REL", 0.5),
+            },
+            team: TeamConfig {
+                enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),
+                max_concurrent_tasks: env_parse("DFAE_MAX_CONCURRENT_TASKS", 8).max(1),
+                max_queued_tasks: env_parse("DFAE_MAX_QUEUED_TASKS", 64),
+                max_agents: env_parse("DFAE_MAX_AGENTS", 8).max(1),
+                role_slots: parse_slots(&env_or("DFAE_ROLE_SLOTS", "researcher=4,operator=1,analyst=4,verifier=2")),
+                agent_timeout_secs: env_parse("DFAE_AGENT_TIMEOUT_SECS", 600),
             },
             max_parallel: env_parse("DFAE_MAX_PARALLEL", 4),
             approval_ttl_secs: env_parse("DFAE_APPROVAL_TTL_SECS", 900),

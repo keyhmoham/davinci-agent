@@ -3,6 +3,7 @@
 //! and decision-driven recovery (retry / replan / escalate / skip / fail).
 
 use crate::engine::{Inner, TaskCtx};
+use crate::team::TeamShared;
 use crate::{planner, prompts};
 use chrono::Utc;
 use dfae_core::*;
@@ -33,9 +34,9 @@ impl From<ToolError> for StepFailure {
     }
 }
 
-struct StepOutput {
-    content: String,
-    evidence: Vec<String>,
+pub(crate) struct StepOutput {
+    pub content: String,
+    pub evidence: Vec<String>,
 }
 
 fn kind_str(k: ErrorKind) -> String {
@@ -45,6 +46,7 @@ fn kind_str(k: ErrorKind) -> String {
 impl Inner {
     pub(crate) async fn execute_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>) -> Result<(), String> {
         let sem = Arc::new(Semaphore::new(self.cfg.max_parallel.max(1)));
+        let mut isolated: Option<String> = None;
         loop {
             if ctx.cancel.is_cancelled() {
                 return Err("cancelled".into());
@@ -120,14 +122,24 @@ impl Inner {
             // ---- recovery -------------------------------------------------------
             let mut fatal: Option<String> = None;
             for (id, f) in failures {
+                let is_agent = ctx.rec.lock().await.plan.as_ref().and_then(|p| p.step(&id)).map(|s| s.kind == StepKind::Agent).unwrap_or(false);
                 if let Some(msg) = self.recover(ctx, &id, f).await {
-                    fatal.get_or_insert(msg);
+                    if is_agent {
+                        // failure isolation: siblings that do not depend on this agent keep running;
+                        // the task fails at the end with their results preserved
+                        isolated.get_or_insert(msg);
+                    } else {
+                        fatal.get_or_insert(msg);
+                    }
                 }
             }
             if let Some(msg) = fatal {
                 return Err(msg);
             }
             self.set_status(ctx, TaskStatus::Running).await;
+        }
+        if let Some(msg) = isolated {
+            return Err(msg);
         }
         // anything still failed (e.g. no recovery needed) fails the task
         let r = ctx.rec.lock().await;
@@ -149,7 +161,10 @@ impl Inner {
                 s.depends_on
                     .iter()
                     .filter_map(|d| plan.step(d))
-                    .map(|d| (d.id.clone(), d.tool.clone(), d.summary.clone().unwrap_or_default(), d.output.clone().unwrap_or_default()))
+                    .map(|d| {
+                        let label = d.tool.clone().or_else(|| (d.kind == StepKind::Agent).then(|| "agent".to_string()));
+                        (d.id.clone(), label, d.summary.clone().unwrap_or_default(), d.output.clone().unwrap_or_default())
+                    })
                     .collect()
             };
             let s = plan.step_mut(id).unwrap();
@@ -175,6 +190,7 @@ impl Inner {
         let result = match step.kind {
             StepKind::Reasoning => self.run_reasoning(ctx, &step, mode, &deps).await,
             StepKind::Tool => self.run_tool(ctx, &step, tainted, &deps).await,
+            StepKind::Agent => self.run_agent(ctx, &step, &deps).await,
         };
 
         match result {
@@ -228,6 +244,7 @@ impl Inner {
                     if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
                         s.status = StepStatus::Failed;
                         s.error = Some(f.message.clone());
+                        s.error_kind = Some(f.kind);
                         s.finished_at = Some(Utc::now());
                     }
                 }
@@ -286,6 +303,9 @@ impl Inner {
         if !ctx.allowed.lock().iter().any(|a| a == &name) {
             return Err(StepFailure::new(ErrorKind::Policy, format!("tool '{name}' is not available for this task")));
         }
+        if !ctx.in_scope(&name) {
+            return Err(StepFailure::new(ErrorKind::Policy, format!("tool '{name}' is outside this agent's role scope")));
+        }
         // resolve {{sN}} templates against dependency outputs
         let outputs: HashMap<&str, &str> = deps.iter().map(|(id, _, _, out)| (id.as_str(), out.as_str())).collect();
         let args = planner::substitute(&step.args, &|id| {
@@ -307,16 +327,37 @@ impl Inner {
         if let Some(reason) = approval_reason {
             self.await_approval(ctx, step, &name, &args, &reason, meta.risk).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
         }
-        self.take_tool_call(ctx).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
-
+        // a read another member of the team already did (and nothing has changed since)
+        let shared = ctx.shared.get().cloned();
+        let cache_key = shared.as_ref().filter(|_| meta.cacheable).map(|_| TeamShared::key(&name, &args));
+        let cached = shared.as_ref().zip(cache_key.as_ref()).and_then(|(sh, k)| sh.get(k));
         let tool = self.tools.get(&name).ok_or_else(|| StepFailure::new(ErrorKind::NotFound, "tool vanished"))?;
         let tctx =
             ToolContext { task_id: ctx.id.clone(), step_id: step.id.clone(), workspace: self.policy.workspace().to_path_buf(), cancel: ctx.cancel.clone() };
-        let out = match tokio::time::timeout(Duration::from_secs(120), tool.execute(args.clone(), tctx.clone())).await {
-            Ok(r) => r.map_err(StepFailure::from)?,
-            Err(_) => return Err(StepFailure::new(ErrorKind::Timeout, "tool timed out after 120s")),
+        let generation = shared.as_ref().map(|s| s.generation()).unwrap_or(0);
+        let out = match cached {
+            Some(content) => ToolOutput { content, ok: true, exit_code: Some(0), evidence: vec!["served from the team's shared cache".into()] },
+            None => {
+                self.take_tool_call(ctx).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
+                let res = tokio::time::timeout(Duration::from_secs(120), tool.execute(args.clone(), tctx.clone())).await;
+                if meta.side_effects
+                    && let Some(sh) = &shared
+                {
+                    sh.invalidate(); // whatever happened, cached reads of the old state are stale
+                }
+                match res {
+                    Ok(r) => r.map_err(StepFailure::from)?,
+                    Err(_) => return Err(StepFailure::new(ErrorKind::Timeout, "tool timed out after 120s")),
+                }
+            }
         };
         let content = dfae_core::safety::redact_secrets(&out.content);
+        if out.ok
+            && let (Some(sh), Some(k)) = (&shared, cache_key)
+            && !out.evidence.iter().any(|e| e.contains("shared cache"))
+        {
+            sh.put(k, content.clone(), generation);
+        }
         if !out.ok {
             let first = content.lines().next().unwrap_or("").chars().take(160).collect::<String>();
             return Err(StepFailure::new(ErrorKind::Other, format!("{name} reported failure (exit {}): {first}", out.exit_code.unwrap_or(-1))));
@@ -439,7 +480,8 @@ impl Inner {
             attempts: step.attempts,
             max_attempts: step.retry.max_attempts,
             replans_used: usage.replans,
-            max_replans: if generative { budget.max_replans } else { 0 },
+            // an agent step is retried or escalated, never replanned: its own pipeline already replans internally
+            max_replans: if generative && step.kind != StepKind::Agent { budget.max_replans } else { 0 },
             optional: false,
             strong_available: self.models.has(Tier::Strong),
         });
@@ -468,7 +510,22 @@ impl Inner {
                 }
                 None
             }
+            Escalate if step.kind == StepKind::Agent => {
+                // supervision: run the sub-task again on the stronger model
+                {
+                    let mut r = ctx.rec.lock().await;
+                    if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                        s.status = StepStatus::Pending;
+                        s.args = json!({"mode": "escalated"});
+                    }
+                }
+                self.emit(ctx, EventKind::Warning { message: format!("escalating {label}") }).await;
+                None
+            }
             Replan | Escalate => {
+                if step.kind == StepKind::Agent {
+                    return Some(label);
+                }
                 let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
                 let tier = if action == Escalate { Tier::Strong } else { self.pick_tier(mode).unwrap_or(Tier::Slm) };
                 if !self.models.has(tier) {
@@ -512,7 +569,7 @@ impl Inner {
             (r.entities.clone(), r.goal.clone())
         };
         let mut tstate = self.decision_state(&base, &entities);
-        tstate.tools = self.tools.briefs();
+        tstate.tools = self.scoped_briefs(ctx);
         let picked = self.note(ctx, self.decider.select_tools(tstate).await).await;
         let allowed: Vec<String> = {
             let mut a = ctx.allowed.lock();
@@ -524,7 +581,7 @@ impl Inner {
             // a recovery plan may need a sibling of a tool that already failed
             // (same category), but never an unrelated one
             let cats: Vec<String> = a.iter().filter_map(|n| self.tools.meta(n)).map(|m| m.category).collect();
-            for m in self.tools.metas() {
+            for m in self.scoped_metas(ctx) {
                 if cats.contains(&m.category) && !a.contains(&m.name) && !m.side_effects {
                     a.push(m.name);
                 }

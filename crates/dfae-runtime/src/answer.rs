@@ -8,6 +8,15 @@ use dfae_core::*;
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
 
+/// What to call a step in prose: the tool, the delegated sub-goal, or "reasoning".
+fn label(s: &Step) -> String {
+    match s.kind {
+        StepKind::Tool => s.tool.clone().unwrap_or_default(),
+        StepKind::Agent => tokens::truncate_tokens(&s.description, 14),
+        StepKind::Reasoning => "reasoning".into(),
+    }
+}
+
 /// `id tool: summary` lines for completed steps (token-bounded per step).
 pub fn evidence_block(rec: &TaskRecord, per_step_tokens: usize) -> String {
     let Some(plan) = &rec.plan else { return String::new() };
@@ -17,12 +26,10 @@ pub fn evidence_block(rec: &TaskRecord, per_step_tokens: usize) -> String {
             StepStatus::Succeeded => lines.push(format!(
                 "{} {}: {}",
                 s.id,
-                s.tool.as_deref().unwrap_or("reasoning"),
+                label(s),
                 tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), per_step_tokens)
             )),
-            StepStatus::Failed => {
-                lines.push(format!("{} {} FAILED: {}", s.id, s.tool.as_deref().unwrap_or("reasoning"), s.error.as_deref().unwrap_or("error")))
-            }
+            StepStatus::Failed => lines.push(format!("{} {} FAILED: {}", s.id, label(s), s.error.as_deref().unwrap_or("error"))),
             StepStatus::Skipped => lines.push(format!("{} SKIPPED", s.id)),
             _ => {}
         }
@@ -50,15 +57,19 @@ pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
             let body = tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), 350);
             out.push_str(&format!(
                 "▸ {}{}\n{}\n",
-                s.tool.as_deref().unwrap_or("reasoning"),
-                if s.args.is_null() || s.args == serde_json::json!({}) { String::new() } else { format!(" {}", compact_args(&s.args)) },
+                label(s),
+                if s.kind != StepKind::Tool || s.args.is_null() || s.args == serde_json::json!({}) {
+                    String::new()
+                } else {
+                    format!(" {}", compact_args(&s.args))
+                },
                 body
             ));
         }
     }
     let failed: Vec<&Step> = plan.steps.iter().filter(|s| s.status == StepStatus::Failed).collect();
     for s in failed {
-        out.push_str(&format!("✗ {} failed: {}\n", s.tool.as_deref().unwrap_or("reasoning"), s.error.as_deref().unwrap_or("error")));
+        out.push_str(&format!("✗ {} failed: {}\n", label(s), s.error.as_deref().unwrap_or("error")));
     }
     out.trim().to_string()
 }
@@ -121,7 +132,7 @@ impl Inner {
         };
 
         // only tool output is ground truth: a model's own prose must never vouch for itself
-        let evidence_full: String = plan.steps.iter().filter(|s| s.kind == StepKind::Tool).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
+        let evidence_full: String = plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
         let mut from_model = false;
         let text = if exec_err.is_some() || !plan.has_reasoning() {
             templated_answer(&snapshot, exec_err)
