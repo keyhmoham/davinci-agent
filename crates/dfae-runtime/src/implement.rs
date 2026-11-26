@@ -100,6 +100,14 @@ fn bind_view(meta: &ToolMetadata, step_text: &str) -> ToolMetadata {
     m
 }
 
+/// `command` without its leading `cd <cwd> &&` (or `;`), when that is where it already runs.
+pub(crate) fn strip_redundant_cd(command: &str, cwd: &str) -> Option<String> {
+    let norm = |d: &str| d.trim().trim_matches(['"', '\'', '`']).trim_start_matches("./").trim_end_matches('/').to_string();
+    let rest = command.trim_start().strip_prefix("cd ")?;
+    let (dir, tail) = rest.split_once("&&").or_else(|| rest.split_once(';'))?;
+    (norm(dir) == norm(cwd) && !norm(cwd).is_empty() && !tail.trim().is_empty()).then(|| tail.trim().to_string())
+}
+
 /// The directory of the workspace a shell step says it runs in ("…in proj", "inside the folder site", "cwd app"), unless the command
 /// already goes there itself (`cd`, `-C`, a path through it).
 pub(crate) fn directory_named(step: &str, command: &str, workspace: &std::path::Path) -> Option<String> {
@@ -255,7 +263,12 @@ impl Inner {
             .join(" | ");
         // The model is asked for what the step needs, not for every knob of the tool: an optional number nobody mentioned
         // (`timeout_secs`) is a number a small model can run away with ("1200120120…" until the token limit).
-        let asked = bind_view(meta, &step.description);
+        let mut asked = bind_view(meta, &step.description);
+        // content a model already wrote (as plain text, in full) is never asked for again as a JSON string: that is the most expensive
+        // thing a retry can do, and what is wrong with the arguments is not it
+        asked
+            .params
+            .retain(|p| !(CONTENT_PARAMS.contains(&p.name.as_str()) && prebound.get(&p.name).and_then(|v| v.as_str()).is_some_and(|c| !c.trim().is_empty())));
         let meta = &asked;
         // both hosted models are billed by the token: compact signature (the parameter help rides in the schema), trimmed inputs
         let sig = meta.signature();
@@ -354,8 +367,11 @@ impl Inner {
         req.temperature = 0.2;
         let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
-        let why =
-            if degenerate(&text) { Some("it repeated the same lines".to_string()) } else { crate::syntax::problem(std::path::Path::new(path), &text).await };
+        let why = if degenerate(&text) {
+            Some("it repeated the same lines".to_string())
+        } else {
+            crate::syntax::problem(&self.policy.workspace().join(path), &text).await
+        };
         let Some(why) = why else {
             return (!text.trim().is_empty()).then_some(text);
         };
@@ -574,6 +590,15 @@ impl Inner {
             }
         }
 
+        // `cd proj && make` with cwd already `proj`: the cd would fail where it is, and the command is right without it
+        if tool == "shell"
+            && let (Some(cwd), Some(command)) = (args.get("cwd").and_then(|c| c.as_str()), args.get("command").and_then(|c| c.as_str()))
+            && let Some(rest) = strip_redundant_cd(command, cwd)
+        {
+            args.insert("command".into(), Value::String(rest));
+            how.push("rules");
+        }
+
         // "…in proj": a command that does not say where it runs, for a step that names a directory that exists, runs there
         if tool == "shell" && args.get("cwd").is_none() && meta.params.iter().any(|p| p.name == "cwd") {
             let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
@@ -629,6 +654,13 @@ impl Inner {
         let (checks, understood) = crate::planner::expect_checks(expect);
         let mut missed: Vec<String> = Vec::new();
         for c in &checks {
+            if let Check::UrlServes { url, value } = c {
+                // a server that was just started builds on its first request: it is given time to come up
+                if let Err(why) = crate::verify::probe_url(url, value.as_deref(), std::time::Duration::from_secs(45)).await {
+                    missed.push(format!("{} ({why})", c.describe()));
+                }
+                continue;
+            }
             let (pass, ev) = self.eval_check(c, output);
             if !pass && !self.satisfied_by_arguments(c, step) {
                 missed.push(format!("{} ({ev})", c.describe()));
@@ -731,6 +763,16 @@ mod content_tests {
         assert_eq!(names(&bind_view(&shell, "serve it on port 8001")), ["command", "cwd"], "a port is not a timeout");
         assert_eq!(names(&bind_view(&shell, "run the tests with a timeout of 300 seconds")), ["command", "cwd", "timeout_secs"]);
         assert_eq!(names(&bind_view(&shell, "run it in the background")), ["command", "cwd", "background"]);
+    }
+
+    #[test]
+    fn a_cd_into_the_directory_the_command_already_runs_in_is_dropped() {
+        use super::strip_redundant_cd as s;
+        assert_eq!(s("cd lumen && npm run build", "lumen").as_deref(), Some("npm run build"));
+        assert_eq!(s("cd ./lumen/ ; npm test", "lumen").as_deref(), Some("npm test"));
+        assert_eq!(s("cd \"app\" && make -j4", "./app").as_deref(), Some("make -j4"));
+        assert_eq!(s("cd lumen/sub && ls", "lumen"), None, "a deeper directory is a real cd");
+        assert_eq!(s("npm run build", "lumen"), None);
     }
 
     #[test]

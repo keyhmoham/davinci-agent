@@ -20,6 +20,7 @@ dfae-models = { workspace = true }
 dfae-memory = { workspace = true }
 dfae-tools = { workspace = true }
 dfae-mcp = { workspace = true }
+reqwest = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 futures-util = { workspace = true }

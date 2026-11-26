@@ -198,6 +198,13 @@ pub enum Check {
         path: String,
         value: String,
     },
+    /// Something the step started answers on this local address (and, when `value` is given, its page says that): what a served
+    /// page or an API leaves behind. Checked by asking it, after the step, waiting for it to come up.
+    UrlServes {
+        url: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
 }
 
 impl Check {
@@ -229,6 +236,8 @@ impl Check {
             Check::ExitOk => "tool reported success".into(),
             Check::FileExists { path } => format!("file exists: {path}"),
             Check::FileContains { path, value } => format!("{path} contains '{value}'"),
+            Check::UrlServes { url, value: Some(v) } => format!("{url} serves a page that says '{v}'"),
+            Check::UrlServes { url, value: None } => format!("{url} answers"),
         }
     }
 }

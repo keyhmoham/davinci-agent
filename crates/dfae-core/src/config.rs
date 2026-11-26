@@ -276,7 +276,7 @@ impl Config {
                 max_model_calls: env_parse("DFAE_MAX_MODEL_CALLS", 12),
                 max_worker_calls: env_parse("DFAE_MAX_WORKER_CALLS", 200),
                 max_tool_calls: env_parse("DFAE_MAX_TOOL_CALLS", 25),
-                max_replans: env_parse("DFAE_MAX_REPLANS", 2),
+                max_replans: env_parse("DFAE_MAX_REPLANS", 4),
                 max_seconds: env_parse("DFAE_MAX_SECONDS", 600),
                 max_children: env_parse("DFAE_MAX_CHILDREN", 8),
             },
