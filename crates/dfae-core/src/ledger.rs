@@ -26,6 +26,9 @@ pub struct LedgerEntry {
     /// Part of `prompt_tokens` that the provider's prompt cache served.
     #[serde(default)]
     pub cached_tokens: u64,
+    /// The request was sent as a cacheable prefix (`GenerationRequest::cache`).
+    #[serde(default)]
+    pub prefixed: bool,
     pub latency_ms: u64,
     /// True when the answer came from a cache (no tokens spent).
     #[serde(default)]
@@ -174,6 +177,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             cached_tokens: 0,
+            prefixed: false,
             latency_ms: 1,
             cached: false,
             origin: None,
@@ -190,6 +194,7 @@ mod tests {
             prompt_tokens: 200,
             completion_tokens: 100,
             cached_tokens: 0,
+            prefixed: false,
             latency_ms: 1,
             cached: false,
             origin: None,
@@ -224,6 +229,7 @@ mod tests {
                 prompt_tokens: 1000,
                 completion_tokens: 10,
                 cached_tokens: cached,
+                prefixed: false,
                 latency_ms: 1,
                 cached: false,
                 origin: None,

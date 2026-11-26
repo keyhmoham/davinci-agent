@@ -4,7 +4,6 @@
 //! it is unavailable. It is intentionally simple and inspectable: lexicons,
 //! BM25 over tool metadata, and rules over facts the runtime computed.
 
-use crate::questions::*;
 use async_trait::async_trait;
 use dfae_core::text::{bm25_scores, content_tokens, stem};
 use dfae_core::*;
@@ -449,9 +448,14 @@ impl LocalDecider {
                 out.insert("refers_to".into(), Answer::choice(pick, 0.8, &[(pick, 0.8)]));
             }
             DecisionKind::SelectTools => {
-                for (name, p) in self.tool_scores(s) {
-                    out.insert(tool_key(&name), Answer::noul(p));
-                }
+                // the keyword scores, as they are: a request may need several tools, so they are not squeezed into one distribution
+                let scores = self.tool_scores(s);
+                let best = scores.iter().map(|(_, p)| *p).fold(0.0, f64::max);
+                let mut probabilities: std::collections::BTreeMap<String, f64> = scores.into_iter().collect();
+                probabilities.insert("none".into(), (1.0 - best).max(0.1));
+                let (choice, confidence) =
+                    probabilities.iter().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(k, p)| (k.clone(), *p)).unwrap_or(("none".into(), 1.0));
+                out.insert("tool".into(), Answer::Choice { choice, confidence, probabilities });
             }
             DecisionKind::SelectMode => {
                 let f = s.mode_facts.clone().unwrap_or_default();
@@ -587,6 +591,7 @@ impl DecisionProvider for LocalDecider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::questions::*;
 
     fn dec() -> LocalDecider {
         LocalDecider::new(Config::default().thresholds)
@@ -717,11 +722,11 @@ mod tests {
             },
         ];
         let r = d.answer(&tools_request(st));
-        let (a, b) = (r["tool:fs_list"].clone(), r["tool:calc"].clone());
-        match (a, b) {
-            (Answer::Noul { noul: a }, Answer::Noul { noul: b }) => assert!(a > 0.5 && b < 0.3, "{a} {b}"),
+        let p = |k: &str| match &r["tool"] {
+            Answer::Choice { probabilities, .. } => probabilities[k],
             _ => panic!(),
-        }
+        };
+        assert!(p("fs_list") > 0.5 && p("calc") < 0.15, "{} {}", p("fs_list"), p("calc"));
     }
 
     #[test]
@@ -742,12 +747,12 @@ mod tests {
             brief("calc", "evaluate arithmetic expression", "math", &[]),
         ];
         let r = d.answer(&tools_request(st));
-        let p = |k: &str| match &r[k] {
-            Answer::Noul { noul } => *noul,
+        let p = |k: &str| match &r["tool"] {
+            Answer::Choice { probabilities, .. } => probabilities[k],
             _ => panic!(),
         };
-        assert!(p("tool:http_get") > 0.5, "{}", p("tool:http_get"));
-        assert!(p("tool:fs_list") < 0.3 && p("tool:calc") < 0.3);
+        assert!(p("http_get") > 0.5, "{}", p("http_get"));
+        assert!(p("fs_list") < 0.15 && p("calc") < 0.15);
     }
 
     #[test]

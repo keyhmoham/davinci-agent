@@ -116,15 +116,19 @@ async fn medium_tasks_are_planned_by_the_external_model_and_carried_out_by_the_l
     assert_eq!(t.mode, Some(ExecMode::Escalated), "a medium task goes to the planner model by default: {:?}", t.mode_reason);
     assert_eq!(std::fs::read_to_string(r.ws.path().join("ports.txt")).unwrap(), "8080");
 
-    // the planner saw a lean brief-plan prompt: one line per tool, no signatures, no arguments requested
+    // the planner saw the typed-plan prompt: the whole tool catalogue, no arguments requested
     let plan_req = r.planner.requests.lock()[0].clone();
     assert!(
         plan_req.system.contains("ONE JSON object") && plan_req.cache && plan_req.schema_strict && plan_req.schema.is_some(),
         "the stable rules, catalogue and examples are the cacheable system prompt"
     );
-    assert!(plan_req.system.contains("fs_read(path") && plan_req.system.contains("fs_edit("), "the whole catalogue is in the prefix");
-    let tools = &plan_req.messages[0].content;
-    assert!(tools.contains("LIKELY TOOLS:") && tools.contains("fs_read") && !tools.contains("path:str*"), "{tools}");
+    // the planner sees EVERY tool (a decision model's per-tool judgement must not hide fs_write from it) and the typed schema names them
+    let all: Vec<String> = r.engine.tools().into_iter().map(|m| m.name).collect();
+    assert!(all.iter().all(|n| plan_req.system.contains(&format!("{n}("))), "every tool is in the system prompt");
+    let schema = plan_req.schema.as_ref().unwrap().to_string();
+    assert!(all.iter().all(|n| schema.contains(&format!("\"{n}\""))), "and in the schema's tool enum");
+    let user = &plan_req.messages[0].content;
+    assert!(!user.contains("LIKELY TOOLS") && !user.contains("TOOLS:"), "no per-task tool list to hide anything: {user}");
     // the plan is intents the program implemented
     let plan = t.plan.as_ref().unwrap();
     assert_eq!(plan.source, PlanSource::Planner);
@@ -175,6 +179,26 @@ async fn when_the_slm_cannot_bind_a_step_the_external_model_is_asked_for_the_arg
     assert_eq!(t.plan.as_ref().unwrap().step("s2").unwrap().how.as_deref(), Some("planner"));
     let bind = r.planner.requests.lock().iter().find(|q| q.purpose == "bind").unwrap().clone();
     assert!(bind.messages[0].content.contains("fs_write(") && !bind.messages[0].content.contains("params —"), "a lean prompt for the paid model");
+}
+
+#[tokio::test]
+async fn a_directory_the_worker_made_up_is_corrected_while_binding_not_discovered_by_a_failed_step() {
+    let r = rig(false, |_| {});
+    std::fs::create_dir(r.ws.path().join("site")).unwrap();
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "run a shell command in the site directory that shows what it contains", "tool": "shell"}]}).to_string());
+    // the first answer names a directory that is nowhere (and outside the workspace); the correction names a real one
+    r.worker.push(&json!({"command": "ls", "cwd": "/workspace/nowhere"}).to_string());
+    r.worker.push(&json!({"command": "ls", "cwd": "site"}).to_string());
+    r.planner.push("Done.");
+    let t = run(&r, "show me what the site directory contains using the shell, and tell me what is there please").await;
+    let step = t.plan.as_ref().unwrap().step("s1").unwrap().clone();
+    assert_eq!((step.status, step.attempts), (StepStatus::Succeeded, 1), "{:?} {:?}", step.error, t.error);
+    let implemented = events(&r, &t.task_id).into_iter().find_map(|e| match e {
+        EventKind::StepImplemented { args, .. } => Some(args),
+        _ => None,
+    });
+    assert!(!implemented.unwrap().contains("nowhere"), "the made-up directory never reached the tool");
 }
 
 #[tokio::test]

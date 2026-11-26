@@ -311,10 +311,11 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | Variable | Effect |
 |---|---|
 | `DECISION_MODEL` | open-weight decision model pulled into Ollama (`qwen3:4b-instruct-2507-q4_K_M` default); `DECISION_PROVIDER=local` turns it off |
-| `DECISION_KINDS` | which decisions the model makes (default `route_task,select_tools,assess_recovery,assess_escalation,assess_completion`; `all` for every kind). The rest — mode, plan check, team split — use the built-in rules. The model is loaded in the background at start (decisions use the rules until it answers), a failure pauses it for 30 s instead of making every decision wait out a timeout, and tool selection asks it about the 4 best-ranked tools only |
+| `DECISION_KINDS` | which decisions the model makes (default `route_task,select_tools,assess_recovery,assess_escalation,assess_completion`; `all` for every kind). The rest — mode, plan check, team split — use the built-in rules. The model is loaded in the background at start (decisions use the rules until it answers), a failure pauses it for 30 s instead of making every decision wait out a timeout, and tool selection is one multiple-choice question over the tools (and `none`) |
 | `PLANNER_API_KEY` / `PLANNER_MODEL` / `PLANNER_PROVIDER` / `PLANNER_BASE_URL` | the planner model (default `gpt-6-luna`; provider `openai` = any OpenAI-compatible endpoint, default base URL `https://ai-gateway.vercel.sh/v1`; or `anthropic`) |
 | `WORKER_API_KEY` / `WORKER_MODEL` / `WORKER_PROVIDER` / `WORKER_BASE_URL` | the worker model, configured exactly like the planner (default `glm-5.3-flash`; with no key of its own it uses the planner's when they share a base URL) |
 | `PLANNER_MAX_TOKENS` / `WORKER_MAX_TOKENS` / `WORKER_CONTENT_MAX_TOKENS` | output limits: a plan; ordinary worker work (800); a file's content (16000) |
+| `PLANNER_REASONING` / `WORKER_REASONING` | thinking effort of a hosted model: `off`, `low`, `medium`, `high` (planner default `low`, worker `off`: hidden thinking is billed and eats the output limit; a gateway that rejects the field is asked without it from then on) |
 | `*_TIMEOUT_SECS`, `PLANNER_PROMPT_CACHE` | request timeouts; declare that an OpenAI-compatible endpoint caches repeated prompt prefixes (Anthropic and `api.openai.com` are known to) |
 | `DFAE_API_TOKEN` | bearer token for the API |
 | `DFAE_APPROVALS` | `never` (default): nothing waits for a human. `ask`: risky calls wait for approval |

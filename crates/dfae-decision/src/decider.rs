@@ -134,6 +134,7 @@ impl Decider {
             prompt_tokens: if from_cache { 0 } else { resp.input_tokens },
             completion_tokens: if from_cache { 0 } else { resp.output_tokens },
             cached_tokens: 0,
+            prefixed: false,
             latency_ms: resp.latency_ms,
             cached: from_cache,
             origin: None,
@@ -179,24 +180,16 @@ impl Decider {
             let (_, record, entry) = self.decide(tools_request(state)).await;
             return Decided { value: vec![], record, entry };
         }
-        // a self-hosted decision model costs nothing per question, so it judges every tool
-        let req = tools_request(state);
-        let (r, record, entry) = self.decide(req).await;
-        let mut scored: Vec<(String, f32)> = r
-            .answers
-            .iter()
-            .filter_map(|(k, a)| match (k.strip_prefix("tool:"), a) {
-                (Some(name), Answer::Noul { noul }) => Some((name.to_string(), *noul as f32)),
-                _ => None,
-            })
-            .collect();
+        let (r, record, entry) = self.decide(tools_request(state)).await;
+        // one choice over the tools and `none`: the probabilities are the relevance
+        let mut scored: Vec<(String, f32)> = match r.answers.get("tool") {
+            Some(Answer::Choice { probabilities, .. }) => {
+                probabilities.iter().filter(|(k, _)| k.as_str() != "none").map(|(k, p)| (k.clone(), *p as f32)).collect()
+            }
+            _ => vec![],
+        };
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        let mut picked: Vec<(String, f32)> = scored.iter().filter(|(_, p)| *p >= self.thresholds.tool_min_relevance).take(10).cloned().collect();
-        if picked.is_empty()
-            && let Some(top) = scored.first().filter(|(_, p)| *p >= 0.3)
-        {
-            picked.push(top.clone());
-        }
+        let picked: Vec<(String, f32)> = scored.into_iter().filter(|(_, p)| *p >= 0.1).take(10).collect();
         Decided { value: picked, record, entry }
     }
 

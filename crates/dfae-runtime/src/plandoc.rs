@@ -82,6 +82,17 @@ fn is_nothing(s: &str) -> bool {
     matches!(s.to_ascii_lowercase().as_str(), "" | "null" | "none" | "-" | "n/a" | "reasoning" | "think" | "llm" | "model")
 }
 
+/// The longest intent a step may have.
+const MAX_INTENT_CHARS: usize = 700;
+
+/// `cat > f <<'EOF'`, `echo … > f`, `tee f`, `printf … > f`, "write … using a heredoc": a file written by the shell.
+fn writes_a_file_through_the_shell(intent: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)<<-?\s*['\x22]?[A-Z_]+['\x22]?|\bcat\s*>{1,2}\s*\S|\btee\s+(?:-a\s+)?\S+\.\w+|\b(?:echo|printf)\b[^\n|;&]*>{1,2}\s*[\w./\-]+\.\w+|\bheredoc\b").unwrap()
+    });
+    RE.is_match(intent)
+}
+
 fn lev(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -155,6 +166,21 @@ fn step_from(v: &Value, position: usize, tools: &[String], r: &mut Reading) -> O
                 return None;
             }
         }
+    }
+    // A step is an intent, not a payload: content written into the plan is paid for at the planner's price, and a shell heredoc
+    // is a file written the wrong way. Both go back to the planner as typed issues.
+    if intent.chars().count() > MAX_INTENT_CHARS {
+        r.issues.push(format!(
+            "step {id}: \"do\" is {} characters long. Describe what the file or command must do or contain in one or two sentences; the worker model writes the content",
+            intent.chars().count()
+        ));
+        return None;
+    }
+    if tool.as_deref() == Some("shell") && writes_a_file_through_the_shell(&intent) {
+        r.issues.push(format!(
+            "step {id}: files are written with fs_write (or changed with fs_edit), not with shell redirects or heredocs; use shell only to run things"
+        ));
+        return None;
     }
     let after = match first(v, &["after", "depends_on", "needs", "requires"]) {
         Some(Value::Array(a)) => a.iter().filter_map(text).filter(|s| !s.is_empty()).collect(),
@@ -348,6 +374,19 @@ mod tests {
         assert!(e.issues.iter().any(|m| m.contains("step s2 has no \"do\"")), "{:?}", e.issues);
         assert!(PlanDoc::from_value(&json!({"hello": 1}), &tools()).unwrap_err().issues[0].contains("no \"steps\""));
         assert!(PlanDoc::from_value(&json!({"steps": []}), &tools()).is_err());
+    }
+
+    #[test]
+    fn content_in_the_plan_and_files_written_by_the_shell_are_typed_issues() {
+        let long = "x".repeat(900);
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_write", "do": long},
+            {"id": "s2", "tool": "shell", "do": "write index.html with cat > index.html <<'EOF' ... EOF"},
+            {"id": "s3", "tool": "shell", "do": "start `python3 -m http.server 8000` in the background with cwd site"}]});
+        let e = PlanDoc::from_value(&v, &tools()).unwrap_err();
+        assert!(e.issues.iter().any(|m| m.starts_with("step s1") && m.contains("900 characters")), "{:?}", e.issues);
+        assert!(e.issues.iter().any(|m| m.starts_with("step s2") && m.contains("fs_write")), "{:?}", e.issues);
+        assert!(!e.issues.iter().any(|m| m.starts_with("step s3")), "running a server is what shell is for: {:?}", e.issues);
     }
 
     #[test]

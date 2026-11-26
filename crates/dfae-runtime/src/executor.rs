@@ -890,6 +890,11 @@ impl Inner {
             (r.usage.replans, r.budget.clone())
         };
         self.set_status(ctx, TaskStatus::Recovering).await;
+        if tier == Tier::Planner {
+            // the planner sees every tool; what the plan may use is every tool of this agent's scope
+            *ctx.allowed.lock() = self.scoped_metas(ctx).into_iter().map(|m| m.name).collect();
+            return self.patch_plan(ctx, goal, problem, replans, &budget).await;
+        }
         // widen the tool set through the decision layer (direct/skill plans start narrow)
         let (entities, base) = {
             let r = ctx.rec.lock().await;
@@ -915,9 +920,6 @@ impl Inner {
             }
             a.clone()
         };
-        if tier == Tier::Planner {
-            return self.patch_plan(ctx, goal, problem, replans, &budget, &allowed).await;
-        }
         // No planner model is configured: the worker model re-plans in concrete steps (the remaining steps replace the old ones).
         let (done, kept_ids) = {
             let r = ctx.rec.lock().await;
@@ -983,15 +985,7 @@ impl Inner {
 
     /// Re-planning by the planner model: it answers with a typed patch of the plan (edit / add / drop), which is applied to the
     /// plan as it stands. Only what changes is written, and only what changes runs again.
-    async fn patch_plan(
-        self: &Arc<Self>,
-        ctx: &Arc<TaskCtx>,
-        goal: &str,
-        problem: &str,
-        replans: u32,
-        budget: &Budget,
-        allowed: &[String],
-    ) -> Result<bool, String> {
+    async fn patch_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, problem: &str, replans: u32, budget: &Budget) -> Result<bool, String> {
         let prefix = format!("r{replans}_");
         let ctx_text = self.context_text(ctx, false, Tier::Planner).await;
         let (current, state) = {
@@ -1015,7 +1009,7 @@ impl Inner {
         };
         let existing: std::collections::HashSet<String> = current.iter().map(|s| s.id.clone()).collect();
         let tools: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
-        let mut req = self.brief_request(ctx, allowed, &ctx_text, budget.max_steps.min(12), Some((&state, problem, &prefix)), "replan");
+        let mut req = self.brief_request(ctx, &ctx_text, budget.max_steps.min(12), Some((&state, problem, &prefix)), "replan");
         let mut last_problem = String::new();
         for attempt in 0..2 {
             let v = self.gen_json(ctx, Tier::Planner, req.clone()).await?;
@@ -1047,8 +1041,10 @@ impl Inner {
             last_problem = problems.join("; ");
             if attempt == 0 {
                 req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
-                req.messages
-                    .push(Message::user(format!("The patch has problems:\n- {}\nReturn the corrected patch (the same JSON shape).", problems.join("\n- "))));
+                req.messages.push(Message::user(format!(
+                    "The patch has problems:\n- {}\nReturn the complete corrected patch (the same JSON shape): everything in it that was fine stays.",
+                    problems.join("\n- ")
+                )));
                 req.purpose = "replan_repair".into();
             }
         }

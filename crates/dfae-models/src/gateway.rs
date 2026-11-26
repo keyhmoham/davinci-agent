@@ -83,6 +83,7 @@ impl ModelGateway {
         .ok_or_else(|| ModelError::NotConfigured(format!("{tier:?} tier")))?;
         let est_prompt = tokens::estimate_tokens(&req.system) as u64 + req.messages.iter().map(|m| tokens::estimate_tokens(&m.content) as u64).sum::<u64>();
         let purpose = req.purpose.clone();
+        let cache_requested = req.cache;
         let started = Instant::now();
         let resp = match model.generate(req).await {
             Ok(r) => r,
@@ -119,6 +120,7 @@ impl ModelGateway {
                 prompt_tokens: p,
                 completion_tokens: c,
                 cached_tokens: cached,
+                prefixed: cache_requested,
                 latency_ms,
                 cached: false,
                 origin: None,
@@ -127,21 +129,36 @@ impl ModelGateway {
         })
     }
 
-    /// Generate and parse a JSON object; on parse failure retry once with a
-    /// terse correction. Returns every call made so the caller can account them.
-    pub async fn generate_json(&self, tier: Tier, mut req: GenerationRequest) -> Result<(Value, Vec<Generated>), ModelError> {
+    /// Generate and parse a JSON object; on parse failure retry once with a terse correction. Returns every call made — also
+    /// when the parse failed: those tokens were billed, and the caller must account them.
+    pub async fn generate_json(&self, tier: Tier, mut req: GenerationRequest) -> (Result<Value, ModelError>, Vec<Generated>) {
         req.json = true;
-        let first = self.generate(tier, req.clone()).await?;
+        let first = match self.generate(tier, req.clone()).await {
+            Ok(g) => g,
+            Err(e) => return (Err(e), vec![]),
+        };
         if let Some(v) = extract_json(&first.text) {
-            return Ok((v, vec![first]));
+            return (Ok(v), vec![first]);
+        }
+        let none = |text: &str| ModelError::InvalidOutput(format!("no JSON object in output: {}", text.chars().take(120).collect::<String>()));
+        // a reply that ran into the output limit (a number that never ends, a loop) would only run into it again
+        if first.entry.completion_tokens >= req.max_tokens as u64 {
+            let e = none(&first.text);
+            return (Err(e), vec![first]);
         }
         let mut retry = req;
         retry.messages.push(Message::assistant(first.text.chars().take(400).collect::<String>()));
         retry.messages.push(Message::user("That was not valid JSON. Reply with ONLY the JSON object, no prose, no code fences."));
-        let second = self.generate(tier, retry).await?;
+        let second = match self.generate(tier, retry).await {
+            Ok(g) => g,
+            Err(e) => return (Err(e), vec![first]),
+        };
         match extract_json(&second.text) {
-            Some(v) => Ok((v, vec![first, second])),
-            None => Err(ModelError::InvalidOutput(format!("no JSON object in output: {}", second.text.chars().take(120).collect::<String>()))),
+            Some(v) => (Ok(v), vec![first, second]),
+            None => {
+                let e = none(&second.text);
+                (Err(e), vec![first, second])
+            }
         }
     }
 }
@@ -242,6 +259,7 @@ mod tests {
             cache: false,
             schema: None,
             schema_strict: false,
+            reasoning: None,
         }
     }
 
@@ -249,8 +267,8 @@ mod tests {
     async fn repairs_invalid_json_once() {
         let m = ScriptedModel::new("m", vec!["oops not json", "{\"ok\": true}"]);
         let gw = ModelGateway::new(Some(Arc::new(m.clone())), None);
-        let (v, calls) = gw.generate_json(Tier::Worker, req()).await.unwrap();
-        assert_eq!(v["ok"], true);
+        let (v, calls) = gw.generate_json(Tier::Worker, req()).await;
+        assert_eq!(v.unwrap()["ok"], true);
         assert_eq!(calls.len(), 2);
         assert_eq!(m.calls(), 2);
         // estimated tokens are recorded when the provider reports none
@@ -260,7 +278,19 @@ mod tests {
     #[tokio::test]
     async fn fails_after_one_repair() {
         let gw = ModelGateway::new(Some(Arc::new(ScriptedModel::new("m", vec!["x", "y"]))), None);
-        assert!(gw.generate_json(Tier::Worker, req()).await.is_err());
+        let (r, calls) = gw.generate_json(Tier::Worker, req()).await;
+        assert!(r.is_err());
+        assert_eq!(calls.len(), 2, "both failed calls were billed and are returned for the ledger");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_hit_the_output_limit_is_not_asked_again() {
+        let runaway = format!("{{\"n\": {}", "120".repeat(200));
+        let m = ScriptedModel::new("m", vec![runaway.as_str(), "{\"ok\": true}"]);
+        let gw = ModelGateway::new(Some(Arc::new(m.clone())), None);
+        let (r, calls) = gw.generate_json(Tier::Worker, req()).await;
+        assert!(r.is_err());
+        assert_eq!((calls.len(), m.calls()), (1, 1), "a second ask would run into the same limit");
     }
 
     #[tokio::test]
