@@ -822,3 +822,20 @@ async fn a_plain_reply_that_is_a_tool_call_in_disguise_is_never_shown_to_the_use
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {a}", t.error);
     assert!(a.contains("can't look that up"), "{a}");
 }
+
+#[tokio::test]
+async fn an_answer_that_depends_on_what_the_world_looks_like_now_is_looked_up_never_chatted() {
+    // "find the price of bitcoin for now": the decision model says the answer changes over time, so it is a task whatever else it says
+    let r = oracle_rig_with_strong(vec![
+        (DecisionKind::RouteTask, "needs_tools", Answer::noul(0.05), "find the price of bitcoin for now"),
+        (DecisionKind::RouteTask, "fresh_data", Answer::noul(0.95), "find the price of bitcoin for now"),
+        (DecisionKind::SelectMode, "mode", Answer::choice("assisted", 0.95, &[("assisted", 0.95)]), "find the price of bitcoin for now"),
+    ]);
+    r.worker.push(r#"{"query": "bitcoin price usd"}"#);
+    let t = say(&r, "fresh", "find the price of bitcoin for now").await;
+    let route = t.route.clone().unwrap();
+    assert!(route.fresh_data && route.needs_tools, "{route:?}");
+    let plan = t.plan.as_ref().expect("a plan");
+    assert_eq!(plan.source, PlanSource::Quick, "not a chat reply");
+    assert_eq!(plan.steps[0].tool.as_deref(), Some("web_search"), "{:?}", plan.steps);
+}

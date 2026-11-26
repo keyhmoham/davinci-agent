@@ -41,6 +41,10 @@ pub fn route_request(state: DecisionState) -> DecisionRequest {
             [("low", "read-only"), ("moderate", "reversible changes"), ("high", "destructive or irreversible")],
         ),
     );
+    q.insert(
+        "fresh_data".into(),
+        Question::noul("Does a correct answer depend on information that changes over time or happened recently — a price, a rate, the weather, news, a score, the latest version of something — which the assistant cannot know without looking it up on the web or in a system?"),
+    );
     q.insert("changes_state".into(), Question::noul("Does the request ask for something to be created, written, changed, moved, deleted, installed or started (files, code, settings, a server)? Reading, listing, searching and questions do not count."));
     q.insert(
         "conditional_change".into(),

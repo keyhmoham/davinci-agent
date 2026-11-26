@@ -162,6 +162,9 @@ impl Decider {
         let mut routing = Routing::new(&tt, (cscore / 2.0).clamp(0.0, 1.0) as f32, needs, risk, conf);
         routing.changes = yes("changes_state");
         routing.conditional = yes("conditional_change");
+        // an answer that depends on what the world looks like now has to be looked up: that is a task, not a conversation
+        routing.fresh_data = yes("fresh_data");
+        routing.needs_tools |= routing.fresh_data;
         routing.smalltalk = smalltalk;
         routing.role = role;
         routing.feedback = pick("feedback").filter(|c| c != "none");

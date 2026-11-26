@@ -431,6 +431,9 @@ pub struct Routing {
     /// The kind of agent that fits the work: `researcher`, `operator`, `analyst`, `verifier`.
     #[serde(default)]
     pub role: Option<String>,
+    /// The answer depends on information that changes (a price, the weather, news): it has to be looked up, never answered from memory.
+    #[serde(default)]
+    pub fresh_data: bool,
     /// What the message says about the previous reply: `negative` ("that's wrong", "try again") or `positive`.
     #[serde(default)]
     pub feedback: Option<String>,
@@ -448,6 +451,7 @@ impl Routing {
             conditional: false,
             smalltalk: None,
             role: None,
+            fresh_data: false,
             feedback: None,
         }
     }
