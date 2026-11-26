@@ -20,3 +20,4 @@ pub use calc::{evaluate as evaluate_expression, format_number};
 pub use native::register_native;
 pub use policy::{PathGuard, PolicyConfig, PolicyDecision, PolicyEngine, ShellMode};
 pub use registry::ToolRegistry;
+pub use toolbox::shell_env;

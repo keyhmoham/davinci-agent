@@ -284,7 +284,7 @@ that is on `PATH` in every command:
 | Need | How |
 |---|---|
 | Python packages | `pip install x` (user installs; `python3 -m venv .venv` for a project) |
-| Node | `npm install -g x`, `npx -y x` |
+| Node (the image ships the newest LTS, built from nodejs.org; `NODE_VERSION=v24.22.3` pins one) | `npm install -g x`, `npx -y x`; pnpm/yarn: `npm install -g pnpm` |
 | Rust · Go | `cargo install x` · `go install x@latest` (a toolchain itself: `curl` the official installer into the toolbox) |
 | System packages | `dfae-apt <debian-package>` (apt downloads, `dpkg -x` unpacks into the toolbox; no root; `update-alternatives` links are made) |
 | Anything else | a release binary fetched with `curl` into `$DFAE_TOOLS/bin` |

@@ -565,6 +565,10 @@ impl Inner {
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
         }
+        // "that has to be run as a task": a reply that hands the work back is not an answer, and the system can do the work
+        if ctx.depth == 0 && punts(&text) {
+            ctx.reroute.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(StepOutput { content: text, evidence: vec![] })
     }
 
@@ -1012,7 +1016,16 @@ impl Inner {
         };
         let existing: std::collections::HashSet<String> = current.iter().map(|s| s.id.clone()).collect();
         let tools: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
-        let mut req = self.brief_request(ctx, &ctx_text, budget.max_steps.min(12), Some((&state, problem, &prefix)), "replan");
+        // the code an error points at goes with it: the planner fixes it in this round instead of asking to read it in the next
+        let errors: Vec<(String, Option<String>)> = current
+            .iter()
+            .filter(|s| s.status == StepStatus::Failed)
+            .filter_map(|s| Some((s.error.clone()?, s.args.get("cwd").and_then(|c| c.as_str()).map(String::from))))
+            .chain(std::iter::once((problem.to_string(), None)))
+            .collect();
+        let code = crate::trace::code_at_errors(&self.policy, &errors);
+        let problem_with_code = if code.is_empty() { problem.to_string() } else { format!("{problem}\n{code}") };
+        let mut req = self.brief_request(ctx, &ctx_text, budget.max_steps.min(12), Some((&state, &problem_with_code, &prefix)), "replan");
         let mut last_problem = String::new();
         for attempt in 0..2 {
             let v = self.gen_json(ctx, Tier::Planner, req.clone()).await?;
@@ -1076,6 +1089,19 @@ fn _unused(_: Value) -> Value {
     json!(null)
 }
 
+/// Does a conversational reply say the request needs a lookup or a command, or that the assistant cannot reach what it asks for?
+/// (Replies are told to say "it has to be run as a task" in that case: here that is taken at its word.)
+pub(crate) fn punts(reply: &str) -> bool {
+    static PUNT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?ix)\bas\s+a\s+task\b
+            | \b(?:i|we)\s+(?:can(?:no|'|’)t|cannot|can\s+not|don(?:'|’)?t\s+have|do\s+not\s+have|am\s+not\s+able|(?:am|are)\s+unable)\b[^.\n]{0,60}\b(?:real[-\s]?time|live\s+(?:data|web|information)|the\s+(?:web|internet)|browse|look\s+(?:it\s+)?up|fetch|access\s+(?:the\s+)?(?:web|internet|files?|your))\b",
+        )
+        .unwrap()
+    });
+    PUNT.is_match(reply)
+}
+
 /// An error text cut to a size, keeping its END: what went wrong is said last.
 fn clip_error(msg: &str, max_tokens: usize) -> String {
     let max_chars = max_tokens * 4;
@@ -1115,6 +1141,20 @@ pub(crate) fn failure_digest(output: &str) -> String {
     let text = out.join("\n");
     // the end is what counts: when it is too long, the start is cut
     if text.chars().count() > 1800 { format!("…{}", text.chars().skip(text.chars().count() - 1800).collect::<String>()) } else { text }
+}
+
+#[cfg(test)]
+mod punt_tests {
+    use super::punts;
+
+    #[test]
+    fn a_reply_that_hands_the_work_back_is_recognised() {
+        assert!(punts("That needs a live web lookup, which has to be run as a task — I can't do it from this reply."));
+        assert!(punts("I can't browse the internet from here."));
+        assert!(punts("I don't have access to real-time prices."));
+        assert!(!punts("A mutex guards shared data so only one thread uses it at a time."));
+        assert!(!punts("You can run it as a background task in your own code."), "advice about tasks is not a punt");
+    }
 }
 
 #[cfg(test)]

@@ -23,6 +23,7 @@ pub mod skills;
 mod style;
 mod syntax;
 pub mod team;
+mod trace;
 mod verify;
 mod workspace;
 

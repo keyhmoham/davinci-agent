@@ -118,6 +118,8 @@ impl Inner {
             }
         }
 
+        let mut mode_request = req.mode;
+
         // ---- 4. deterministic candidates -----------------------------------
         let metas = self.scoped_metas(ctx);
         let calls: Option<Vec<DirectCall>> =
@@ -137,13 +139,27 @@ impl Inner {
                 && self.note(ctx, self.decider.select_tools(tstate).await).await.iter().any(|(_, p)| *p >= self.cfg.thresholds.tool_min_relevance + 0.2);
             if !relevant {
                 // a reply needs no plan: the worker system answers it (planning is what the planner model is for)
-                return self.run_chat(ctx, &goal, false, ExecMode::Assisted).await;
+                let outcome = self.run_chat(ctx, &goal, false, ExecMode::Assisted).await;
+                if !ctx.reroute.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    return outcome;
+                }
+                // the reply handed the work back ("that has to be run as a task"): it is run as one, by the planner model
+                self.emit(ctx, EventKind::Warning { message: "the reply said this needs a lookup or a command: running the request as a task".into() }).await;
+                {
+                    let mut r = ctx.rec.lock().await;
+                    r.plan = None;
+                    r.final_answer = None;
+                    r.verification = None;
+                }
+                routing.needs_tools = true;
+                mode_request = ModeRequest::Escalated;
+            } else {
+                self.emit(
+                    ctx,
+                    EventKind::Warning { message: "the routing said no tools were needed, but a tool is plainly relevant: handling it as a task".into() },
+                )
+                .await;
             }
-            self.emit(
-                ctx,
-                EventKind::Warning { message: "the routing said no tools were needed, but a tool is plainly relevant: handling it as a task".into() },
-            )
-            .await;
         }
 
         // ---- 5. mode ---------------------------------------------------------
@@ -159,7 +175,7 @@ impl Inner {
             task_type: routing.task_type.clone(),
             plan_min_complexity: self.cfg.thresholds.plan_min_complexity,
         });
-        let choice = self.note(ctx, self.decider.select_mode(mstate, req.mode).await).await;
+        let choice = self.note(ctx, self.decider.select_mode(mstate, mode_request).await).await;
         let mut mode = choice.mode;
         let skill_id = skill.as_ref().map(|s| s.memory_id.clone());
         {
@@ -841,7 +857,47 @@ impl Inner {
         }
         let s = crate::workspace::snapshot(self.policy.workspace(), 24);
         let ports = self.ports_line().await;
-        if s.is_empty() { ports } else { format!("\n{s}{ports}") }
+        let runtimes = self.runtimes_line().await;
+        if s.is_empty() { format!("{runtimes}{ports}") } else { format!("\n{s}{runtimes}{ports}") }
+    }
+
+    /// Which runtimes the shell has, with their versions: a plan that scaffolds a project, picks a framework version or writes code for a
+    /// language level is better when it knows what is installed (and a missing one is a step to install, not a surprise).
+    pub(crate) async fn runtimes_line(&self) -> String {
+        if self.policy.config().shell.mode != dfae_tools::ShellMode::Sandbox {
+            return String::new();
+        }
+        let line = self
+            .runtimes
+            .get_or_init(|| async {
+                let env = dfae_tools::shell_env(&self.policy);
+                let mut found: Vec<String> = Vec::new();
+                for (name, cmd, args) in [
+                    ("node", "node", "--version"),
+                    ("npm", "npm", "--version"),
+                    ("python", "python3", "--version"),
+                    ("go", "go", "version"),
+                    ("rust", "rustc", "--version"),
+                ] {
+                    let out = tokio::time::timeout(
+                        std::time::Duration::from_secs(3),
+                        tokio::process::Command::new(cmd).arg(args).env_clear().envs(env.iter().cloned()).stdin(std::process::Stdio::null()).output(),
+                    )
+                    .await;
+                    if let Ok(Ok(o)) = out
+                        && o.status.success()
+                        && let Some(v) = String::from_utf8_lossy(&o.stdout)
+                            .split_whitespace()
+                            .find(|w| w.chars().any(|c| c.is_ascii_digit()) && !w.contains("version"))
+                            .map(String::from)
+                    {
+                        found.push(format!("{name} {}", v.trim_start_matches("go")));
+                    }
+                }
+                if found.is_empty() { String::new() } else { format!("\nRUNTIMES: {}", found.join(", ")) }
+            })
+            .await;
+        line.clone()
     }
 
     /// Which of the ports a server may take (8000–8010) are already in use on this machine: a plan that starts a server on a taken one

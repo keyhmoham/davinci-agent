@@ -55,6 +55,8 @@ pub(crate) struct TaskCtx {
     pub mcp: Mutex<HashSet<String>>,
     /// Tools of those servers that this task does not see: a big server shows the planner the few that fit the request, not all of them.
     pub mcp_hidden: Mutex<HashSet<String>>,
+    /// A conversational reply said the request needs a task (a lookup, a command): the pipeline then runs it as one.
+    pub reroute: std::sync::atomic::AtomicBool,
 }
 
 impl TaskCtx {
@@ -75,6 +77,7 @@ impl TaskCtx {
             checkpoints: Mutex::new(Vec::new()),
             mcp: Mutex::new(HashSet::new()),
             mcp_hidden: Mutex::new(HashSet::new()),
+            reroute: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -120,6 +123,8 @@ pub(crate) struct Inner {
     pub shadow: [std::sync::atomic::AtomicU64; 3],
     /// MCP servers: set once at startup, when any are configured or discoverable.
     pub mcp: std::sync::OnceLock<Arc<dfae_mcp::McpHub>>,
+    /// The versions of the runtimes the shell has (`node v26…, python 3.13…`), asked once.
+    pub runtimes: tokio::sync::OnceCell<String>,
 }
 
 /// The agent engine. Cheap to clone.
@@ -186,6 +191,7 @@ impl Engine {
                 prefix_policy: Mutex::new(Default::default()),
                 shadow: Default::default(),
                 mcp: std::sync::OnceLock::new(),
+                runtimes: tokio::sync::OnceCell::new(),
             }),
         }
     }
@@ -720,7 +726,14 @@ impl Inner {
             cache: false,
             schema: None,
             schema_strict: false,
-            reasoning: if tier == Tier::Planner { self.cfg.planner.reasoning.clone() } else { self.cfg.worker.reasoning.clone() },
+            reasoning: match tier {
+                // a plan is short and thinks a little; repairing one after a failure thinks longer
+                Tier::Planner if matches!(purpose, "replan" | "replan_repair") => {
+                    self.cfg.planner.reasoning_hard.clone().or_else(|| self.cfg.planner.reasoning.clone())
+                }
+                Tier::Planner => self.cfg.planner.reasoning.clone(),
+                _ => self.cfg.worker.reasoning.clone(),
+            },
         }
     }
 

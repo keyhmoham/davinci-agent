@@ -28,7 +28,7 @@ pub fn evidence_block(rec: &TaskRecord, per_step_tokens: usize) -> String {
                 "{} {}: {}",
                 s.id,
                 label(s),
-                tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), per_step_tokens)
+                tokens::truncate_middle(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), per_step_tokens)
             )),
             StepStatus::Failed => lines.push(format!("{} {} FAILED: {}", s.id, label(s), s.error.as_deref().unwrap_or("error"))),
             StepStatus::Skipped => lines.push(format!("{} SKIPPED", s.id)),

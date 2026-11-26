@@ -44,10 +44,15 @@ FROM runtime-base AS server
 ARG DEV_TOOLS=1
 RUN if [ "$DEV_TOOLS" = "1" ]; then \
       apt-get update \
-   && apt-get install -y --no-install-recommends bash git curl jq ripgrep patch make gcc g++ libc6-dev python3 python3-venv python3-pip nodejs npm \
+   && apt-get install -y --no-install-recommends bash git curl jq ripgrep patch make gcc g++ libc6-dev python3 python3-venv python3-pip \
         file less tree unzip zip tar gzip xz-utils sed gawk openssh-client \
    && rm -rf /var/lib/apt/lists/*; \
     fi
+# Node.js: the newest long-term-support release from nodejs.org (Debian's package is Node 18, too old for current frameworks).
+# NODE_VERSION=lts picks the newest LTS at build time; pin one with e.g. --build-arg NODE_VERSION=v24.22.3.
+ARG NODE_VERSION=lts
+COPY deploy/docker/install-node.sh /tmp/install-node.sh
+RUN if [ "$DEV_TOOLS" = "1" ]; then /tmp/install-node.sh "$NODE_VERSION" /usr/local; fi; rm -f /tmp/install-node.sh
 COPY --from=build /out/dfae-server /usr/local/bin/dfae-server
 COPY config/policy.toml /etc/dfae/policy.toml
 ENV DFAE_BIND=0.0.0.0:8080 \

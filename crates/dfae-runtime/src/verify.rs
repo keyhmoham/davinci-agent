@@ -30,6 +30,8 @@ pub(crate) async fn probe_url(url: &str, value: Option<&str>, patience: std::tim
                     last = format!("HTTP {status}{seen}");
                 } else if let Some(v) = value.filter(|v| !visible_text(&body).to_lowercase().contains(&v.to_lowercase())) {
                     last = format!("HTTP {status}, but the page does not say '{v}'{seen}");
+                } else if let Some(problem) = page_problem(&http, &url, &body).await {
+                    last = format!("HTTP {status}, but {problem}{seen}");
                 } else {
                     return Ok(format!("HTTP {status}, {} bytes{seen}", body.len()));
                 }
@@ -61,6 +63,71 @@ fn visible_text(body: &str) -> String {
         .replace("&lt;", "<")
         .replace("&gt;", ">");
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a person would see at a glance and a status code does not say: a page whose stylesheet defines almost none of the classes the page
+/// uses (a framework import lost from the CSS: plain unstyled HTML), and images the page points at that are not served.
+async fn page_problem(http: &reqwest::Client, base: &str, html: &str) -> Option<String> {
+    static CLASS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r#"(?is)\sclass(?:Name)?\s*=\s*"([^"]+)""#).unwrap());
+    static LINK: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r#"(?is)<link\b[^>]*>"#).unwrap());
+    static HREF: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r#"(?is)\bhref\s*=\s*"([^"]+)""#).unwrap());
+    static STYLE_TAG: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"(?is)<style\b[^>]*>(.*?)</style>").unwrap());
+    static CSS_CLASS: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r"\.((?:\\.|[A-Za-z0-9_-])+)").unwrap());
+    static IMG: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| Regex::new(r#"(?is)<img\b[^>]*?\ssrc\s*=\s*"([^"]+)""#).unwrap());
+    if !html.to_lowercase().contains("<html") {
+        return None; // an API answer, a plain text: nothing to look at
+    }
+    let base_url = reqwest::Url::parse(base).ok()?;
+    // --- unstyled? ---
+    let used: std::collections::HashSet<String> = CLASS
+        .captures_iter(html)
+        .flat_map(|c| c[1].split_whitespace().map(String::from).collect::<Vec<_>>())
+        .filter(|t| !t.contains(['{', '}', '$']))
+        .collect();
+    // a framework that styles in the browser (a CDN script) has nothing to compare
+    let runtime_styled = ["cdn.tailwindcss.com", "unocss", "twind", "cdn.jsdelivr.net/npm/@unocss"].iter().any(|k| html.contains(k));
+    if used.len() >= 12 && !runtime_styled {
+        let mut css = String::new();
+        for c in STYLE_TAG.captures_iter(html) {
+            css.push_str(&c[1]);
+        }
+        for tag in LINK.find_iter(html) {
+            let tag = tag.as_str().to_lowercase();
+            if !tag.contains("stylesheet") {
+                continue;
+            }
+            if let Some(h) = HREF.captures(tag.as_str()).and_then(|c| base_url.join(&c[1]).ok())
+                && let Ok(r) = http.get(h).send().await
+                && let Ok(text) = r.text().await
+            {
+                css.push_str(&text);
+            }
+        }
+        let defined: std::collections::HashSet<String> = CSS_CLASS.captures_iter(&css).map(|c| c[1].replace('\\', "")).collect();
+        let hit = used.iter().filter(|t| defined.contains(&t.replace('\\', ""))).count();
+        if (hit as f64) / (used.len() as f64) < 0.3 {
+            return Some(format!(
+                "it looks unstyled: its stylesheets define only {hit} of the {} classes the page uses (a rewritten stylesheet may have lost the framework's import, such as Tailwind's `@import \"tailwindcss\"`)",
+                used.len()
+            ));
+        }
+    }
+    // --- images that do not load ---
+    let mut missing: Vec<String> = Vec::new();
+    for src in IMG.captures_iter(html).map(|c| c[1].replace("&amp;", "&")).filter(|s| !s.starts_with("data:")).take(8) {
+        let Ok(u) = base_url.join(&src) else { continue };
+        if u.host_str() != base_url.host_str() || u.port() != base_url.port() {
+            continue;
+        }
+        let ok = http.get(u).send().await.map(|r| r.status().is_success()).unwrap_or(false);
+        if !ok {
+            missing.push(src.chars().take(80).collect());
+        }
+    }
+    if !missing.is_empty() {
+        return Some(format!("the page points at images the server does not have: {}", missing.join(", ")));
+    }
+    None
 }
 
 /// `; title "…", first heading "…"` of an HTML page.
@@ -231,6 +298,48 @@ mod probe_tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_page_without_its_styles_or_its_images_is_not_accepted() {
+        let classes: String = (0..20).map(|i| format!("<p class=\"u{i} flex\">x</p>")).collect();
+        let styled_css = (0..20).map(|i| format!(".u{i}{{color:red}}")).collect::<String>() + ".flex{display:flex}";
+        // one server: the page, its stylesheet, one image that exists and one that does not
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (ok_css, bare_css) = (styled_css.clone(), ".nothing{x:y}".to_string());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let (ok_css, bare_css, classes) = (ok_css.clone(), bare_css.clone(), classes.clone());
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let path = String::from_utf8_lossy(&buf[..n]).split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let (status, ctype, body) = match path.as_str() {
+                        "/styled" => (
+                            200,
+                            "text/html",
+                            format!("<html><head><link rel=\"stylesheet\" href=\"/ok.css\"></head><body>{classes}<img src=\"/there.png\"></body></html>"),
+                        ),
+                        "/bare" => (200, "text/html", format!("<html><head><link rel=\"stylesheet\" href=\"/bare.css\"></head><body>{classes}</body></html>")),
+                        "/noimg" => (200, "text/html", "<html><body><img src=\"/gone.png\"></body></html>".to_string()),
+                        "/ok.css" => (200, "text/css", ok_css),
+                        "/bare.css" => (200, "text/css", bare_css),
+                        "/there.png" => (200, "image/png", "png".to_string()),
+                        _ => (404, "text/plain", "no".to_string()),
+                    };
+                    let reply = format!("HTTP/1.1 {status} X\r\ncontent-type: {ctype}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                    let _ = s.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        let base = format!("http://{addr}");
+        assert!(probe_url(&format!("{base}/styled"), None, Duration::from_secs(2)).await.is_ok());
+        let bare = probe_url(&format!("{base}/bare"), None, Duration::from_secs(1)).await.unwrap_err();
+        assert!(bare.contains("looks unstyled") && bare.contains("only 0 of the 21"), "{bare}");
+        let img = probe_url(&format!("{base}/noimg"), None, Duration::from_secs(1)).await.unwrap_err();
+        assert!(img.contains("images the server does not have") && img.contains("/gone.png"), "{img}");
     }
 
     #[tokio::test]

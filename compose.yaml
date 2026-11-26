@@ -78,6 +78,9 @@ services:
       context: .
       dockerfile: deploy/docker/Dockerfile
       target: server
+      args:
+        # the Node.js in the sandbox: the newest LTS at build time, or an exact version (v24.22.3)
+        NODE_VERSION: ${NODE_VERSION:-lts}
     restart: unless-stopped
     depends_on:
       postgres:
