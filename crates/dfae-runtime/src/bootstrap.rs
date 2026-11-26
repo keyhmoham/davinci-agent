@@ -44,7 +44,7 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     let primary: Option<Arc<dyn DecisionProvider>> = open.map(|p| p as Arc<dyn DecisionProvider>);
     let decider = Arc::new(Decider::new(primary, calibrator, config.thresholds.clone()).with_model_kinds(&config.decision.kinds));
     // models
-    let models = ModelGateway::new(build_model(&config.slm), build_model(&config.strong));
+    let models = ModelGateway::new(build_model(&config.worker), build_model(&config.planner));
 
     let engine = Engine::new(EngineDeps { config, store, extractor, decider, models, tools: Arc::new(registry), policy });
     engine.restore().await;

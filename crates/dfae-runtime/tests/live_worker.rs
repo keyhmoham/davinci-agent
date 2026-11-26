@@ -1,14 +1,14 @@
 #![allow(clippy::field_reassign_with_default)]
 //! The self-hosted model against realistic plans, for real. Ignored by default: it needs a running OpenAI-compatible
 //! server (Ollama in the compose stack) — the external planner is scripted with the plans a good LLM writes in the
-//! plan-line format, so what is under test is whether the *local* system (rules, extractor, SLM) can carry them out.
+//! plan-line format, so what is under test is whether the *local* system (rules, extractor, worker model) can carry them out.
 //!
 //! ```bash
 //! docker compose up -d ollama ollama-pull           # port 11434 is published on loopback
-//! SLM_BASE_URL=http://localhost:11434/v1 SLM_MODEL=qwen2.5:3b \
-//!   cargo test -p dfae-runtime --test live_slm -- --ignored --nocapture --test-threads=1
+//! WORKER_BASE_URL=http://localhost:11434/v1 WORKER_MODEL=qwen2.5:3b \
+//!   cargo test -p dfae-runtime --test live_worker -- --ignored --nocapture --test-threads=1
 //! ```
-//! `LIVE_TRACE=1` also prints every call to the SLM (what it was asked, how long it took, what it said).
+//! `LIVE_TRACE=1` also prints every call to the worker model (what it was asked, how long it took, what it said).
 //! Optional: `DECISION_BASE_URL` / `DECISION_MODEL` to use the open decision model as well (otherwise the built-in rules decide).
 
 use dfae_core::*;
@@ -113,14 +113,14 @@ impl LanguageModel for Traced {
             let tail = |s: &str, n: usize| -> String { s.chars().take(n).collect::<String>().replace('\n', " ⏎ ") };
             match &r {
                 Ok(g) => eprintln!(
-                    "    [slm {purpose} {:.1}s in={} out={}] ASKED: {} …\n        SAID: {}",
+                    "    [worker {purpose} {:.1}s in={} out={}] ASKED: {} …\n        SAID: {}",
                     started.elapsed().as_secs_f32(),
                     g.usage.prompt_tokens,
                     g.usage.completion_tokens,
                     tail(&ask, 260),
                     tail(&g.text, 260)
                 ),
-                Err(e) => eprintln!("    [slm {purpose} {:.1}s] ERROR {e}", started.elapsed().as_secs_f32()),
+                Err(e) => eprintln!("    [worker {purpose} {:.1}s] ERROR {e}", started.elapsed().as_secs_f32()),
             }
         }
         r
@@ -131,11 +131,11 @@ fn engine(ws: &std::path::Path, plan: &str) -> (Engine, ScriptedModel) {
     let mut cfg = Config::default();
     cfg.workspace = ws.to_path_buf();
     cfg.approvals = ApprovalMode::Never;
-    cfg.slm.provider = "openai".into();
-    cfg.slm.base_url = std::env::var("SLM_BASE_URL").expect("SLM_BASE_URL");
-    cfg.slm.model = std::env::var("SLM_MODEL").unwrap_or_else(|_| "qwen2.5:3b".into());
-    let slm = Traced(OpenAiCompat::new(&cfg.slm.base_url, &cfg.slm.model, None, Duration::from_secs(600)));
-    let strong = ScriptedModel::new("scripted-planner", vec![plan]).caching();
+    cfg.worker.provider = "openai".into();
+    cfg.worker.base_url = std::env::var("WORKER_BASE_URL").expect("WORKER_BASE_URL");
+    cfg.worker.model = std::env::var("WORKER_MODEL").unwrap_or_else(|_| "qwen2.5:3b".into());
+    let worker = Traced(OpenAiCompat::new(&cfg.worker.base_url, &cfg.worker.model, None, Duration::from_secs(600)));
+    let planner = ScriptedModel::new("scripted-planner", vec![plan]).caching();
     let store = Arc::new(InMemoryStore::new());
     let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.to_path_buf()));
     let mut reg = ToolRegistry::new();
@@ -152,12 +152,12 @@ fn engine(ws: &std::path::Path, plan: &str) -> (Engine, ScriptedModel) {
         decider: Arc::new(Decider::new(provider, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
         extractor: Arc::new(HybridExtractor::new(None)),
         store,
-        models: ModelGateway::new(Some(Arc::new(slm)), Some(Arc::new(strong.clone()))),
+        models: ModelGateway::new(Some(Arc::new(worker)), Some(Arc::new(planner.clone()))),
         tools: Arc::new(reg),
         policy,
         config: cfg,
     });
-    (e, strong)
+    (e, planner)
 }
 
 #[tokio::test]
@@ -190,10 +190,10 @@ async fn the_local_system_carries_out_the_plans_a_good_llm_writes() {
         }
         let s = t.ledger.summary();
         eprintln!(
-            "  slm calls {} ({} tokens), external {} tokens, answer: {}",
-            s.slm_calls,
-            s.slm_tokens,
-            s.external_tokens,
+            "  worker calls {} ({} tokens), external {} tokens, answer: {}",
+            s.worker_calls,
+            s.worker_tokens,
+            s.planner_tokens,
             tokens::truncate_tokens(t.final_answer.as_deref().unwrap_or(""), 60).replace('\n', " ")
         );
         let verdict = if t.status != TaskStatus::Completed { Err(format!("{:?}: {:?}", t.status, t.error)) } else { (c.check)(ws.path(), &t) };

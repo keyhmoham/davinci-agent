@@ -178,146 +178,9 @@ pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str,
     for (s, raw) in steps.iter_mut().zip(arr) {
         s.brief = true;
         s.expect = raw.get("expect").or_else(|| raw.get("success")).and_then(|e| e.as_str()).map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
-        s.strong = raw.get("strong").and_then(|b| b.as_bool()).unwrap_or(false);
+        s.planner = raw.get("planner").and_then(|b| b.as_bool()).unwrap_or(false);
     }
     Ok(steps)
-}
-
-static LINE_STEP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^(?P<id>[A-Za-z][A-Za-z0-9_]*)[.)]?\s+\[?(?P<tool>[A-Za-z_][A-Za-z0-9_]*|-)\]?(?P<meta>(?:\s+(?:after=[A-Za-z0-9_,]*|strong))*)\s*:\s*(?P<do>.*)$",
-    )
-    .unwrap()
-});
-
-/// Parse the compact line format of a brief plan into the same JSON shape `parse_brief_plan` reads:
-///
-/// ```text
-/// s1 fs_mkdir: create the directory site
-/// s2 fs_write after=s1: write site/index.html, a page that says hello
-///   expect: site/index.html exists
-/// s3 - after=s2 strong: summarise what was built
-/// report: The page is in site/index.html.
-/// ```
-///
-/// A model that answers in JSON anyway is accepted as is. Roughly a quarter of the output tokens of the JSON form.
-///
-/// `tools` are the names of the tools that exist: a model that numbers its lines (`1. fs_mkdir site`), writes
-/// `Step 2: use fs_write to …` or puts the tool in brackets is still understood.
-pub fn parse_line_plan(text: &str, tools: &[String]) -> Result<Value, String> {
-    if let Some(v) = dfae_models::extract_json(text) {
-        if v.get("steps").is_some() {
-            return Ok(v);
-        }
-        // the same plan under another name
-        for key in ["plan", "tasks", "actions", "plan_steps", "stages"] {
-            if let Some(a) = v.get(key).filter(|a| a.is_array()) {
-                let mut out = json!({"steps": a});
-                if let Some(r) = v.get("report") {
-                    out["report"] = r.clone();
-                }
-                return Ok(out);
-            }
-        }
-    }
-    let mut steps: Vec<Value> = Vec::new();
-    let mut report: Option<String> = None;
-    let mut in_report = false;
-    for raw in text.lines() {
-        let line = raw.trim_end();
-        // a model may bullet its lines
-        let t = line.trim().trim_start_matches(['-', '*', '•']).trim_start();
-        if t.is_empty() || t.starts_with("```") {
-            continue;
-        }
-        if in_report {
-            report = report.map(|r| format!("{r}\n{t}"));
-            continue;
-        }
-        let lower = t.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("report:") {
-            let at = t.len() - rest.len();
-            report = Some(t[at..].trim().to_string());
-            in_report = true;
-            continue;
-        }
-        let indented = line.starts_with(char::is_whitespace) && !LINE_STEP.is_match(t);
-        if indented || lower.starts_with("expect:") {
-            let Some(last) = steps.last_mut() else { continue };
-            if let Some(rest) = lower.strip_prefix("expect:") {
-                last["expect"] = Value::String(t[t.len() - rest.len()..].trim().to_string());
-            } else if let Some(d) = last["do"].as_str() {
-                // a long sentence the model wrapped
-                last["do"] = Value::String(format!("{d} {t}"));
-            }
-            continue;
-        }
-        if let Some(c) = LINE_STEP.captures(t) {
-            let mut after: Vec<String> = Vec::new();
-            let mut strong = false;
-            for part in c["meta"].split_whitespace() {
-                if let Some(ids) = part.strip_prefix("after=") {
-                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(norm_id));
-                } else if part == "strong" {
-                    strong = true;
-                }
-            }
-            let tool = if &c["tool"] == "-" { Value::Null } else { Value::String(c["tool"].to_string()) };
-            steps.push(json!({"id": norm_id(&c["id"]), "tool": tool, "do": c["do"].trim(), "after": after, "strong": strong}));
-        } else if let Some(step) = lenient_step(t, tools) {
-            steps.push(step);
-        }
-    }
-    if steps.is_empty() {
-        return Err("no plan lines found (expected `<id> <tool|-> [after=ids]: <intent>`, e.g. `s1 fs_read: read a.txt`)".into());
-    }
-    let mut v = json!({"steps": steps});
-    if let Some(r) = report.filter(|r| !r.is_empty()) {
-        v["report"] = Value::String(r);
-    }
-    Ok(v)
-}
-
-/// `1` and `step1` are `s1`.
-fn norm_id(id: &str) -> String {
-    let lower = id.trim().to_ascii_lowercase();
-    let digits = lower.strip_prefix("step").unwrap_or(&lower);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) { format!("s{digits}") } else { id.trim().to_string() }
-}
-
-static LENIENT_STEP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:step\s*)?(?P<id>\d+|s\d+|step\d+)\s*[.):]\s*(?P<rest>\S.*)$").unwrap());
-
-/// A numbered or "Step 2:" line that is not in the exact format: `1. fs_mkdir site`, `2) [fs_write] write …`,
-/// `s3: - after=s2: summarise`, `Step 4: use fs_search to find TODO`.
-fn lenient_step(t: &str, tools: &[String]) -> Option<Value> {
-    let c = LENIENT_STEP.captures(t)?;
-    let id = norm_id(&c["id"]);
-    let rest = c["rest"].trim();
-    let is_tool = |w: &str| tools.iter().any(|t| t == w);
-    let clean = |w: &str| w.trim_matches(|ch: char| matches!(ch, '[' | ']' | '`' | '(' | ')' | '*' | ',' | '"')).trim_start_matches("tool=").to_string();
-    let (mut tool, mut intent) = (None::<String>, rest.to_string());
-    let mut after: Vec<String> = Vec::new();
-    let mut strong = false;
-    if let Some((head, tail)) = rest.split_once(':') {
-        let toks: Vec<String> = head.split_whitespace().map(clean).collect();
-        let first = toks.first().cloned().unwrap_or_default();
-        if is_tool(&first) || matches!(first.as_str(), "-" | "null" | "none" | "reasoning" | "think") {
-            tool = is_tool(&first).then_some(first);
-            for tok in toks.iter().skip(1) {
-                if let Some(ids) = tok.strip_prefix("after=") {
-                    after.extend(ids.split(',').filter(|i| !i.is_empty()).map(norm_id));
-                } else if tok == "strong" {
-                    strong = true;
-                }
-            }
-            intent = tail.trim().to_string();
-        }
-    }
-    if tool.is_none() && intent == rest {
-        // no tool slot: the first existing tool the sentence names is the tool
-        tool = rest.split(|ch: char| !(ch.is_alphanumeric() || ch == '_')).find(|w| is_tool(w)).map(str::to_string);
-    }
-    (!intent.is_empty()).then(|| json!({"id": id, "tool": tool, "do": intent, "after": after, "strong": strong}))
 }
 
 /// The planner's pre-written final reply, if it is usable: every `{{id}}` in it names a step of the plan.
@@ -326,6 +189,68 @@ pub fn plan_report(v: &Value, steps: &[Step]) -> Option<String> {
     let ids: HashSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
     // ids in the report follow the same renumbering as the steps only for a first plan; a re-plan sets its own
     TEMPLATE.captures_iter(r).all(|c| ids.contains(&c[1])).then(|| r.to_string())
+}
+
+/// Apply a re-planning patch to the steps of a plan. Finished steps are never touched; an edited step runs again from a clean
+/// state (its arguments are chosen anew by the worker); a failed step that is neither edited nor dropped is an issue, because the
+/// plan could not finish. `Err` lists what to tell the planner.
+pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &str, registry: &ToolRegistry) -> Result<Vec<Step>, Vec<String>> {
+    let mut issues: Vec<String> = Vec::new();
+    let mut steps: Vec<Step> = current.to_vec();
+    let done = |s: &Step| s.status == StepStatus::Succeeded;
+    for id in &patch.drop {
+        match steps.iter().position(|s| &s.id == id) {
+            Some(i) if done(&steps[i]) => issues.push(format!("{id} is finished and cannot be dropped")),
+            Some(i) => {
+                steps.remove(i);
+            }
+            None => {}
+        }
+    }
+    // new steps get ids `prefix1`, `prefix2`… whatever the planner wrote; edits may refer to them by what it wrote
+    let renumber: HashMap<String, String> = patch.add.iter().enumerate().map(|(i, s)| (s.id.clone(), format!("{prefix}{}", i + 1))).collect();
+    let fix_dep = |d: &String| renumber.get(d).cloned().unwrap_or_else(|| d.clone());
+    for e in &patch.edit {
+        let Some(i) = steps.iter().position(|s| s.id == e.id) else { continue };
+        if done(&steps[i]) {
+            issues.push(format!("{} is finished: add a new step instead of editing it", e.id));
+            continue;
+        }
+        let mut ns = match &e.tool {
+            Some(t) => Step::tool(&e.id, t, &e.intent, json!({})),
+            None => Step::reasoning(&e.id, &e.intent),
+        };
+        if let Some(m) = e.tool.as_deref().and_then(|t| registry.meta(t)) {
+            ns.approval_required = m.requires_approval;
+        }
+        ns.brief = true;
+        ns.expect = e.expect.clone();
+        ns.planner = e.planner;
+        ns.depends_on = e.after.iter().map(fix_dep).filter(|d| *d != e.id).collect();
+        steps[i] = ns;
+    }
+    if !patch.add.is_empty() {
+        let doc = json!({"steps": patch.add.iter().map(|s| s.to_value()).collect::<Vec<_>>()});
+        match parse_brief_plan(&doc, "", PlanSource::Replan, prefix, registry) {
+            Ok(new) => steps.extend(new),
+            Err(e) => issues.push(e),
+        }
+    }
+    // nothing may wait for a step that is gone
+    let gone: HashSet<&String> = patch.drop.iter().collect();
+    for s in &mut steps {
+        s.depends_on.retain(|d| !gone.contains(d));
+        // what was waiting on the old version of an edited step, or was cancelled with the run, runs again
+        if matches!(s.status, StepStatus::Cancelled) {
+            s.status = StepStatus::Pending;
+        }
+    }
+    for s in &steps {
+        if s.status == StepStatus::Failed {
+            issues.push(format!("{} failed ({}) and is neither edited nor dropped", s.id, tokens::truncate_tokens(s.error.as_deref().unwrap_or("error"), 20)));
+        }
+    }
+    if issues.is_empty() { Ok(steps) } else { Err(issues) }
 }
 
 static EXPECT_EXISTS: LazyLock<Regex> = LazyLock::new(|| {
@@ -669,7 +594,7 @@ mod tests {
             {"id": "s2", "tool": null, "do": "summarise", "after": ["s1"]},
             {"id": "s3", "tool": "calc", "args": {"expression": "{{s1}}"}}
         ]});
-        let steps = parse_plan(&v, "g", PlanSource::Slm, "", &r).unwrap();
+        let steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
         assert_eq!(steps.len(), 3);
         assert_eq!(steps[1].kind, StepKind::Reasoning);
         assert_eq!(steps[2].depends_on, vec!["s1"], "template reference implies a dependency");
@@ -681,7 +606,7 @@ mod tests {
     fn rejects_bad_plans() {
         let r = registry();
         let bad = |v: Value| {
-            let steps = parse_plan(&v, "g", PlanSource::Slm, "", &r).unwrap();
+            let steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
             validate_plan(&steps, &r, &["fs_read".to_string()], &Budget::default()).unwrap_err()
         };
         assert!(bad(json!({"steps": [{"id": "s1", "tool": "rm_rf", "args": {}}]})).iter().any(|e| e.contains("unknown tool")));
@@ -720,7 +645,7 @@ mod tests {
             {"id": "s3", "tool": "fs_read", "args": {"path": "other.txt"}},
             {"id": "s4", "tool": "fs_read", "args": {"path": "./public/earth.html"}}
         ]});
-        let mut steps = parse_plan(&v, "g", PlanSource::Slm, "", &r).unwrap();
+        let mut steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
         let notes = infer_dependencies(&mut steps, &r);
         let deps = |id: &str| steps.iter().find(|s| s.id == id).unwrap().depends_on.clone();
         assert_eq!(deps("s2"), vec!["s1"], "{notes:?}");
@@ -731,15 +656,15 @@ mod tests {
         assert!(infer_dependencies(&mut steps, &r).is_empty());
         validate_plan(&steps, &r, &allowed(&r), &Budget::default()).unwrap();
         // changes happen one after another in plan order
-        let mut two = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}}, {"id": "b", "tool": "fs_write", "args": {"path": "y.txt", "content": "2"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        let mut two = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}}, {"id": "b", "tool": "fs_write", "args": {"path": "y.txt", "content": "2"}}]}), "g", PlanSource::Worker, "", &r).unwrap();
         infer_dependencies(&mut two, &r);
         assert_eq!(two[1].depends_on, vec!["a"]);
         // an intent that has no arguments yet is judged by its sentence
-        let mut brief = parse_brief_plan(&json!({"steps": [{"id": "s1", "do": "write the page to public/index.html", "tool": "fs_write"}, {"id": "s2", "do": "serve the public directory", "tool": "shell"}]}), "g", PlanSource::Strong, "", &r).unwrap();
+        let mut brief = parse_brief_plan(&json!({"steps": [{"id": "s1", "do": "write the page to public/index.html", "tool": "fs_write"}, {"id": "s2", "do": "serve the public directory", "tool": "shell"}]}), "g", PlanSource::Planner, "", &r).unwrap();
         infer_dependencies(&mut brief, &r);
         assert_eq!(brief[1].depends_on, vec!["s1"]);
         // a model's own dependency that would make a cycle is left alone
-        let mut cyc = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}, "after": ["b"]}, {"id": "b", "tool": "fs_write", "args": {"path": "x.txt", "content": "2"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        let mut cyc = parse_plan(&json!({"steps": [{"id": "a", "tool": "fs_write", "args": {"path": "x.txt", "content": "1"}, "after": ["b"]}, {"id": "b", "tool": "fs_write", "args": {"path": "x.txt", "content": "2"}}]}), "g", PlanSource::Worker, "", &r).unwrap();
         infer_dependencies(&mut cyc, &r);
         assert!(find_cycle(&cyc).is_none());
     }
@@ -750,7 +675,7 @@ mod tests {
         let steps = parse_plan(
             &json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a.html", "content": "<p>{{ENT.location}} and {{ENT.person}}</p>"}}]}),
             "g",
-            PlanSource::Slm,
+            PlanSource::Worker,
             "",
             &r,
         )
@@ -798,10 +723,10 @@ mod tests {
     fn a_changing_request_needs_a_changing_step() {
         let r = registry();
         let allowed = vec!["fs_write".to_string(), "fs_list".to_string()];
-        let list = parse_plan(&json!({"steps": [{"id": "s1", "tool": "fs_list", "args": {"path": "."}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+        let list = parse_plan(&json!({"steps": [{"id": "s1", "tool": "fs_list", "args": {"path": "."}}]}), "g", PlanSource::Worker, "", &r).unwrap();
         assert!(missing_effect(&list, &r, &allowed).unwrap().contains("fs_write"));
         let write =
-            parse_plan(&json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a", "content": "b"}}]}), "g", PlanSource::Slm, "", &r).unwrap();
+            parse_plan(&json!({"steps": [{"id": "s1", "tool": "fs_write", "args": {"path": "a", "content": "b"}}]}), "g", PlanSource::Worker, "", &r).unwrap();
         assert!(missing_effect(&write, &r, &allowed).is_none());
         assert!(missing_effect(&list, &r, &["fs_list".to_string()]).is_none(), "nothing offered could change anything");
     }
@@ -811,96 +736,6 @@ mod tests {
         let v = json!({"a": "x {{s1}} y", "b": ["{{s2}}"]});
         let out = substitute(&v, &|id| Some(format!("<{id}>")));
         assert_eq!(out, json!({"a": "x <s1> y", "b": ["<s2>"]}));
-    }
-}
-
-#[cfg(test)]
-mod line_format_tests {
-    use super::*;
-    use dfae_memory::InMemoryStore;
-    use dfae_tools::{PolicyConfig, PolicyEngine, register_native};
-    use std::sync::Arc;
-
-    fn registry() -> ToolRegistry {
-        let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), std::env::temp_dir()));
-        let mut r = ToolRegistry::new();
-        register_native(&mut r, policy, Arc::new(InMemoryStore::new()));
-        r
-    }
-
-    const PLAN: &str = "```\ns1 fs_mkdir: create the directory site\ns2 fs_write after=s1: write site/index.html, a page that says hello\n  expect: site/index.html exists\ns3 shell after=s2 strong: run `python3 -m http.server 8000` in site\nreport: Served at http://localhost:8000 ({{s3}})\n```";
-
-    #[test]
-    fn lines_become_the_same_plan_the_json_form_gives() {
-        let r = registry();
-        let v = parse_line_plan(PLAN, &[]).unwrap();
-        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
-        assert_eq!(steps.len(), 3);
-        assert_eq!(steps[1].tool.as_deref(), Some("fs_write"));
-        assert_eq!(steps[1].depends_on, vec!["s1"]);
-        assert_eq!(steps[1].expect.as_deref(), Some("site/index.html exists"));
-        assert!(steps[2].strong && steps[2].brief);
-        assert!(steps[2].description.contains("http.server 8000"));
-        assert_eq!(plan_report(&v, &steps).as_deref(), Some("Served at http://localhost:8000 ({{s3}})"));
-    }
-
-    #[test]
-    fn a_reasoning_step_uses_a_dash_and_wrapped_sentences_join() {
-        let v = parse_line_plan("s1 fs_read: read a.txt\ns2 - after=s1: count the words\n  and say the number", &[]).unwrap();
-        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
-        assert_eq!(steps[1].kind, StepKind::Reasoning);
-        assert_eq!(steps[1].description, "count the words and say the number");
-        assert!(plan_report(&v, &steps).is_none());
-    }
-
-    #[test]
-    fn json_output_is_still_accepted_and_prose_is_an_error() {
-        let v = parse_line_plan(r#"{"steps":[{"id":"s1","tool":"fs_read","do":"read a.txt"}],"report":"{{s1}}"}"#, &[]).unwrap();
-        assert!(v["report"].is_string());
-        assert!(parse_line_plan("Sure, here is my plan: first read the file", &[]).is_err());
-    }
-
-    #[test]
-    fn small_variations_in_how_a_model_writes_the_lines_are_tolerated() {
-        let v = parse_line_plan("- s1. [fs_read]: read a.txt\n* s2) - after=s1: count the words\n   expect: a number", &[]).unwrap();
-        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
-        assert_eq!(steps.len(), 2);
-        assert_eq!(steps[0].tool.as_deref(), Some("fs_read"));
-        assert_eq!(steps[1].depends_on, vec!["s1"]);
-        assert_eq!(steps[1].expect.as_deref(), Some("a number"));
-    }
-
-    #[test]
-    fn what_real_models_write_instead_of_the_exact_format_is_still_a_plan() {
-        let r = registry();
-        let tools = r.names();
-        // numbered lines, tool first or named in the sentence
-        let v = parse_line_plan("Here is the plan:\n1. fs_mkdir: create the directory site\n2. fs_write: write site/index.html with a page\n3) Step uses shell to run `ls site` after 2\nStep 4: - after=3: say what is in site", &tools).unwrap();
-        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
-        assert_eq!(steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2", "s3", "s4"]);
-        assert_eq!(steps[0].tool.as_deref(), Some("fs_mkdir"));
-        assert_eq!(steps[2].tool.as_deref(), Some("shell"), "the tool the sentence names");
-        assert_eq!((steps[3].kind, steps[3].depends_on.clone()), (StepKind::Reasoning, vec!["s3".to_string()]));
-        // JSON under another key
-        let v = parse_line_plan(
-            r#"```json
-{"plan": [{"id": "s1", "tool": "fs_read", "do": "read a.txt"}]}
-```"#,
-            &tools,
-        )
-        .unwrap();
-        assert_eq!(parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap().len(), 1);
-        // `s1: fs_read: ...`
-        let v = parse_line_plan("s1: fs_read: read a.txt\ns2: - after=s1: count words", &tools).unwrap();
-        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &r).unwrap();
-        assert_eq!((steps[0].tool.as_deref(), steps[1].depends_on.clone()), (Some("fs_read"), vec!["s1".to_string()]));
-    }
-
-    #[test]
-    fn a_report_that_names_a_missing_step_is_dropped() {
-        let v = parse_line_plan("s1 fs_read: read a.txt\nreport: it says {{s9}}", &[]).unwrap();
-        let steps = parse_brief_plan(&v, "g", PlanSource::Strong, "", &registry()).unwrap();
-        assert!(plan_report(&v, &steps).is_none());
     }
 }
 

@@ -6,7 +6,7 @@
 #
 # Everything optional degrades gracefully: without the GLiNER model the engine
 # extracts with rules; with DECISION_PROVIDER=local it decides with built-in rules; without
-# the SLM it still runs every request that can be bound deterministically.
+# the worker model it still runs every request that can be bound deterministically.
 
 name: dfae
 
@@ -39,11 +39,11 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
-    # loopback only: lets `cargo test --test live_slm -- --ignored` talk to the same models
+    # loopback only: lets `cargo test --test live_worker -- --ignored` talk to the same models
     ports:
       - "127.0.0.1:11434:11434"
     environment:
-      # the SLM and the decision model stay loaded; decisions ask a few questions at once
+      # the worker model and the decision model stay loaded; decisions ask a few questions at once
       OLLAMA_KEEP_ALIVE: 24h
       OLLAMA_MAX_LOADED_MODELS: "2"
       OLLAMA_NUM_PARALLEL: "2"
@@ -58,7 +58,7 @@ services:
       timeout: 5s
       retries: 30
 
-  # One-shot: pull the SLM and the decision model into the ollama volume.
+  # One-shot: pull the worker model and the decision model into the ollama volume.
   ollama-pull:
     image: ollama/ollama:latest
     restart: "no"
@@ -67,14 +67,14 @@ services:
         condition: service_healthy
     environment:
       OLLAMA_HOST: http://ollama:11434
-      SLM_MODEL: ${SLM_MODEL:-qwen2.5:3b}
+      WORKER_MODEL: ${WORKER_MODEL:-qwen2.5:3b}
       DECISION_MODEL: ${DECISION_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
       DECISION_PROVIDER: ${DECISION_PROVIDER:-}
     entrypoint:
       - /bin/sh
       - -c
       - |
-        ollama pull "$$SLM_MODEL"
+        ollama pull "$$WORKER_MODEL"
         if [ "$$DECISION_PROVIDER" != "local" ]; then ollama pull "$$DECISION_MODEL"; fi
 
   # The engine: runtime + HTTP/SSE API.
@@ -97,14 +97,14 @@ services:
       DECISION_PROVIDER: ${DECISION_PROVIDER:-}
       DECISION_API_KEY: ${DECISION_API_KEY:-}
       # small language model
-      SLM_PROVIDER: openai
-      SLM_BASE_URL: http://ollama:11434/v1
-      SLM_MODEL: ${SLM_MODEL:-qwen2.5:3b}
-      # optional stronger model for escalation (anthropic | openai)
-      STRONG_PROVIDER: ${STRONG_PROVIDER:-}
-      STRONG_API_KEY: ${STRONG_API_KEY:-}
-      STRONG_MODEL: ${STRONG_MODEL:-claude-sonnet-5-5}
-      STRONG_BASE_URL: ${STRONG_BASE_URL:-https://api.anthropic.com}
+      WORKER_PROVIDER: openai
+      WORKER_BASE_URL: http://ollama:11434/v1
+      WORKER_MODEL: ${WORKER_MODEL:-qwen2.5:3b}
+      # optional planner model for escalation (anthropic | openai)
+      PLANNER_PROVIDER: ${PLANNER_PROVIDER:-}
+      PLANNER_API_KEY: ${PLANNER_API_KEY:-}
+      PLANNER_MODEL: ${PLANNER_MODEL:-claude-sonnet-5-5}
+      PLANNER_BASE_URL: ${PLANNER_BASE_URL:-https://api.anthropic.com}
       # web search backends (optional; without them DuckDuckGo's HTML endpoint and Wikipedia are used)
       SEARXNG_URL: ${SEARXNG_URL:-}
       BRAVE_API_KEY: ${BRAVE_API_KEY:-}
@@ -112,16 +112,16 @@ services:
       DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
       # never (default): no tool call waits for a human. ask: risky calls wait for approval in the TUI.
       DFAE_APPROVALS: ${DFAE_APPROVALS:-never}
-      # complexity (0..1) from which a task is planned by the external model (needs STRONG_*); 2 = never
-      DFAE_EXTERNAL_MIN_COMPLEXITY: ${DFAE_EXTERNAL_MIN_COMPLEXITY:-}
+      # complexity (0..1) from which a task is planned by the external model (needs PLANNER_*); 2 = never
+      DFAE_PLAN_MIN_COMPLEXITY: ${DFAE_PLAN_MIN_COMPLEXITY:-}
       DFAE_MAX_MODEL_CALLS: ${DFAE_MAX_MODEL_CALLS:-}
-      DFAE_MAX_LOCAL_CALLS: ${DFAE_MAX_LOCAL_CALLS:-}
+      DFAE_MAX_WORKER_CALLS: ${DFAE_MAX_WORKER_CALLS:-}
       DFAE_REPAIR: ${DFAE_REPAIR:-}
       DFAE_LAZY_CONTEXT: ${DFAE_LAZY_CONTEXT:-}
       DFAE_PLAN_FALLBACK: ${DFAE_PLAN_FALLBACK:-}
       DFAE_PLAN_FORMAT: ${DFAE_PLAN_FORMAT:-}
       DFAE_PLAN_PREFIX: ${DFAE_PLAN_PREFIX:-}
-      STRONG_PROMPT_CACHE: ${STRONG_PROMPT_CACHE:-}
+      PLANNER_PROMPT_CACHE: ${PLANNER_PROMPT_CACHE:-}
       DFAE_PLAN_REPORT: ${DFAE_PLAN_REPORT:-}
       DFAE_ANSWER_LOCAL_FIRST: ${DFAE_ANSWER_LOCAL_FIRST:-}
       DFAE_WORKSPACE_SNAPSHOT: ${DFAE_WORKSPACE_SNAPSHOT:-}

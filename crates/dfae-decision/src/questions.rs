@@ -151,7 +151,7 @@ pub fn recovery_request(state: DecisionState) -> DecisionRequest {
                 ("retry", "the failure looks transient"),
                 ("replan", "the approach is wrong; produce a new plan"),
                 ("skip", "the step is optional"),
-                ("escalate", "needs a stronger model"),
+                ("escalate", "needs a planner model"),
                 ("fail", "cannot be recovered or was forbidden"),
             ],
         ),
@@ -176,6 +176,6 @@ pub fn decomposition_request(state: DecisionState) -> DecisionRequest {
 
 pub fn escalation_request(state: DecisionState) -> DecisionRequest {
     let mut q = BTreeMap::new();
-    q.insert("escalate".into(), Question::noul("Should this task be escalated to a stronger model?"));
+    q.insert("escalate".into(), Question::noul("Should this task be escalated to a planner model?"));
     DecisionRequest { kind: DecisionKind::AssessEscalation, state, questions: q }
 }

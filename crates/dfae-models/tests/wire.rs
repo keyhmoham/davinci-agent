@@ -29,6 +29,7 @@ fn req(json_mode: bool) -> GenerationRequest {
         purpose: "t".into(),
         cache: false,
         schema: None,
+        schema_strict: false,
     }
 }
 

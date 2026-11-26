@@ -17,8 +17,8 @@ use std::time::Duration;
 
 struct Rig {
     engine: Engine,
-    slm: ScriptedModel,
-    strong: ScriptedModel,
+    worker: ScriptedModel,
+    planner: ScriptedModel,
     ws: tempfile::TempDir,
     store: Arc<InMemoryStore>,
 }
@@ -37,11 +37,11 @@ fn rig(with_slm: bool, with_strong: bool, extra: Vec<Arc<dyn Tool>>, tweak: impl
     for t in extra {
         reg.register(t);
     }
-    let slm = ScriptedModel::new("scripted-slm", vec![]);
-    let strong = ScriptedModel::new("scripted-strong", vec![]);
+    let worker = ScriptedModel::new("scripted-worker", vec![]);
+    let planner = ScriptedModel::new("scripted-planner", vec![]);
     let models = ModelGateway::new(
-        with_slm.then(|| Arc::new(slm.clone()) as Arc<dyn LanguageModel>),
-        with_strong.then(|| Arc::new(strong.clone()) as Arc<dyn LanguageModel>),
+        with_slm.then(|| Arc::new(worker.clone()) as Arc<dyn LanguageModel>),
+        with_strong.then(|| Arc::new(planner.clone()) as Arc<dyn LanguageModel>),
     );
     let engine = Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
@@ -52,7 +52,7 @@ fn rig(with_slm: bool, with_strong: bool, extra: Vec<Arc<dyn Tool>>, tweak: impl
         tools: Arc::new(reg),
         policy,
     });
-    Rig { engine, slm, strong, ws, store }
+    Rig { engine, worker, planner, ws, store }
 }
 
 async fn run(r: &Rig, goal: &str) -> TaskRecord {
@@ -82,7 +82,7 @@ async fn direct_mode_answers_with_zero_generative_tokens() {
     assert_eq!(t.verification.as_ref().unwrap().status, VerificationStatus::Verified);
     let l = t.ledger.summary();
     assert_eq!(l.generative_tokens, 0, "direct mode must not call a generative model");
-    assert_eq!(r.slm.calls(), 0);
+    assert_eq!(r.worker.calls(), 0);
     assert!(l.baseline_tokens > 300 && l.saved_pct > 90.0, "{l:?}");
 }
 
@@ -104,24 +104,24 @@ async fn assisted_mode_plans_with_only_the_selected_tools() {
     let r = rig(true, false, vec![], |_| {});
     std::fs::create_dir_all(r.ws.path().join("notes")).unwrap();
     std::fs::write(r.ws.path().join("notes/todo.md"), "- [x] ship v0\n- [ ] write tests\n").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "do": "read the todo file", "args": {"path": "notes/todo.md"}, "check": ["nonempty"]},
         {"id": "s2", "tool": null, "do": "list the tasks that are still open", "after": ["s1"]}
     ]})));
-    r.slm.push("Open: write tests");
+    r.worker.push("Open: write tests");
     let t = run(&r, "Read notes/todo.md and tell me which tasks are still open").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert_eq!(t.mode, Some(ExecMode::Assisted));
     assert_eq!(t.final_answer.as_deref(), Some("Open: write tests"));
     assert_eq!(t.verification.as_ref().unwrap().status, VerificationStatus::Verified);
-    assert_eq!(r.slm.calls(), 2, "one plan call + one reasoning step; the lone reasoning leaf is the answer");
+    assert_eq!(r.worker.calls(), 2, "one plan call + one reasoning step; the lone reasoning leaf is the answer");
     // token optimisation: the planner only saw the tools the decision layer selected
-    let plan_prompt = r.slm.requests.lock()[0].messages[0].content.clone();
+    let plan_prompt = r.worker.requests.lock()[0].messages[0].content.clone();
     assert!(plan_prompt.contains("fs_read("), "{plan_prompt}");
-    assert!(!plan_prompt.contains("http_get("), "unselected tools must not be shown to the SLM: {plan_prompt}");
+    assert!(!plan_prompt.contains("http_get("), "unselected tools must not be shown to the worker model: {plan_prompt}");
     assert!(!plan_prompt.contains("system_info("));
     // the step prompt wraps tool output as untrusted data
-    let step_prompt = r.slm.requests.lock()[1].messages[0].content.clone();
+    let step_prompt = r.worker.requests.lock()[1].messages[0].content.clone();
     assert!(step_prompt.contains("<data src=\"s1 fs_read\">"), "{step_prompt}");
 }
 
@@ -129,21 +129,21 @@ async fn assisted_mode_plans_with_only_the_selected_tools() {
 async fn invalid_plans_are_repaired_once() {
     let r = rig(true, false, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [{"id": "s1", "tool": "delete_everything", "args": {}}]})));
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [{"id": "s1", "tool": "delete_everything", "args": {}}]})));
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "explain the content", "after": ["s1"]}]})));
-    r.slm.push("It says alpha.");
+    r.worker.push("It says alpha.");
     let t = run(&r, "Read a.txt and explain what it says").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    let repair = r.slm.requests.lock()[1].messages.last().unwrap().content.clone();
+    let repair = r.worker.requests.lock()[1].messages.last().unwrap().content.clone();
     assert!(repair.contains("unknown tool"), "{repair}");
 }
 
 #[tokio::test]
 async fn policy_blocks_what_the_model_proposes() {
     let r = rig(true, false, vec![], |_| {});
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "/etc/passwd"}},
         {"id": "s2", "tool": null, "do": "summarise", "after": ["s1"]}]})));
     let t = run(&r, "read the file /etc/passwd and summarize it").await;
@@ -228,13 +228,13 @@ async fn prompt_injection_in_tool_output_taints_the_task() {
 async fn failed_step_triggers_a_replan() {
     let r = rig(true, false, vec![], |_| {});
     std::fs::write(r.ws.path().join("present.txt"), "here").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "missing.txt"}},
         {"id": "s2", "tool": null, "do": "explain what it says", "after": ["s1"]}]})));
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_list", "args": {"path": "."}},
         {"id": "s2", "tool": null, "do": "explain that missing.txt does not exist and what the folder holds", "after": ["s1"]}]})));
-    r.slm.push("missing.txt does not exist; the folder holds present.txt.");
+    r.worker.push("missing.txt does not exist; the folder holds present.txt.");
     let t = run(&r, "Read missing.txt and explain what it says").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert_eq!(t.usage.replans, 1);
@@ -301,50 +301,33 @@ async fn verified_plans_become_skills_that_skip_planning() {
     let r = rig(true, false, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
     std::fs::write(r.ws.path().join("b.txt"), "beta").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "explain what a.txt is", "after": ["s1"]}]})));
-    r.slm.push("a.txt holds alpha");
+    r.worker.push("a.txt holds alpha");
     let t1 = run(&r, "Show me the contents of the file a.txt and explain what it is").await;
     assert_eq!(t1.status, TaskStatus::Completed, "{:?}", t1.error);
-    assert_eq!(t1.ledger.summary().slm_calls, 2);
+    assert_eq!(t1.ledger.summary().worker_calls, 2);
     assert_eq!(r.store.stats().await.unwrap().procedural, 1, "a skill was learned");
 
     // same request shape, different file: no planning call is needed
-    r.slm.push("b.txt holds beta");
+    r.worker.push("b.txt holds beta");
     let t2 = run(&r, "Show me the contents of the file b.txt and explain what it is").await;
     assert_eq!(t2.status, TaskStatus::Completed, "{:?}", t2.error);
     assert_eq!(t2.plan.as_ref().unwrap().source, PlanSource::Skill);
     assert_eq!(step(&t2, "s1").args, json!({"path": "b.txt"}));
-    assert_eq!(t2.ledger.summary().slm_calls, 1, "only the reasoning step needs the SLM");
+    assert_eq!(t2.ledger.summary().worker_calls, 1, "only the reasoning step needs the worker model");
     assert!(t2.skill_id.is_some());
-}
-
-#[tokio::test]
-async fn bad_slm_output_escalates_to_the_stronger_model() {
-    let r = rig(true, true, vec![], |_| {});
-    std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push("sorry, I cannot do JSON");
-    r.slm.push("still no json");
-    r.strong.push(&plan_json(json!({"steps": [
-        {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
-        {"id": "s2", "tool": null, "do": "explain", "after": ["s1"]}]})));
-    r.strong.push("It holds alpha.");
-    let t = run(&r, "Read a.txt and explain what it holds").await;
-    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!(t.mode, Some(ExecMode::Escalated));
-    assert!(t.ledger.summary().strong_tokens > 0);
-    assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Strong);
 }
 
 #[tokio::test]
 async fn ungrounded_numbers_are_flagged_in_model_written_answers() {
     let r = rig(true, false, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "explain", "after": ["s1"]}]})));
-    r.slm.push("The file holds alpha and was last modified 4821 days ago.");
+    r.worker.push("The file holds alpha and was last modified 4821 days ago.");
     let t = run(&r, "Read a.txt and explain it").await;
     let a = t.final_answer.unwrap();
     assert!(a.contains("Not found in the collected evidence: 4821"), "{a}");
@@ -364,16 +347,16 @@ async fn no_model_and_no_binding_fails_clearly() {
 #[tokio::test]
 async fn model_call_budget_is_enforced() {
     // the self-hosted model is metered by the (generous) local guard, not the paid budget
-    let r = rig(true, false, vec![], |c| c.budget.max_local_calls = 1);
+    let r = rig(true, false, vec![], |c| c.budget.max_worker_calls = 1);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "explain", "after": ["s1"]}]})));
-    r.slm.push("never reached");
+    r.worker.push("never reached");
     let t = run(&r, "Read a.txt and explain it").await;
     assert_eq!(t.status, TaskStatus::Failed);
     assert!(t.error.unwrap().contains("budget"));
-    assert_eq!(r.slm.calls(), 1);
+    assert_eq!(r.worker.calls(), 1);
 }
 
 #[tokio::test]
@@ -381,27 +364,27 @@ async fn the_paid_budget_meters_the_external_model_and_not_the_local_one() {
     // a one-call paid budget does not stop a local model from making several calls
     let r = rig(true, false, vec![], |c| c.budget.max_model_calls = 1);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan_json(json!({"steps": [
+    r.worker.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "explain", "after": ["s1"]},
         {"id": "s3", "tool": null, "do": "also summarise", "after": ["s1"]}]})));
-    r.slm.push("explained");
-    r.slm.push("summarised");
-    r.slm.push("combined");
+    r.worker.push("explained");
+    r.worker.push("summarised");
+    r.worker.push("combined");
     let t = run(&r, "Read a.txt and explain it and summarise it").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!((t.usage.model_calls, t.usage.local_calls), (0, 4), "plan + 2 steps + answer, all local");
+    assert_eq!((t.usage.model_calls, t.usage.worker_calls), (0, 4), "plan + 2 steps + answer, all local");
     // the same plan on the external model is refused up front by the plan gate
     let r = rig(false, true, vec![], |c| c.budget.max_model_calls = 2);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
     // (reasoning the planner asks the external model to do itself is what the paid budget meters)
-    r.strong.push(&plan_json(json!({"steps": [
+    r.planner.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
-        {"id": "s2", "tool": null, "do": "explain", "after": ["s1"], "strong": true},
-        {"id": "s3", "tool": null, "do": "also summarise", "after": ["s1"], "strong": true}]})));
+        {"id": "s2", "tool": null, "do": "explain", "after": ["s1"], "planner": true},
+        {"id": "s3", "tool": null, "do": "also summarise", "after": ["s1"], "planner": true}]})));
     let t = run(&r, "Read a.txt and explain it and summarise it").await;
     assert_eq!(t.status, TaskStatus::Failed);
-    let repair = r.strong.requests.lock()[1].messages.last().unwrap().content.clone();
+    let repair = r.planner.requests.lock()[1].messages.last().unwrap().content.clone();
     assert!(repair.contains("model calls but only 1 remain"), "the paid budget gates the plan: {repair}");
 }
 

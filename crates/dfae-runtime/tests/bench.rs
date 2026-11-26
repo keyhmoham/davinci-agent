@@ -3,7 +3,7 @@
 //! makes the *same* decisions in both runs (it answers in whatever format its prompt asks for):
 //!
 //! * baseline: JSON plans, a narrow per-task tool list, the external model writes the final answer;
-//! * optimised: compact plan lines, the whole tool catalogue as a cached prefix, a plan-time reply template,
+//! * optimised: the whole tool catalogue as a cached prefix, a plan-time reply template,
 //!   local-first answers, a workspace snapshot.
 //!
 //! The external model is metered like a provider with prompt caching. The benchmark measures what the prompts, formats
@@ -142,38 +142,24 @@ fn scenarios() -> Vec<Scenario> {
     ]
 }
 
-fn render(sc: &Scenario, lines: bool, with_report: bool) -> String {
-    if lines {
-        let mut out = String::new();
-        for p in &sc.plan {
-            let after = if p.after.is_empty() { String::new() } else { format!(" after={}", p.after.join(",")) };
-            out.push_str(&format!("{} {}{}: {}\n", p.id, p.tool.unwrap_or("-"), after, p.doc));
-            if let Some(e) = p.expect {
-                out.push_str(&format!("  expect: {e}\n"));
-            }
-        }
-        if let (true, Some(r)) = (with_report, sc.report) {
-            out.push_str(&format!("report: {r}\n"));
-        }
-        out
-    } else {
-        let steps: Vec<_> = sc
-            .plan
-            .iter()
-            .map(|p| {
-                let mut s = json!({"id": p.id, "do": p.doc, "tool": p.tool, "after": p.after});
-                if let Some(e) = p.expect {
-                    s["expect"] = json!(e);
-                }
-                s
-            })
-            .collect();
-        json!({"steps": steps}).to_string()
+/// The plan as the planner writes it under the typed plan schema: every field of every step, `null` where there is nothing to say.
+fn render(sc: &Scenario, with_report: bool) -> String {
+    let steps: Vec<_> =
+        sc.plan.iter().map(|p| json!({"id": p.id, "tool": p.tool, "do": p.doc, "after": p.after, "expect": p.expect, "planner": false})).collect();
+    let mut v = json!({"steps": steps});
+    if with_report {
+        v["report"] = sc.report.map(|r| json!(r)).unwrap_or(serde_json::Value::Null);
     }
+    v.to_string()
 }
 
 #[derive(Default, Debug)]
 struct Totals {
+    /// Planner tokens (the expensive model) and worker tokens (the cheap one), raw and as input-token equivalents.
+    planner: u64,
+    worker: u64,
+    planner_eff: u64,
+    worker_eff: u64,
     external: u64,
     effective: u64,
     cached: u64,
@@ -188,7 +174,6 @@ struct Arm {
 
 #[derive(Clone, Copy)]
 struct Flags {
-    lines: bool,
     prefix: bool,
     report: bool,
     local_answer: bool,
@@ -196,9 +181,9 @@ struct Flags {
 }
 
 impl Flags {
-    const NONE: Flags = Flags { lines: false, prefix: false, report: false, local_answer: false, workspace: false };
+    const NONE: Flags = Flags { prefix: false, report: false, local_answer: false, workspace: false };
     /// What ships by default (the reply template is opt-in).
-    const ALL: Flags = Flags { lines: true, prefix: true, report: false, local_answer: true, workspace: true };
+    const ALL: Flags = Flags { prefix: true, report: false, local_answer: true, workspace: true };
 }
 
 async fn run_arm(f: Flags, rounds: usize, provider_caches: bool) -> Arm {
@@ -207,22 +192,21 @@ async fn run_arm(f: Flags, rounds: usize, provider_caches: bool) -> Arm {
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
     let eco = &mut cfg.economy;
-    (eco.plan_lines, eco.plan_prefix, eco.plan_report, eco.answer_local_first, eco.workspace_snapshot) =
-        (f.lines, f.prefix, f.report, f.local_answer, f.workspace);
+    (eco.plan_prefix, eco.plan_report, eco.answer_local_first, eco.workspace_snapshot) = (f.prefix, f.report, f.local_answer, f.workspace);
     let current = Arc::new(AtomicUsize::new(0));
     let scs = Arc::new(scenarios());
     let (c1, s1) = (current.clone(), scs.clone());
-    let strong = MeteredModel::new("strong", move |req| {
+    let planner = MeteredModel::new("planner", move |req| {
         let sc = &s1[c1.load(Ordering::SeqCst)];
         match req.purpose.as_str() {
-            "plan" => Ok(render(sc, req.system.contains("plan lines"), req.system.contains("report:"))),
+            "plan" => Ok(render(sc, req.system.contains("\"report\":"))),
             "answer" => Ok(sc.answer.to_string()),
             other => Err(format!("unexpected external call: {other}")),
         }
     });
-    let strong = if provider_caches { strong } else { strong.without_cache() };
+    let planner = if provider_caches { planner } else { planner.without_cache() };
     let (c2, s2) = (current.clone(), scs.clone());
-    let slm = MeteredModel::new("slm", move |req| {
+    let worker = MeteredModel::new("worker", move |req| {
         let sc = &s2[c2.load(Ordering::SeqCst)];
         match req.purpose.as_str() {
             "bind" => Ok(sc.bind.to_string()),
@@ -240,7 +224,7 @@ async fn run_arm(f: Flags, rounds: usize, provider_caches: bool) -> Arm {
         extractor: Arc::new(HybridExtractor::new(None)),
         config: cfg,
         store,
-        models: ModelGateway::new(Some(Arc::new(slm)), Some(Arc::new(strong))),
+        models: ModelGateway::new(Some(Arc::new(worker)), Some(Arc::new(planner))),
         tools: Arc::new(reg),
         policy,
     });
@@ -261,12 +245,20 @@ async fn run_arm(f: Flags, rounds: usize, provider_caches: bool) -> Arm {
         assert_eq!(t.status, TaskStatus::Completed, "[{}] {:?} / {:?}", sc.goal, t.error, t.final_answer);
         (sc.outcome)(ws.path());
         let s = t.ledger.summary();
-        arm.totals.external += s.external_tokens;
-        arm.totals.effective += s.external_effective_tokens;
-        arm.totals.cached += s.external_cached_tokens;
-        arm.totals.calls += s.strong_calls;
-        for (k, v) in s.external_by_purpose {
-            *arm.totals.by_purpose.entry(k).or_default() += v;
+        // both hosted models are billed: the planner's tokens and the worker's
+        arm.totals.planner += s.planner_tokens;
+        arm.totals.worker += s.worker_tokens;
+        arm.totals.planner_eff += s.planner_effective_tokens;
+        arm.totals.worker_eff += s.worker_effective_tokens;
+        arm.totals.external += s.planner_tokens + s.worker_tokens;
+        arm.totals.effective += s.planner_effective_tokens + s.worker_effective_tokens;
+        arm.totals.cached += s.planner_cached_tokens + s.worker_cached_tokens;
+        arm.totals.calls += s.planner_calls;
+        for (k, v) in s.planner_by_purpose {
+            *arm.totals.by_purpose.entry(format!("planner:{k}")).or_default() += v;
+        }
+        for (k, v) in s.worker_by_purpose {
+            *arm.totals.by_purpose.entry(format!("worker:{k}")).or_default() += v;
         }
         arm.answers.push(t.final_answer.clone().unwrap_or_default());
     }
@@ -276,13 +268,12 @@ async fn run_arm(f: Flags, rounds: usize, provider_caches: bool) -> Arm {
 const MUST: [&str; 6] = ["site/index.html", "8080", "9090", "notes/a.md", "backup/config.toml", "8080"];
 
 #[tokio::test]
-async fn the_optimised_flow_costs_far_fewer_external_tokens_for_the_same_outcomes() {
+async fn the_optimised_flow_costs_far_fewer_planner_tokens_for_the_same_outcomes() {
     let rounds = 4;
     let tasks = (scenarios().len() * rounds) as f64;
     let arms: Vec<(&str, Flags)> = vec![
-        ("baseline (json, narrow, answer call)", Flags::NONE),
-        ("+ compact plan lines", Flags { lines: true, ..Flags::NONE }),
-        ("+ plan-time reply template", Flags { lines: true, report: true, ..Flags::NONE }),
+        ("baseline (narrow tool list, answer call)", Flags::NONE),
+        ("+ plan-time reply template", Flags { report: true, ..Flags::NONE }),
         ("+ local-first answer", Flags { local_answer: true, ..Flags::NONE }),
         ("+ workspace snapshot", Flags { workspace: true, ..Flags::NONE }),
         ("+ cached catalogue prefix", Flags { prefix: true, ..Flags::NONE }),
@@ -290,20 +281,29 @@ async fn the_optimised_flow_costs_far_fewer_external_tokens_for_the_same_outcome
         ("all, on a provider without caching", Flags::ALL),
     ];
     let mut results = Vec::new();
-    eprintln!("\n{:<40} {:>5} {:>8} {:>8} {:>10} {:>9}", "arm", "calls", "tokens", "cached", "effective", "eff/task");
+    eprintln!("\n{:<40} {:>5} {:>9} {:>8} {:>10} {:>10} {:>9}", "arm", "calls", "planner", "worker", "plan eff", "work eff", "eff/task");
     for (name, f) in &arms {
         let arm = run_arm(*f, rounds, !name.contains("without caching")).await;
         let t = &arm.totals;
-        eprintln!("{:<40} {:>5} {:>8} {:>8} {:>10} {:>9.0}   {:?}", name, t.calls, t.external, t.cached, t.effective, t.effective as f64 / tasks, t.by_purpose);
+        eprintln!(
+            "{:<40} {:>5} {:>9} {:>8} {:>10} {:>10} {:>9.0}",
+            name,
+            t.calls,
+            t.planner,
+            t.worker,
+            t.planner_eff,
+            t.worker_eff,
+            t.effective as f64 / tasks
+        );
         results.push((*name, arm));
     }
     let (base, all) = (&results[0].1, &results[results.len() - 2].1);
     let nocache = &results.last().unwrap().1;
     let cut = |a: u64, b: u64| 100.0 * (a as f64 - b as f64) / a as f64;
     eprintln!(
-        "\nall vs baseline: external calls -{:.0}%, raw tokens -{:.0}%, effective tokens -{:.0}%",
+        "\nall vs baseline: planner calls -{:.0}%, planner effective tokens -{:.0}%, planner+worker effective tokens -{:.0}%",
         cut(base.totals.calls as u64, all.totals.calls as u64),
-        cut(base.totals.external, all.totals.external),
+        cut(base.totals.planner_eff, all.totals.planner_eff),
         cut(base.totals.effective, all.totals.effective)
     );
     // every arm produced answers that carry the facts of the task (same outcomes), not only the cheapest one
@@ -313,13 +313,13 @@ async fn the_optimised_flow_costs_far_fewer_external_tokens_for_the_same_outcome
         }
     }
     eprintln!(
-        "no-cache provider vs baseline: raw tokens -{:.0}%, effective tokens -{:.0}% (the prefix is switched off by itself)",
-        cut(base.totals.external, nocache.totals.external),
-        cut(base.totals.effective, nocache.totals.effective)
+        "no-cache provider vs baseline: planner effective tokens -{:.0}% (the prefix is switched off by itself)",
+        cut(base.totals.planner_eff, nocache.totals.planner_eff)
     );
-    assert!(nocache.totals.external < base.totals.external, "without caching the optimised flow must still not cost more");
-    assert!(all.totals.calls < base.totals.calls, "fewer external calls");
-    assert!(all.totals.effective < base.totals.effective, "fewer effective external tokens");
+    assert!(nocache.totals.planner_eff < base.totals.planner_eff, "without caching the optimised flow must still not cost the planner more");
+    assert!(all.totals.calls < base.totals.calls, "fewer planner calls");
+    assert!(all.totals.planner_eff < base.totals.planner_eff, "fewer effective planner tokens");
+    assert!(all.totals.effective < base.totals.effective, "and fewer effective tokens in all, worker included");
 }
 
 /// A stream of requests of one shape ("read <file> and tell me how many lines it has"): the first is planned by the
@@ -334,16 +334,20 @@ async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
-    cfg.thresholds.external_min_complexity = 0.01;
-    let strong = MeteredModel::new("strong", |req| match req.purpose.as_str() {
+    cfg.thresholds.plan_min_complexity = 0.01;
+    let planner = MeteredModel::new("planner", |req| match req.purpose.as_str() {
         "plan" => {
             let goal = &req.messages[0].content;
             let file = goal.split_whitespace().find(|w| w.starts_with("notes/")).unwrap_or("notes/f0.md").trim_end_matches(['.', ',']).to_string();
-            Ok(format!("s1 fs_read: read {file}\ns2 - after=s1: count the lines of the file and state the number"))
+            Ok(json!({"steps": [
+                {"id": "s1", "tool": "fs_read", "do": format!("read {file}"), "after": [], "expect": null, "planner": false},
+                {"id": "s2", "tool": null, "do": "count the lines of the file and state the number", "after": ["s1"], "expect": null, "planner": false}
+            ]})
+            .to_string())
         }
         other => Err(format!("unexpected external call: {other}")),
     });
-    let slm = MeteredModel::new("slm", |req| match req.purpose.as_str() {
+    let worker = MeteredModel::new("worker", |req| match req.purpose.as_str() {
         "step" => Ok("The file has some lines.".to_string()),
         other => Err(format!("unexpected local call: {other}")),
     });
@@ -356,7 +360,7 @@ async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
         extractor: Arc::new(HybridExtractor::new(None)),
         config: cfg,
         store,
-        models: ModelGateway::new(Some(Arc::new(slm)), Some(Arc::new(strong.clone()))),
+        models: ModelGateway::new(Some(Arc::new(worker)), Some(Arc::new(planner.clone()))),
         tools: Arc::new(reg),
         policy,
     });
@@ -368,24 +372,10 @@ async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
             .unwrap();
         let t = engine.wait(&id, Duration::from_secs(30)).await.unwrap();
         assert_eq!(t.status, TaskStatus::Completed, "task {i}: {:?} / {:?}", t.error, t.final_answer);
-        per_task.push(t.ledger.summary().external_tokens);
+        per_task.push(t.ledger.summary().planner_tokens);
     }
     eprintln!("\nexternal tokens per task for six requests of one shape: {per_task:?}");
     assert!(per_task[0] > 0, "the first is planned by the external model");
     assert!(per_task[1..].iter().all(|t| *t == 0), "the rest are replayed from the skill: {per_task:?}");
-    assert_eq!(strong.calls(), 1);
-}
-
-#[test]
-fn plan_lines_are_a_smaller_output_than_the_same_plan_in_json() {
-    let (mut json_tokens, mut line_tokens) = (0, 0);
-    for sc in scenarios() {
-        json_tokens += tokens::estimate_tokens(&render(&sc, false, false));
-        line_tokens += tokens::estimate_tokens(&render(&sc, true, false));
-    }
-    eprintln!(
-        "\nplan output tokens for the six benchmark plans: json {json_tokens}, lines {line_tokens} ({:.0}% fewer)",
-        100.0 * (json_tokens - line_tokens) as f64 / json_tokens as f64
-    );
-    assert!(line_tokens * 10 < json_tokens * 7, "lines {line_tokens} vs json {json_tokens}");
+    assert_eq!(planner.calls(), 1);
 }

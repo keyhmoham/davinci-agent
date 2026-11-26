@@ -4,7 +4,7 @@
 //! request binds to exactly one tool with all required arguments present, the
 //! whole task can run without any generative model. Anything that smells like
 //! reasoning ("explain", "why", long multi-part requests) is refused so the
-//! SLM gets it instead.
+//! worker model gets it instead.
 
 use dfae_core::*;
 use parking_lot::Mutex;

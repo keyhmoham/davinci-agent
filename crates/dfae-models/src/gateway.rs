@@ -6,8 +6,8 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    Slm,
-    Strong,
+    Worker,
+    Planner,
 }
 
 /// One completed model call, ready to be recorded in the ledger.
@@ -22,53 +22,53 @@ pub struct Generated {
 /// based on the decision layer.
 #[derive(Clone)]
 pub struct ModelGateway {
-    slm: Option<Arc<dyn LanguageModel>>,
-    strong: Option<Arc<dyn LanguageModel>>,
+    worker: Option<Arc<dyn LanguageModel>>,
+    planner: Option<Arc<dyn LanguageModel>>,
 }
 
 impl ModelGateway {
-    pub fn new(slm: Option<Arc<dyn LanguageModel>>, strong: Option<Arc<dyn LanguageModel>>) -> Self {
-        Self { slm, strong }
+    pub fn new(worker: Option<Arc<dyn LanguageModel>>, planner: Option<Arc<dyn LanguageModel>>) -> Self {
+        Self { worker, planner }
     }
 
     pub fn has(&self, tier: Tier) -> bool {
         match tier {
-            Tier::Slm => self.slm.is_some(),
-            Tier::Strong => self.strong.is_some(),
+            Tier::Worker => self.worker.is_some(),
+            Tier::Planner => self.planner.is_some(),
         }
     }
 
     /// Does this tier's provider bill a repeated prompt prefix at a fraction?
     pub fn caches_prompts(&self, tier: Tier) -> bool {
         match tier {
-            Tier::Slm => self.slm.as_ref().map(|m| m.caches_prompts()).unwrap_or(false),
-            Tier::Strong => self.strong.as_ref().map(|m| m.caches_prompts()).unwrap_or(false),
+            Tier::Worker => self.worker.as_ref().map(|m| m.caches_prompts()).unwrap_or(false),
+            Tier::Planner => self.planner.as_ref().map(|m| m.caches_prompts()).unwrap_or(false),
         }
     }
 
     /// Why a tier is not usable (`None` when it is, or is not configured).
     pub async fn diagnose(&self, tier: Tier) -> Option<String> {
         let m = match tier {
-            Tier::Slm => self.slm.as_ref(),
-            Tier::Strong => self.strong.as_ref(),
+            Tier::Worker => self.worker.as_ref(),
+            Tier::Planner => self.planner.as_ref(),
         }?;
         m.diagnose().await.err()
     }
 
     pub fn model_name(&self, tier: Tier) -> Option<String> {
         match tier {
-            Tier::Slm => self.slm.as_ref().map(|m| m.name().to_string()),
-            Tier::Strong => self.strong.as_ref().map(|m| m.name().to_string()),
+            Tier::Worker => self.worker.as_ref().map(|m| m.name().to_string()),
+            Tier::Planner => self.planner.as_ref().map(|m| m.name().to_string()),
         }
     }
 
     pub async fn health(&self, tier: Tier) -> Option<bool> {
         match tier {
-            Tier::Slm => match &self.slm {
+            Tier::Worker => match &self.worker {
                 Some(m) => Some(m.health().await),
                 None => None,
             },
-            Tier::Strong => match &self.strong {
+            Tier::Planner => match &self.planner {
                 Some(m) => Some(m.health().await),
                 None => None,
             },
@@ -77,8 +77,8 @@ impl ModelGateway {
 
     pub async fn generate(&self, tier: Tier, req: GenerationRequest) -> Result<Generated, ModelError> {
         let model = match tier {
-            Tier::Slm => self.slm.as_ref(),
-            Tier::Strong => self.strong.as_ref(),
+            Tier::Worker => self.worker.as_ref(),
+            Tier::Planner => self.planner.as_ref(),
         }
         .ok_or_else(|| ModelError::NotConfigured(format!("{tier:?} tier")))?;
         let est_prompt = tokens::estimate_tokens(&req.system) as u64 + req.messages.iter().map(|m| tokens::estimate_tokens(&m.content) as u64).sum::<u64>();
@@ -113,7 +113,7 @@ impl ModelGateway {
         Ok(Generated {
             entry: LedgerEntry {
                 ts: Utc::now(),
-                component: if tier == Tier::Slm { Component::Slm } else { Component::Strong },
+                component: if tier == Tier::Worker { Component::Worker } else { Component::Planner },
                 model: resp.model,
                 purpose,
                 prompt_tokens: p,
@@ -218,6 +218,7 @@ mod tests {
             purpose: "plan".into(),
             cache: false,
             schema: None,
+            schema_strict: false,
         }
     }
 
@@ -225,7 +226,7 @@ mod tests {
     async fn repairs_invalid_json_once() {
         let m = ScriptedModel::new("m", vec!["oops not json", "{\"ok\": true}"]);
         let gw = ModelGateway::new(Some(Arc::new(m.clone())), None);
-        let (v, calls) = gw.generate_json(Tier::Slm, req()).await.unwrap();
+        let (v, calls) = gw.generate_json(Tier::Worker, req()).await.unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(calls.len(), 2);
         assert_eq!(m.calls(), 2);
@@ -236,12 +237,12 @@ mod tests {
     #[tokio::test]
     async fn fails_after_one_repair() {
         let gw = ModelGateway::new(Some(Arc::new(ScriptedModel::new("m", vec!["x", "y"]))), None);
-        assert!(gw.generate_json(Tier::Slm, req()).await.is_err());
+        assert!(gw.generate_json(Tier::Worker, req()).await.is_err());
     }
 
     #[tokio::test]
     async fn missing_tier_is_an_error() {
         let gw = ModelGateway::new(None, None);
-        assert!(matches!(gw.generate(Tier::Strong, req()).await, Err(ModelError::NotConfigured(_))));
+        assert!(matches!(gw.generate(Tier::Planner, req()).await, Err(ModelError::NotConfigured(_))));
     }
 }

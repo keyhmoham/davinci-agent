@@ -13,6 +13,7 @@ mod engine;
 mod executor;
 mod implement;
 mod pipeline;
+pub mod plandoc;
 pub mod planner;
 pub mod prompts;
 mod session;

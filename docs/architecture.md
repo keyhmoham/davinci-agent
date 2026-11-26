@@ -4,7 +4,7 @@
 
 > The model proposes; the engine decides what is authorised, executes, observes and verifies.
 
-The runtime is the agent. The decision model, GLiNER and the SLM are services it calls for *bounded* questions.
+The runtime is the agent. The decision model, GLiNER and the worker model are services it calls for *bounded* questions.
 No model owns control flow, permissions, or the claim that a task is done.
 
 ## Pipeline (`crates/dfae-runtime/src/pipeline.rs`)
@@ -23,7 +23,7 @@ No model owns control flow, permissions, or the claim that a task is done.
 6. **Plan** — Direct: from bindings or the skill. Otherwise `select_tools` narrows the tool set and a model
    writes a JSON plan; it is parsed, **validated** (schema, known tools, only the selected tools, argument
    types, DAG acyclicity, step/tool-call budgets), repaired once with the exact problems listed, and — if the
-   SLM still fails and a stronger model exists — re-planned there.
+   worker model still fails and a planner model exists — re-planned there.
 7. **Execute** — DAG waves with bounded parallelism (`DFAE_MAX_PARALLEL`).
 8. **Verify** — evidence-based; one continuation round if the completion judgment is low.
 9. **Answer** — templated (no model) unless reasoning steps produced material to compose; model-written
@@ -43,21 +43,21 @@ place with phrase lists and regexes, and it answers exactly the same questions.
 
 The decision model chooses the handling (`select_mode`): `direct` (binds to tools outright), `assisted` = *quick* (one action or a reply the
 local triple handles alone) or `escalated` = *needs a plan*. Code only enforces limits: `escalated` without an external model falls back to
-the SLM; a low-confidence `assisted` is escalated; a user's explicit mode wins. There is no complexity rule on top (the threshold only
+the worker model; a low-confidence `assisted` is escalated; a user's explicit mode wins. There is no complexity rule on top (the threshold only
 parameterises the built-in rules that stand in when the decision model is down). With an external model configured **all planning is
 its**: a quick request becomes one brief step (`PlanSource::Quick`: the best-fitting tool the decision model picked, or none for a reply)
 that the acting phase binds and runs; if it fails, the re-plan is the external model's; an unreachable external model fails the task
-unless `DFAE_PLAN_FALLBACK=slm`. Conversation is answered by the local models. `escalated` means *the external model plans, the local system acts*:
+unless `DFAE_PLAN_FALLBACK=worker`. Conversation is answered by the local models. `escalated` means *the external model plans, the local system acts*:
 
 * **Planning phase** (`stage_model_plan`, event `phase: planning`): the brief-plan prompt (see *The cost of planning* below); the reply is
-  parsed by `parse_line_plan` / `parse_brief_plan`: every step is `brief`, `expect`/`strong` are read, arguments the planner did give are kept as hints. Plan
+  parsed by `parse_line_plan` / `parse_brief_plan`: every step is `brief`, `expect`/`planner` are read, arguments the planner did give are kept as hints. Plan
   validation skips argument checks for brief steps; the paid-call gate counts only reasoning the planner kept for itself (`Step::runs_local`).
 * **Acting phase** (event `phase: acting`): `run_step` calls `Inner::implement_step` for a brief step, which decides the action just in time:
   entities (GLiNER + rules) from the step sentence → kind (the planner's tool; if none, a tool only when the sentence binds outright via
   `bind_direct`) → arguments: planner hints, `bind_direct` on the sentence, entities that are *unambiguous* for a parameter (two candidate
-  paths are never guessed), then the ladder SLM, SLM, external model with the schema error fed back each time → validation (schema, `{{id}}` only
+  paths are never guessed), then the ladder worker model, worker model, external model with the schema error fed back each time → validation (schema, `{{id}}` only
   from this step's dependencies). The result is written back into the plan (`tool`, `args`, `how`) and the normal machinery runs it: policy,
-  contracts, repair, retries. A reasoning step is written by the SLM unless `strong`.
+  contracts, repair, retries. A reasoning step is written by the worker model unless `planner`.
 * **Judging**: if the planner gave `expect`, the decision model's completion question is asked of the result; a "no" fails the step
   (`other`), and the usual recovery decision (retry / repair / replan / skip) follows. Re-plans by the external model use the same system prompt as planning (the re-plan rules are in the message).
 * **Reviewing** (event `phase: reviewing`): verification and, if the evidence says the request is not accomplished, one continuation plan.
@@ -166,7 +166,7 @@ Delegation is a **plan step kind** (`Agent`); an agent is a child `TaskRecord` r
    narrows its tool scope, and waits for a worker slot (`Dispatcher::acquire_agent`: role pool, then global pool).
 5. **Run** — the agent inherits the entities of its sub-goal (no extractor call), a `Minimal` context profile, a slice of
    the coordinator's budget, and the coordinator's taint / auto-approve; it plans, executes, verifies and learns like any task.
-6. **Supervise** — on failure the decision layer picks retry (fresh agent), escalate (re-run on the stronger model) or fail;
+6. **Supervise** — on failure the decision layer picks retry (fresh agent), escalate (re-run on the planner model) or fail;
    `max_replans` is 0 for agent steps because the agent already replans internally. Siblings are isolated from the failure.
 7. **Join** — usage and ledger entries roll up (`origin` marks them), and the coordinator verifies: an agent step counts as
    evidence only if the agent itself was verified or partial. The answer is the join step's text, or each agent's answer under
@@ -199,8 +199,8 @@ Provider answers are validated against the question (type, and `choice ∈ optio
 **after** the provider — they are the reason a mis-calibrated decision model cannot cause harm:
 
 - `direct` requires a deterministic binding; otherwise → assisted.
-- `escalated` requires a configured stronger model; otherwise → assisted.
-- `assisted` without an SLM → escalated if available, else direct if bound.
+- `escalated` requires a configured planner model; otherwise → assisted.
+- `assisted` without an worker model → escalated if available, else direct if bound.
 - policy denials and cancellations are never retried or "worked around"; retries are capped by attempts; replans by budget.
 
 Calibration (`Calibrator`) blends raw confidence with the observed verified-success rate of that exact
@@ -248,5 +248,5 @@ capped per profile and truncated; observations get a per-step share.
 
 ## Tokens
 
-Every model call (SLM, strong, decision model) is a `LedgerEntry` with provider-reported usage when available (otherwise
+Every model call (worker model, planner, decision model) is a `LedgerEntry` with provider-reported usage when available (otherwise
 estimated), emitted as an event and aggregated per task and globally. See `evaluation.md` for the baseline model.

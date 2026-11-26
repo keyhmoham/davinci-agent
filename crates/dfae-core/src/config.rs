@@ -52,8 +52,34 @@ pub struct ModelConfig {
     pub model: String,
     #[serde(skip_serializing)]
     pub api_key: Option<String>,
+    /// Output limit for ordinary work (choosing arguments, short reasoning, answers): kept small, it is billed.
     pub max_tokens: u32,
+    /// Output limit when the model writes a file's content (a page, code, data): generous, the content is the product.
+    pub content_max_tokens: u32,
     pub timeout_secs: u64,
+}
+
+/// Where hosted models are reached unless a deployment says otherwise (an OpenAI-compatible gateway).
+pub const DEFAULT_MODEL_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+pub const DEFAULT_PLANNER_MODEL: &str = "gpt-6-luna";
+pub const DEFAULT_WORKER_MODEL: &str = "glm-5.3-flash";
+
+impl ModelConfig {
+    /// A hosted model from `<PREFIX>_PROVIDER` (`openai` | `anthropic` | `none`; default `openai` once a key is set),
+    /// `_BASE_URL`, `_MODEL`, `_API_KEY`, `_MAX_TOKENS`, `_CONTENT_MAX_TOKENS`, `_TIMEOUT_SECS`. The planner and the worker
+    /// model are configured the same way.
+    fn from_env(prefix: &str, default_model: &str, max_tokens: u32, content_max_tokens: u32, timeout_secs: u64) -> Self {
+        let var = |k: &str| env(&format!("{prefix}_{k}"));
+        Self {
+            provider: var("PROVIDER").unwrap_or_else(|| if var("API_KEY").is_some() { "openai".into() } else { "none".into() }),
+            base_url: var("BASE_URL").unwrap_or_else(|| DEFAULT_MODEL_BASE_URL.into()),
+            model: var("MODEL").unwrap_or_else(|| default_model.into()),
+            api_key: var("API_KEY"),
+            max_tokens: var("MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(max_tokens),
+            content_max_tokens: var("CONTENT_MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(content_max_tokens),
+            timeout_secs: var("TIMEOUT_SECS").and_then(|v| v.parse().ok()).unwrap_or(timeout_secs),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +94,7 @@ pub struct Thresholds {
     pub tool_min_relevance: f32,
     /// From this complexity (0..1, from the decision model) a task is "medium" and is planned by the external
     /// model when one is configured; below it the self-hosted models handle it alone. 2.0 turns this off.
-    pub external_min_complexity: f32,
+    pub plan_min_complexity: f32,
 }
 
 /// Token-economy switches (the zero-cost mechanisms that save generative tokens).
@@ -80,8 +106,6 @@ pub struct EconomyConfig {
     /// more (`NEED <step>`). Off by default: it trades a possible extra call for
     /// smaller prompts and should be measured on your workload before enabling.
     pub lazy_context: bool,
-    /// The external planner answers in a compact line format instead of JSON (`DFAE_PLAN_FORMAT=json` for JSON).
-    pub plan_lines: bool,
     /// The external planner's system prompt carries the whole stable tool catalogue and examples, so a provider
     /// with prompt caching bills it at a fraction after the first call (`DFAE_PLAN_PREFIX=narrow` lists only the
     /// tools judged relevant instead).
@@ -93,8 +117,8 @@ pub struct EconomyConfig {
     /// have written an equally good one for free. For deployments whose self-hosted model writes poor answers.
     pub plan_report: bool,
     /// Planning is always the external model's. When it cannot be reached the task fails with the reason — unless
-    /// `DFAE_PLAN_FALLBACK=slm`, which lets the self-hosted model plan instead.
-    pub plan_fallback_slm: bool,
+    /// `DFAE_PLAN_FALLBACK=worker`, which lets the self-hosted model plan instead.
+    pub plan_fallback_worker: bool,
     /// The final answer is composed by the self-hosted model and checked against the evidence; the external model
     /// is asked only when that check fails.
     pub answer_local_first: bool,
@@ -142,8 +166,8 @@ pub struct Config {
     pub policy_path: Option<PathBuf>,
     pub gliner_url: Option<String>,
     pub decision: DecisionConfig,
-    pub slm: ModelConfig,
-    pub strong: ModelConfig,
+    pub worker: ModelConfig,
+    pub planner: ModelConfig,
     pub budget: Budget,
     pub thresholds: Thresholds,
     pub team: TeamConfig,
@@ -170,7 +194,6 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
-        let slm_provider = env_or("SLM_PROVIDER", if env("SLM_BASE_URL").is_some() { "openai" } else { "none" });
         Self {
             bind: env_or("DFAE_BIND", "0.0.0.0:8080"),
             api_token: env("DFAE_API_TOKEN"),
@@ -190,26 +213,12 @@ impl Config {
                 // the model is self-hosted and free per token, so it makes every decision; narrow it to save latency
                 kinds: env_or("DECISION_KINDS", "all").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             },
-            slm: ModelConfig {
-                provider: slm_provider,
-                base_url: env_or("SLM_BASE_URL", "http://ollama:11434/v1"),
-                model: env_or("SLM_MODEL", "qwen2.5:3b"),
-                api_key: env("SLM_API_KEY"),
-                max_tokens: env_parse("SLM_MAX_TOKENS", 4096),
-                timeout_secs: env_parse("SLM_TIMEOUT_SECS", 180),
-            },
-            strong: ModelConfig {
-                provider: env_or("STRONG_PROVIDER", if env("STRONG_API_KEY").is_some() { "anthropic" } else { "none" }),
-                base_url: env_or("STRONG_BASE_URL", "https://api.anthropic.com"),
-                model: env_or("STRONG_MODEL", "claude-sonnet-5-5"),
-                api_key: env("STRONG_API_KEY"),
-                max_tokens: env_parse("STRONG_MAX_TOKENS", 2048),
-                timeout_secs: env_parse("STRONG_TIMEOUT_SECS", 120),
-            },
+            worker: ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90),
+            planner: ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180),
             budget: Budget {
                 max_steps: env_parse("DFAE_MAX_STEPS", 30),
                 max_model_calls: env_parse("DFAE_MAX_MODEL_CALLS", 12),
-                max_local_calls: env_parse("DFAE_MAX_LOCAL_CALLS", 200),
+                max_worker_calls: env_parse("DFAE_MAX_WORKER_CALLS", 200),
                 max_tool_calls: env_parse("DFAE_MAX_TOOL_CALLS", 25),
                 max_replans: env_parse("DFAE_MAX_REPLANS", 2),
                 max_seconds: env_parse("DFAE_MAX_SECONDS", 600),
@@ -220,15 +229,14 @@ impl Config {
                 skill_min_similarity: env_parse("DFAE_SKILL_MIN_SIM", 0.82),
                 escalate_below: env_parse("DFAE_ESCALATE_BELOW", 0.35),
                 tool_min_relevance: env_parse("DFAE_TOOL_MIN_REL", 0.5),
-                external_min_complexity: env_parse("DFAE_EXTERNAL_MIN_COMPLEXITY", 0.3),
+                plan_min_complexity: env_parse("DFAE_PLAN_MIN_COMPLEXITY", 0.3),
             },
             economy: EconomyConfig {
                 repair: !matches!(env("DFAE_REPAIR").as_deref(), Some("off" | "false" | "0")),
                 lazy_context: env_bool("DFAE_LAZY_CONTEXT", false),
-                plan_lines: !matches!(env("DFAE_PLAN_FORMAT").as_deref(), Some("json")),
                 plan_prefix: !matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("narrow" | "off")),
                 plan_prefix_always: matches!(env("DFAE_PLAN_PREFIX").as_deref(), Some("always")),
-                plan_fallback_slm: matches!(env("DFAE_PLAN_FALLBACK").as_deref(), Some("slm")),
+                plan_fallback_worker: matches!(env("DFAE_PLAN_FALLBACK").as_deref(), Some("worker")),
                 plan_report: matches!(env("DFAE_PLAN_REPORT").as_deref(), Some("on" | "true" | "1")),
                 answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
                 workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
@@ -259,8 +267,8 @@ impl Default for Config {
         c.gliner_url = None;
         c.decision.base_url = None;
         c.approvals = ApprovalMode::Ask; // the approval machinery is what the hermetic tests exercise
-        c.slm.provider = "none".into();
-        c.strong.provider = "none".into();
+        c.worker.provider = "none".into();
+        c.planner.provider = "none".into();
         c.api_token = None;
         c
     }

@@ -5,13 +5,13 @@ how to benchmark it properly.
 
 ## The token ledger
 
-Every model call is recorded (`slm`, `strong`, `decision`) with provider-reported token usage, falling back to an
+Every model call is recorded (`worker`, `planner`, `decision`) with provider-reported token usage, falling back to an
 estimator (`max(chars/4, words·4/3)`, deliberately slightly high). GLiNER calls are counted but cost no LLM tokens.
 
-* **generative tokens** = SLM + strong-model tokens — what an LLM bill is made of.
+* **generative tokens** = worker model + planner-model tokens — what an LLM bill is made of.
 * **decision tokens** = decision-model input+output tokens (a local model: compute, not a bill).
-* **external tokens** = strong-model input+output tokens: the only ones that cost anything. The saved percentage compares
-  *these* with the naive baseline (an agent that sends everything to an external model each step); SLM and decision tokens are reported but free.
+* **external tokens** = planner-model input+output tokens: the only ones that cost anything. The saved percentage compares
+  *these* with the naive baseline (an agent that sends everything to an external model each step); worker model and decision tokens are reported but free.
 
 ## The baseline (an estimate, not a measurement)
 
@@ -68,7 +68,7 @@ cargo test -p dfae-runtime --test bench -- --nocapture
 
 * With prompt caching: **−49 % effective external tokens, −14 % external calls**; without it: **−20 % effective, −13 % raw**. Raw tokens go
   *up* with caching because the whole tool catalogue and worked examples ride in the prefix — they are billed at a tenth, which is why the
-  prefix is sent only to a provider that caches (`LanguageModel::caches_prompts`: Anthropic, OpenAI's API, or `STRONG_PROMPT_CACHE=on`), only
+  prefix is sent only to a provider that caches (`LanguageModel::caches_prompts`: Anthropic, OpenAI's API, or `PLANNER_PROMPT_CACHE=on`), only
   while the cache is warm or traffic is dense enough to warm it (`economy/prefix.rs`: a prefixed call in the last 4½ minutes, or three planner calls in
   ten), and never after three prefixed planner calls in a row came back with no cache hit.
 * Honest negatives, kept in the table: the **reply template costs more than it saves** here (the planner pays five-times-priced output
@@ -82,7 +82,7 @@ cargo test -p dfae-runtime --test bench -- --nocapture
   differs from the original in its slot values (entities), because its sentences are phrased for the original.
 * What the benchmark does **not** show: how smart a real planner is. It measures what prompts, formats and flow cost. Plan quality, the
   tool-call accuracy of a real 3B model, and the real cache-hit rate of your provider have to be measured on your own traffic: the *Tokens* tab
-  and `/v1/stats` (`external_by_purpose`, `external_cached_tokens`, `external_effective_tokens`, `effective_per_completed`,
+  and `/v1/stats` (`planner_by_purpose`, `planner_cached_tokens`, `planner_effective_tokens`, `effective_per_completed`,
   `effective_per_verified`) are the instruments.
 
 ### Quality, verified by test
@@ -95,7 +95,7 @@ Each item is pinned by a test that fails without the change (`crates/dfae-runtim
 | written files are parsed (JSON, TOML, HTML balance, Python, shell, JS) | a JSON object cut off by the token limit is caught, the *local* model rewrites it with the parser's complaint, and the external model is not called again |
 | a reasoning step that misses its expectation is rewritten once locally, with the judge's reason | external calls stay at 1 |
 | arguments are bound under a JSON schema (servers that support `response_format: json_schema`; others fall back by themselves) and a second local attempt is a 3-sample vote | wire test (`dfae-models/tests/wire.rs`) and unit test |
-| a big tool output is condensed by the SLM, kept only if it states nothing the output lacks | the external model's step prompt holds the condensed text, not 600 lines (`tiers.rs`) |
+| a big tool output is condensed by the worker model, kept only if it states nothing the output lacks | the external model's step prompt holds the condensed text, not 600 lines (`tiers.rs`) |
 | work the external model plans is one plan, not a team of planners | `work_the_external_model_plans_is_one_plan_not_a_team_of_planners` fails without the change |
 | a task that went wrong and then worked leaves a one-line lesson that the next planner sees | lesson stored from `problems`, retrieved into the next plan prompt |
 | "that's wrong, try again" (decision model: `feedback`) marks the previous result as rejected | calibration, the skill that produced it, a lesson and a decision-log line (`rejected_by_user`) |
@@ -105,10 +105,10 @@ Each item is pinned by a test that fails without the change (`crates/dfae-runtim
 
 Compare, on *your* task distribution:
 
-1. a plain SLM agent (no tools);
-2. the same SLM with native tool calling;
-3. DFAE (decision model + GLiNER + SLM);
-4. DFAE with a stronger model enabled for escalation (or a stronger model alone).
+1. a plain worker model agent (no tools);
+2. the same worker model with native tool calling;
+3. DFAE (decision model + GLiNER + worker model);
+4. DFAE with a planner model enabled for escalation (or a planner model alone).
 
 `scripts/bench.sh [file]` runs a list of requests and prints mode, verification and tokens per request;
 `GET /v1/stats` aggregates. Metrics from the blueprint and where to read them:
@@ -119,7 +119,7 @@ Compare, on *your* task distribution:
 | tool accuracy, planning quality | plan + step statuses in the task record; `invalid plan` warnings; repair/replan counts |
 | extraction precision/recall | not built in — label a set and diff `entities` |
 | recovery rate | tasks with `usage.replans > 0` or `attempts > 1` that still verify |
-| escalation quality | `mode == escalated` vs outcome, `strong_tokens`, calibration table (`/v1/calibration`) |
+| escalation quality | `mode == escalated` vs outcome, `planner_tokens`, calibration table (`/v1/calibration`) |
 | cost / tokens per task | `ledger` (per task), `dfae_tokens*` (`/metrics`) |
 | latency | event timestamps; `latency_ms` on every ledger entry |
 | security | `crates/dfae-tools` policy tests; add your own red-team cases to `crates/dfae-runtime/tests/e2e.rs` |

@@ -4,7 +4,7 @@
 //! plan → execute → verify → answer → learn.
 //!
 //! Every stage prefers the cheapest component that can do the job: code, then
-//! the decision model, then the SLM, then (only when needed) a stronger model.
+//! the decision model, then the worker model, then (only when needed) a planner model.
 
 use crate::engine::{ContextBase, Inner, TaskCtx};
 use crate::{answer, planner, prompts, session, skills};
@@ -133,12 +133,12 @@ impl Inner {
             direct_bindable: calls.is_some() || skill_direct,
             direct_tools: calls.as_ref().map(|c| c.iter().map(|x| x.tool.clone()).collect()).unwrap_or_default(),
             skill_score: skill.as_ref().map(|s| s.similarity),
-            strong_available: self.models.has(Tier::Strong),
-            slm_available: self.models.has(Tier::Slm),
+            planner_available: self.models.has(Tier::Planner),
+            worker_available: self.models.has(Tier::Worker),
             complexity: routing.complexity,
             risk: Some(routing.risk),
             task_type: routing.task_type.clone(),
-            external_min_complexity: self.cfg.thresholds.external_min_complexity,
+            plan_min_complexity: self.cfg.thresholds.plan_min_complexity,
         });
         let choice = self.note(ctx, self.decider.select_mode(mstate, req.mode).await).await;
         let mut mode = choice.mode;
@@ -195,7 +195,7 @@ impl Inner {
         let mut plan = plan;
         // a brief plan's remaining work is the local system's: free, apart from what the planner flagged
         let any_brief = plan.steps.iter().any(|s| s.brief);
-        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(mode) && !any_brief));
+        plan.estimate = Some(self.cost.estimate_plan(&plan, self.uses_planner(mode) && !any_brief));
         ctx.rec.lock().await.plan = Some(plan.clone());
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
@@ -454,7 +454,7 @@ impl Inner {
         }
         self.emit(ctx, EventKind::Mode { mode, reason, skill_id: None }).await;
         let mut plan = planner::chat_plan(goal, gap);
-        plan.estimate = Some(self.cost.estimate_plan(&plan, self.is_external(mode)));
+        plan.estimate = Some(self.cost.estimate_plan(&plan, self.uses_planner(mode)));
         ctx.rec.lock().await.plan = Some(plan.clone());
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
@@ -537,14 +537,12 @@ impl Inner {
         } else {
             vec![]
         };
-        let profile = r.request.profile.unwrap_or(if tier != Tier::Strong {
-            ContextProfile::Reasoning
-        } else {
-            match r.route.as_ref().map(|x| x.complexity).unwrap_or(0.3) {
-                c if c >= 0.65 => ContextProfile::Reasoning,
-                c if c < 0.25 => ContextProfile::Minimal,
-                _ => ContextProfile::Standard,
-            }
+        // every context token is billed (planner and worker alike): the profile follows the request's complexity
+        let _ = tier;
+        let profile = r.request.profile.unwrap_or(match r.route.as_ref().map(|x| x.complexity).unwrap_or(0.3) {
+            c if c >= 0.65 => ContextProfile::Reasoning,
+            c if c < 0.25 => ContextProfile::Minimal,
+            _ => ContextProfile::Standard,
         });
         let pkg = build_context(&ContextInput {
             goal: &r.goal,
@@ -605,7 +603,7 @@ impl Inner {
         let top_tool = picked.first().map(|(n, _)| n.clone());
         let mut allowed: Vec<String> = picked.into_iter().map(|(n, _)| n).collect();
         // every tool listed is prompt text: a paid model gets the six best, a self-hosted one all that were judged relevant
-        if self.pick_tier(mode) == Some(Tier::Strong) {
+        if self.pick_tier(mode) == Some(Tier::Planner) {
             allowed.truncate(6);
         }
         for c in calls.unwrap_or(&[]) {
@@ -637,7 +635,7 @@ impl Inner {
         // The decision model said this needs no plan: one step, made here without asking anyone to plan it. The best-fitting
         // tool (or none: the local model writes the reply) is the step; the local system binds its arguments just before it
         // runs. If that is not enough, the step fails and the external model re-plans with the actual result in hand.
-        if mode == ExecMode::Assisted && self.models.has(Tier::Strong) && !is_member {
+        if mode == ExecMode::Assisted && self.models.has(Tier::Planner) && !is_member {
             let mut step = match top_tool.filter(|t| ctx.in_scope(t)) {
                 Some(t) => Step::tool("s1", &t, goal, json!({})),
                 None => Step::reasoning("s1", goal),
@@ -652,15 +650,15 @@ impl Inner {
         let budget = ctx.rec.lock().await.budget.clone();
         let mut tier = self
             .pick_tier(mode)
-            .ok_or("no language model is configured (set SLM_BASE_URL or STRONG_API_KEY) and this request cannot be handled deterministically")?;
-        let mut used_mode = if tier == Tier::Strong { ExecMode::Escalated } else { mode };
+            .ok_or("no language model is configured (set WORKER_BASE_URL or PLANNER_API_KEY) and this request cannot be handled deterministically")?;
+        let mut used_mode = if tier == Tier::Planner { ExecMode::Escalated } else { mode };
         let mut last_err = String::new();
         for attempt in 0..2 {
             let ctx_text = self.context_text(ctx, false, tier).await;
             // a self-hosted model gets parameter help and worked examples; the paid one gets the leanest prompt
             // planning phase: the external model writes a brief plan of intents (no arguments: the local system
             // supplies them step by step); a self-hosted planner writes a concrete plan as before
-            let brief = tier == Tier::Strong;
+            let brief = tier == Tier::Planner;
             if brief {
                 self.emit(
                     ctx,
@@ -679,7 +677,7 @@ impl Inner {
                 req.json = true;
                 req
             };
-            let source = if tier == Tier::Strong { PlanSource::Strong } else { PlanSource::Slm };
+            let source = if tier == Tier::Planner { PlanSource::Planner } else { PlanSource::Worker };
             match self.try_plan(ctx, tier, req, goal, source, &allowed, brief).await {
                 Ok((steps, report)) => {
                     let _ = entities;
@@ -688,21 +686,28 @@ impl Inner {
                 Err(e) => {
                     last_err = e;
                     // the external model cannot be reached (down, rate-limited): the self-hosted one plans instead
-                    if tier == Tier::Strong && self.models.has(Tier::Slm) && self.cfg.economy.plan_fallback_slm && last_err.contains("model request failed") {
+                    if tier == Tier::Planner
+                        && self.models.has(Tier::Worker)
+                        && self.cfg.economy.plan_fallback_worker
+                        && last_err.contains("model request failed")
+                    {
                         self.emit(
                             ctx,
                             EventKind::Warning { message: format!("the external model is unavailable ({last_err}); the self-hosted model plans instead") },
                         )
                         .await;
-                        tier = Tier::Slm;
+                        tier = Tier::Worker;
                         used_mode = ExecMode::Assisted;
                         continue;
                     }
-                    // one escalation to the stronger model, if there is one
-                    if tier == Tier::Slm && self.models.has(Tier::Strong) {
-                        self.emit(ctx, EventKind::Warning { message: format!("SLM plan failed ({last_err}); escalating the plan to the stronger model") })
-                            .await;
-                        tier = Tier::Strong;
+                    // one escalation to the planner model, if there is one
+                    if tier == Tier::Worker && self.models.has(Tier::Planner) {
+                        self.emit(
+                            ctx,
+                            EventKind::Warning { message: format!("worker model plan failed ({last_err}); escalating the plan to the planner model") },
+                        )
+                        .await;
+                        tier = Tier::Planner;
                         used_mode = ExecMode::Escalated;
                     } else {
                         break;
@@ -710,8 +715,8 @@ impl Inner {
                 }
             }
         }
-        let hint = if self.models.has(Tier::Strong) && self.models.has(Tier::Slm) && !self.cfg.economy.plan_fallback_slm {
-            " (planning is always the external model's; DFAE_PLAN_FALLBACK=slm lets the local model plan when it cannot be reached)"
+        let hint = if self.models.has(Tier::Planner) && self.models.has(Tier::Worker) && !self.cfg.economy.plan_fallback_worker {
+            " (planning is always the external model's; DFAE_PLAN_FALLBACK=worker lets the local model plan when it cannot be reached)"
         } else {
             ""
         };
@@ -730,35 +735,46 @@ impl Inner {
         allowed: &[String],
         brief: bool,
     ) -> Result<(Vec<Step>, Option<String>), String> {
-        let lines = brief && self.cfg.economy.plan_lines;
-        let parse =
-            |v: &Value| if brief { planner::parse_brief_plan(v, goal, source, "", &self.tools) } else { planner::parse_plan(v, goal, source, "", &self.tools) };
-        let (reply, raw) = self.gen_plan(ctx, tier, req.clone(), lines).await?;
         let _ = allowed; // the live list is ctx.allowed: admitting a tool below widens it
-        let problems = match reply.and_then(|v| parse(&v).map(|s| (s, v))) {
-            Ok((steps, v)) => match self.finish_plan(ctx, steps, goal, true).await {
-                Ok(steps) => {
-                    let report = if self.cfg.economy.plan_report { planner::plan_report(&v, &steps) } else { None };
-                    return Ok((steps, report));
-                }
-                Err(errs) => errs,
-            },
-            Err(e) => vec![e],
+        let v = self.gen_json(ctx, tier, req.clone()).await?;
+        let problems = match self.read_plan(ctx, &v, goal, source, brief, true).await {
+            Ok(done) => return Ok(done),
+            Err(problems) => problems,
         };
-        req.messages.push(Message::assistant(tokens::truncate_tokens(&raw, 500)));
-        let again = if lines {
-            "Return the corrected plan lines only, one step per line, e.g.\ns1 fs_read: read a.txt\ns2 - after=s1: summarise it"
-        } else {
-            "Return the corrected JSON only."
-        };
-        req.messages.push(Message::user(format!("Invalid plan:\n- {}\n{again}", problems.join("\n- "))));
+        req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
+        req.messages.push(Message::user(format!("The plan has problems:\n- {}\nReturn the corrected plan (the same JSON shape).", problems.join("\n- "))));
         req.purpose = "plan_repair".into();
-        let (reply2, _) = self.gen_plan(ctx, tier, req, lines).await?;
-        let v2 = reply2?;
-        let steps = parse(&v2)?;
+        let v2 = self.gen_json(ctx, tier, req).await?;
         // the second attempt is judged on validity alone: a plan that is merely less ambitious is still a plan
-        let steps = self.finish_plan(ctx, steps, goal, false).await.map_err(|e| e.join("; "))?;
-        let report = if self.cfg.economy.plan_report { planner::plan_report(&v2, &steps) } else { None };
+        self.read_plan(ctx, &v2, goal, source, brief, false).await.map_err(|e| e.join("; "))
+    }
+
+    /// A planner's reply → typed steps (repairing what code can, saying so), → validated steps and the pre-written reply.
+    /// `Err` is what to tell the planner.
+    async fn read_plan(
+        &self,
+        ctx: &Arc<TaskCtx>,
+        v: &Value,
+        goal: &str,
+        source: PlanSource,
+        brief: bool,
+        expect_effect: bool,
+    ) -> Result<(Vec<Step>, Option<String>), Vec<String>> {
+        let (value, parsed) = if brief {
+            let tools: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
+            let (doc, reading) = crate::plandoc::PlanDoc::from_value(v, &tools).map_err(|r| r.issues)?;
+            for note in &reading.repairs {
+                self.emit(ctx, EventKind::Repaired { step_id: "plan".into(), note: note.clone() }).await;
+            }
+            let value = doc.to_value();
+            let parsed = planner::parse_brief_plan(&value, goal, source, "", &self.tools);
+            (value, parsed)
+        } else {
+            (v.clone(), planner::parse_plan(v, goal, source, "", &self.tools))
+        };
+        let steps = parsed.map_err(|e| vec![e])?;
+        let steps = self.finish_plan(ctx, steps, goal, expect_effect).await?;
+        let report = if self.cfg.economy.plan_report { planner::plan_report(&value, &steps) } else { None };
         Ok((steps, report))
     }
 
@@ -775,9 +791,10 @@ impl Inner {
         if s.is_empty() { s } else { format!("\n{s}") }
     }
 
-    /// Everything stable about planning for the external model (rules, the whole tool catalogue, examples) is the system
-    /// prompt, byte-identical from task to task so the provider's cache serves it; what changes — the shortlist of
-    /// likely tools, the context, and for a re-plan what is done and what went wrong — is the user message.
+    /// Everything stable about planning (rules, the whole tool catalogue, examples) is the system prompt, byte-identical from
+    /// task to task so the provider's cache serves it; what changes — the shortlist of likely tools, the context, and for a
+    /// re-plan the state of the plan and what went wrong — is the user message. The reply is constrained to the typed plan (or
+    /// patch) JSON Schema, with the tools that exist as an enum.
     pub(crate) fn brief_request(
         &self,
         ctx: &Arc<TaskCtx>,
@@ -788,20 +805,24 @@ impl Inner {
         purpose: &str,
     ) -> GenerationRequest {
         let eco = &self.cfg.economy;
-        let catalog = self.prefix_enabled().then(|| {
-            let mut names: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
-            names.sort();
-            self.tools.catalog_lines(&names)
-        });
-        let system = prompts::brief_system(eco.plan_lines, eco.plan_report, catalog.as_deref());
+        let mut names: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
+        names.sort();
+        let catalog = self.prefix_enabled().then(|| self.tools.catalog_lines(&names));
+        let system = prompts::brief_system(eco.plan_report, catalog.as_deref());
         let user = match (&catalog, replan) {
             (Some(_), None) => prompts::plan_user_shortlist(allowed, ctx_text, max_steps),
-            (Some(_), Some((done, problem, prefix))) => prompts::replan_user_shortlist(allowed, ctx_text, done, problem, prefix, max_steps),
+            (Some(_), Some((state, problem, prefix))) => prompts::replan_user_shortlist(allowed, ctx_text, state, problem, prefix, max_steps),
             (None, None) => prompts::plan_user(&self.tools.brief_lines(allowed), ctx_text, max_steps),
-            (None, Some((done, problem, prefix))) => prompts::replan_user_brief(&self.tools.brief_lines(allowed), ctx_text, done, problem, prefix, max_steps),
+            (None, Some((state, problem, prefix))) => prompts::replan_user_brief(&self.tools.brief_lines(allowed), ctx_text, state, problem, prefix, max_steps),
         };
-        let mut req = self.gen_request(Tier::Strong, &system, user, purpose);
-        req.json = !eco.plan_lines;
+        let mut req = self.gen_request(Tier::Planner, &system, user, purpose);
+        req.json = true;
+        req.schema = Some(if replan.is_some() {
+            crate::plandoc::patch_schema(&names, max_steps)
+        } else {
+            crate::plandoc::plan_schema(&names, max_steps, eco.plan_report)
+        });
+        req.schema_strict = true;
         req.cache = catalog.is_some();
         req
     }
@@ -1005,14 +1026,14 @@ impl Inner {
     /// Put the routing questions to the external model too and record how far the decision model agrees with it.
     async fn shadow_evaluate(&self, ctx: &Arc<TaskCtx>, state: &DecisionState, routing: &Routing) {
         use std::sync::atomic::Ordering::Relaxed;
-        if !self.models.has(Tier::Strong) {
+        if !self.models.has(Tier::Planner) {
             return;
         }
         let user = crate::shadow::render(&dfae_decision::route_request(state.clone()));
-        let mut req = self.gen_request(Tier::Strong, crate::shadow::SHADOW_SYSTEM, user, "shadow_eval");
+        let mut req = self.gen_request(Tier::Planner, crate::shadow::SHADOW_SYSTEM, user, "shadow_eval");
         req.json = true;
         req.max_tokens = req.max_tokens.min(300);
-        let Ok(theirs) = self.gen_json(ctx, Tier::Strong, req).await else { return };
+        let Ok(theirs) = self.gen_json(ctx, Tier::Planner, req).await else { return };
         let (agree, total, diffs) = crate::shadow::compare(routing, &theirs);
         self.shadow[0].fetch_add(1, Relaxed);
         self.shadow[1].fetch_add(agree as u64, Relaxed);

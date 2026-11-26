@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Component {
-    Slm,
-    Strong,
+    Worker,
+    Planner,
     /// The decision model.
     #[serde(alias = "jev")]
     Decision,
@@ -47,26 +47,29 @@ pub struct Ledger {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LedgerSummary {
-    pub slm_tokens: u64,
-    pub strong_tokens: u64,
-    /// Tokens sent to and from the **external** (paid) model: the only ones that cost anything.
-    pub external_tokens: u64,
-    /// Part of the external prompt tokens that the provider's prompt cache served (billed at a fraction).
-    pub external_cached_tokens: u64,
-    /// What the external tokens cost in input-token equivalents: cache reads count a tenth, completions
-    /// five times (the usual price ratios). The number to optimise.
-    pub external_effective_tokens: u64,
-    /// External tokens by what they were spent on (`plan`, `answer`, `step`, ...).
-    pub external_by_purpose: std::collections::BTreeMap<String, u64>,
+    /// Tokens sent to and from the **worker** model (hosted: it carries out the plan's steps).
+    pub worker_tokens: u64,
+    /// Tokens sent to and from the **planner** model (hosted: it writes and revises plans).
+    pub planner_tokens: u64,
+    /// Part of the prompt tokens that the providers' prompt caches served (billed at a fraction).
+    pub planner_cached_tokens: u64,
+    pub worker_cached_tokens: u64,
+    /// What the tokens cost in input-token equivalents: cache reads count a tenth, completions five times (the usual
+    /// price ratios). The numbers to optimise.
+    pub planner_effective_tokens: u64,
+    pub worker_effective_tokens: u64,
+    /// Tokens by what they were spent on (`plan`, `bind`, `content`, `answer`, ...).
+    pub planner_by_purpose: std::collections::BTreeMap<String, u64>,
+    pub worker_by_purpose: std::collections::BTreeMap<String, u64>,
+    /// The self-hosted decision model's tokens (compute, not a bill).
     pub decision_tokens: u64,
-    /// SLM + strong-model tokens (what an LLM bill would be made of).
+    /// worker + planner tokens: what the hosted-model bill is made of.
     pub generative_tokens: u64,
     pub baseline_tokens: u64,
     pub saved_tokens: u64,
     pub saved_pct: f32,
-    pub slm_calls: u32,
-    pub strong_calls: u32,
-    #[serde(alias = "jev_calls")]
+    pub worker_calls: u32,
+    pub planner_calls: u32,
     pub decision_calls: u32,
     pub gliner_calls: u32,
     pub cache_hits: u32,
@@ -95,16 +98,19 @@ impl Ledger {
                 s.cache_hits += 1;
             }
             match e.component {
-                Component::Slm => {
-                    s.slm_tokens += t;
-                    s.slm_calls += 1;
+                Component::Worker => {
+                    s.worker_tokens += t;
+                    s.worker_calls += 1;
+                    s.worker_cached_tokens += e.cached_tokens;
+                    s.worker_effective_tokens += effective_tokens(e.prompt_tokens, e.cached_tokens, e.completion_tokens);
+                    *s.worker_by_purpose.entry(e.purpose.clone()).or_default() += t;
                 }
-                Component::Strong => {
-                    s.strong_tokens += t;
-                    s.strong_calls += 1;
-                    s.external_cached_tokens += e.cached_tokens;
-                    s.external_effective_tokens += effective_tokens(e.prompt_tokens, e.cached_tokens, e.completion_tokens);
-                    *s.external_by_purpose.entry(e.purpose.clone()).or_default() += t;
+                Component::Planner => {
+                    s.planner_tokens += t;
+                    s.planner_calls += 1;
+                    s.planner_cached_tokens += e.cached_tokens;
+                    s.planner_effective_tokens += effective_tokens(e.prompt_tokens, e.cached_tokens, e.completion_tokens);
+                    *s.planner_by_purpose.entry(e.purpose.clone()).or_default() += t;
                 }
                 Component::Decision => {
                     s.decision_tokens += t;
@@ -113,11 +119,10 @@ impl Ledger {
                 Component::Gliner => s.gliner_calls += 1,
             }
         }
-        s.generative_tokens = s.slm_tokens + s.strong_tokens;
-        s.external_tokens = s.strong_tokens;
+        s.generative_tokens = s.worker_tokens + s.planner_tokens;
         s.baseline_tokens = self.baseline_tokens;
-        // the baseline is what a monolithic agent would have spent on an external model; self-hosted models are free
-        s.saved_tokens = s.baseline_tokens.saturating_sub(s.external_tokens);
+        // the baseline is what a monolithic agent would have spent on one hosted model; the decision model and the extractor are self-hosted
+        s.saved_tokens = s.baseline_tokens.saturating_sub(s.generative_tokens);
         s.saved_pct = if s.baseline_tokens > 0 { 100.0 * s.saved_tokens as f32 / s.baseline_tokens as f32 } else { 0.0 };
         s
     }
@@ -163,7 +168,7 @@ mod tests {
         let mut l = Ledger { baseline_tokens: 1000, ..Default::default() };
         l.record(LedgerEntry {
             ts: Utc::now(),
-            component: Component::Slm,
+            component: Component::Worker,
             model: "m".into(),
             purpose: "plan".into(),
             prompt_tokens: 100,
@@ -174,12 +179,12 @@ mod tests {
             origin: None,
         });
         let s = l.summary();
-        assert_eq!((s.generative_tokens, s.external_tokens), (150, 0), "a self-hosted model's tokens are not external");
-        assert_eq!(s.saved_tokens, 1000, "nothing was spent on an external model");
-        assert!((s.saved_pct - 100.0).abs() < 0.01);
+        assert_eq!((s.generative_tokens, s.worker_tokens, s.planner_tokens), (150, 150, 0));
+        assert_eq!(s.saved_tokens, 850, "the worker model's tokens are hosted tokens too: they count against the naive baseline");
+        assert!((s.saved_pct - 85.0).abs() < 0.01);
         l.record(LedgerEntry {
             ts: Utc::now(),
-            component: Component::Strong,
+            component: Component::Planner,
             model: "big".into(),
             purpose: "plan".into(),
             prompt_tokens: 200,
@@ -190,15 +195,15 @@ mod tests {
             origin: None,
         });
         let s = l.summary();
-        assert_eq!((s.external_tokens, s.saved_tokens), (300, 700));
-        assert!((s.saved_pct - 70.0).abs() < 0.01);
+        assert_eq!((s.planner_tokens, s.saved_tokens), (300, 550));
+        assert!((s.saved_pct - 55.0).abs() < 0.01);
     }
 
     #[test]
     fn summaries_from_older_or_newer_servers_still_parse() {
         // an older server's field names and missing fields
-        let old: LedgerSummary = serde_json::from_value(serde_json::json!({"slm_tokens": 5, "jev_calls": 2})).unwrap();
-        assert_eq!((old.slm_tokens, old.decision_calls, old.cache_hits), (5, 2, 0));
+        let old: LedgerSummary = serde_json::from_value(serde_json::json!({"worker_tokens": 5, "decision_calls": 2})).unwrap();
+        assert_eq!((old.worker_tokens, old.decision_calls, old.cache_hits), (5, 2, 0));
         // a newer server's extra fields
         let new: LedgerSummary = serde_json::from_value(serde_json::json!({"decision_calls": 3, "something_new": true})).unwrap();
         assert_eq!(new.decision_calls, 3);
@@ -213,7 +218,7 @@ mod tests {
         for (purpose, cached) in [("plan", 0), ("plan", 900), ("answer", 0)] {
             l.record(LedgerEntry {
                 ts: Utc::now(),
-                component: Component::Strong,
+                component: Component::Planner,
                 model: "m".into(),
                 purpose: purpose.into(),
                 prompt_tokens: 1000,
@@ -225,8 +230,8 @@ mod tests {
             });
         }
         let s = l.summary();
-        assert_eq!((s.external_tokens, s.external_cached_tokens), (3030, 900));
-        assert_eq!(s.external_effective_tokens, (1000 + 50) + (100 + 90 + 50) + (1000 + 50));
-        assert_eq!(s.external_by_purpose["plan"], 2020);
+        assert_eq!((s.planner_tokens, s.planner_cached_tokens), (3030, 900));
+        assert_eq!(s.planner_effective_tokens, (1000 + 50) + (100 + 90 + 50) + (1000 + 50));
+        assert_eq!(s.planner_by_purpose["plan"], 2020);
     }
 }

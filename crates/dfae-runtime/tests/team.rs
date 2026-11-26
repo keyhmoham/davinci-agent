@@ -129,7 +129,7 @@ impl Tool for Probe {
 
 struct Rig {
     engine: Engine,
-    slm: Routed,
+    worker: Routed,
     ws: tempfile::TempDir,
     store: Arc<InMemoryStore>,
 }
@@ -148,8 +148,8 @@ fn rig(with_slm: bool, extra: Vec<Arc<dyn Tool>>, tweak: impl FnOnce(&mut Config
     for t in extra {
         reg.register(t);
     }
-    let slm = Routed::default();
-    let models = ModelGateway::new(with_slm.then(|| Arc::new(slm.clone()) as Arc<dyn LanguageModel>), None);
+    let worker = Routed::default();
+    let models = ModelGateway::new(with_slm.then(|| Arc::new(worker.clone()) as Arc<dyn LanguageModel>), None);
     let engine = Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
         extractor: Arc::new(HybridExtractor::new(None)),
@@ -159,7 +159,7 @@ fn rig(with_slm: bool, extra: Vec<Arc<dyn Tool>>, tweak: impl FnOnce(&mut Config
         tools: Arc::new(reg),
         policy,
     });
-    Rig { engine, slm, ws, store }
+    Rig { engine, worker, ws, store }
 }
 
 async fn run(r: &Rig, goal: &str) -> TaskRecord {
@@ -199,7 +199,7 @@ fn write_files(r: &Rig) {
 async fn fan_out_runs_free_agents_and_pays_for_one_join() {
     let r = rig(true, vec![], |_| {});
     write_files(&r);
-    r.slm.step("summarize them", "The files hold alpha, beta and gamma.");
+    r.worker.step("summarize them", "The files hold alpha, beta and gamma.");
     let t = run(&r, "read a.txt, b.txt and c.txt and summarize them").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
 
@@ -229,8 +229,8 @@ async fn fan_out_runs_free_agents_and_pays_for_one_join() {
         assert_eq!(k.entities.iter().filter(|e| e.label == "file path").count(), 1, "entities are inherited, not re-extracted");
     }
     // the only model call in the whole request is the join
-    assert_eq!(r.slm.calls(), 1);
-    let join = &r.slm.prompts("You do one step of the user")[0];
+    assert_eq!(r.worker.calls(), 1);
+    let join = &r.worker.prompts("You do one step of the user")[0];
     for expect in ["<data src=\"c1 agent\">", "alpha", "beta", "gamma"] {
         assert!(join.contains(expect), "{join}");
     }
@@ -245,7 +245,7 @@ async fn fan_out_runs_free_agents_and_pays_for_one_join() {
 
     // cost accounting: rolled up for the team, but never double counted globally
     let team_total = t.ledger.summary();
-    assert_eq!(team_total.slm_calls, 1);
+    assert_eq!(team_total.worker_calls, 1);
     let stats = r.engine.stats().await;
     assert_eq!((stats.teams, stats.agents), (1, 3));
     assert_eq!(stats.totals.generative_tokens, t.ledger.summary_own().generative_tokens);
@@ -256,8 +256,11 @@ async fn fan_out_runs_free_agents_and_pays_for_one_join() {
 #[tokio::test]
 async fn a_pipeline_hands_results_down_and_separates_read_only_from_state_changing_work() {
     let r = rig(true, vec![], |_| {});
-    r.slm.plan("GOAL: Find the latest", "list-vulns").plan("GOAL: check whether my server", "check-server").plan("GOAL: patch it if necessary", "apply-patch");
-    r.slm
+    r.worker
+        .plan("GOAL: Find the latest", "list-vulns")
+        .plan("GOAL: check whether my server", "check-server")
+        .plan("GOAL: patch it if necessary", "apply-patch");
+    r.worker
         .step("list-vulns", "A critical flaw affects the older release")
         .step("check-server", "The server runs the older release and is affected")
         .step("apply-patch", "Patch plan: upgrade to the fixed release");
@@ -280,7 +283,7 @@ async fn a_pipeline_hands_results_down_and_separates_read_only_from_state_changi
     }
 
     // handoff: the second agent sees the first one's result (compactly), the first sees none
-    let planner_prompts = r.slm.prompts("You are the planner");
+    let planner_prompts = r.worker.prompts("You are the planner");
     let p2 = planner_prompts.iter().find(|p| p.contains("GOAL: check whether")).unwrap();
     assert!(p2.contains("UPSTREAM:") && p2.contains("critical flaw"), "{p2}");
     assert!(!planner_prompts.iter().find(|p| p.contains("GOAL: Find the latest")).unwrap().contains("UPSTREAM"));
@@ -302,7 +305,7 @@ async fn a_pipeline_hands_results_down_and_separates_read_only_from_state_changi
 async fn one_failed_agent_does_not_discard_its_siblings_and_policy_is_never_retried() {
     let r = rig(true, vec![], |_| {});
     write_files(&r);
-    r.slm.step("summarize them", "never reached");
+    r.worker.step("summarize them", "never reached");
     let t = run(&r, "read a.txt, ../../etc/passwd.txt and summarize them").await;
     assert_eq!(t.status, TaskStatus::Failed);
     assert_eq!(step(&t, "c1").status, StepStatus::Succeeded, "the independent sibling ran to completion");
@@ -312,7 +315,7 @@ async fn one_failed_agent_does_not_discard_its_siblings_and_policy_is_never_retr
     let a = t.final_answer.unwrap();
     assert!(a.contains("alpha"), "partial results are preserved: {a}");
     assert!(a.contains("outside the allowed roots"), "{a}");
-    assert_eq!(r.slm.calls(), 0, "no model is paid for a join that cannot happen");
+    assert_eq!(r.worker.calls(), 0, "no model is paid for a join that cannot happen");
     assert_eq!(t.verification.unwrap().status, VerificationStatus::Failed);
     // the split itself is judged by its outcome (calibration)
     assert_eq!(r.engine.calibration()["stats"]["assess_decomposition:split"], json!([0.0, 1.0]));
@@ -324,7 +327,7 @@ async fn supervision_retries_a_transient_agent_failure_with_a_fresh_agent() {
     *probe.fails.lock() = 2; // exhausts the first agent's own retries
     let calls = probe.calls.clone();
     let r = rig(true, vec![probe], |_| {});
-    r.slm.step("summarize", "both widgets are fine");
+    r.worker.step("summarize", "both widgets are fine");
     let t = run(&r, "fetch widget alpha, then fetch widget beta, then summarize").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}\n{:?}", t.error, t.final_answer);
     assert_eq!(step(&t, "c1").attempts, 2, "the supervisor re-dispatched the failed sub-task");
@@ -342,7 +345,7 @@ async fn operators_are_serialised_while_researchers_run_in_parallel() {
     let reset = Arc::new(Probe::new("zone_reset", r"(?i)\breset zone (?P<name>\w+)", true, 80));
     let (scan_peak, reset_peak) = (scan.peak.clone(), reset.peak.clone());
     let r = rig(true, vec![scan, reset], |_| {});
-    r.slm.step("summarize them", "done");
+    r.worker.step("summarize them", "done");
     let t = run(&r, "scan zone a, scan zone b, scan zone c and summarize them").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert!(scan_peak.load(Ordering::SeqCst) >= 2, "read-only agents fan out in parallel");
@@ -361,7 +364,7 @@ async fn operators_are_serialised_while_researchers_run_in_parallel() {
 async fn team_members_share_reads_until_somebody_writes() {
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.step("summarize", "ok");
+    r.worker.step("summarize", "ok");
     // two reads of the same file in sequence: the second is served from the team cache
     let t = run(&r, "read a.txt, then read a.txt, then summarize").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
@@ -393,7 +396,7 @@ async fn team_members_share_reads_until_somebody_writes() {
 #[tokio::test]
 async fn approvals_raised_by_an_agent_are_answered_on_that_agent() {
     let r = rig(true, vec![], |_| {});
-    r.slm.step("summarize", "wrote it");
+    r.worker.step("summarize", "wrote it");
     let id = r.engine.submit(TaskRequest { goal: "write 'x' to d.txt, then read d.txt, then summarize".into(), ..Default::default() }).await.unwrap();
     // find the agent that is waiting for approval
     let mut found = None;
@@ -445,19 +448,19 @@ async fn cancelling_the_coordinator_cancels_its_agents_and_frees_their_slots() {
 
 #[tokio::test]
 async fn independent_model_agents_get_disjoint_slices_of_the_budget() {
-    let r = rig(true, vec![], |c| c.budget.max_local_calls = 8);
-    r.slm.plan("GOAL: explain what a mutex is", "mutex-text").plan("GOAL: explain what a semaphore is", "sem-text");
-    r.slm.step("mutex-text", "A mutex is a lock.").step("sem-text", "A semaphore is a counter.");
+    let r = rig(true, vec![], |c| c.budget.max_worker_calls = 8);
+    r.worker.plan("GOAL: explain what a mutex is", "mutex-text").plan("GOAL: explain what a semaphore is", "sem-text");
+    r.worker.step("mutex-text", "A mutex is a lock.").step("sem-text", "A semaphore is a counter.");
     let t = run(&r, "explain what a mutex is and explain what a semaphore is").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}\n{:?}", t.error, t.final_answer);
     let kids = children(&r, &t).await;
     assert_eq!(kids.len(), 2);
     assert!(kids.iter().all(|k| k.team.as_ref().unwrap().role == AgentRole::Analyst));
-    let sum: u32 = kids.iter().map(|k| k.budget.max_local_calls).sum();
+    let sum: u32 = kids.iter().map(|k| k.budget.max_worker_calls).sum();
     assert!(sum <= 8, "children cannot overspend the coordinator's budget: {sum}");
     assert!(kids.iter().all(|k| k.budget.max_children == 0));
-    assert_eq!(t.usage.local_calls, kids.iter().map(|k| k.usage.local_calls).sum::<u32>(), "usage rolls up");
-    assert_eq!(t.usage.local_calls, 4);
+    assert_eq!(t.usage.worker_calls, kids.iter().map(|k| k.usage.worker_calls).sum::<u32>(), "usage rolls up");
+    assert_eq!(t.usage.worker_calls, 4);
     assert_eq!(t.usage.model_calls, 0, "no external call was made: the self-hosted model is not metered against the paid budget");
     let a = t.final_answer.unwrap();
     assert!(a.contains("A mutex is a lock.") && a.contains("A semaphore is a counter."), "{a}");
@@ -470,11 +473,11 @@ async fn delegation_can_be_switched_off_and_needs_a_model_where_one_is_needed() 
     // the user opts out
     let r = rig(true, vec![], |_| {});
     write_files(&r);
-    r.slm.when(
+    r.worker.when(
         |q| q.system.starts_with("You are the planner"),
         &json!({"steps": [{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "summarise"}]}).to_string(),
     );
-    r.slm.step("summarise", "flat");
+    r.worker.step("summarise", "flat");
     let t = run_req(&r, TaskRequest { goal: "read a.txt, b.txt and c.txt and summarize them".into(), delegate: Some(false), ..Default::default() }).await;
     assert!(t.team.is_none(), "delegate=false keeps it one task");
     assert_ne!(t.plan.as_ref().unwrap().source, PlanSource::Team);
@@ -489,8 +492,8 @@ async fn delegation_can_be_switched_off_and_needs_a_model_where_one_is_needed() 
     // server-wide switch
     let r3 = rig(true, vec![], |c| c.team.enabled = false);
     write_files(&r3);
-    r3.slm.when(|q| q.system.starts_with("You are the planner"), &json!({"steps": [{"id": "s1", "tool": null, "do": "summarise"}]}).to_string());
-    r3.slm.step("summarise", "flat");
+    r3.worker.when(|q| q.system.starts_with("You are the planner"), &json!({"steps": [{"id": "s1", "tool": null, "do": "summarise"}]}).to_string());
+    r3.worker.step("summarise", "flat");
     assert!(run(&r3, "read a.txt, b.txt and c.txt and summarize them").await.team.is_none());
 }
 
@@ -498,7 +501,7 @@ async fn delegation_can_be_switched_off_and_needs_a_model_where_one_is_needed() 
 async fn single_tasks_stay_single() {
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("todo.md"), "- [ ] docs").unwrap();
-    r.slm.plan("GOAL: Read todo.md", "count-open").step("count-open", "1 open task");
+    r.worker.plan("GOAL: Read todo.md", "count-open").step("count-open", "1 open task");
     let t = run(&r, "Read todo.md and tell me how many tasks are open").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert!(t.team.is_none(), "an analysis clause that refers to what was just read is not a separate task");

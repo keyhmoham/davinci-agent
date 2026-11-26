@@ -55,10 +55,10 @@ const CONDENSE_MIN_TOKENS: usize = 1500;
 /// How much of a step's output is kept in its summary. Roomy: it is trimmed to the tier that reads it.
 const STEP_SUMMARY_TOKENS: usize = 900;
 
-/// How much of an earlier step's output goes into a prompt: the paid model gets a tight summary, a
-/// self-hosted model (free per token) gets nearly all of it.
+/// How much of an earlier step's output goes into a prompt. Both hosted models are paid by the token: the planner gets a tight
+/// summary; the worker a little more, because it often has to write something from it.
 fn step_tokens(tier: Tier) -> usize {
-    if tier == Tier::Strong { 300 } else { STEP_SUMMARY_TOKENS }
+    if tier == Tier::Planner { 300 } else { 600 }
 }
 
 impl Inner {
@@ -209,14 +209,14 @@ impl Inner {
         crate::session::substitute_artifacts(args, &have)
     }
 
-    /// Which model writes a reasoning step of a brief plan: the SLM, unless the planner wants the external one.
+    /// Which model writes a reasoning step of a brief plan: the worker model, unless the planner wants the external one.
     fn step_tier(&self, step: &Step) -> Option<Tier> {
-        if step.strong && self.models.has(Tier::Strong) {
-            Some(Tier::Strong)
-        } else if self.models.has(Tier::Slm) {
-            Some(Tier::Slm)
-        } else if self.models.has(Tier::Strong) {
-            Some(Tier::Strong)
+        if step.planner && self.models.has(Tier::Planner) {
+            Some(Tier::Planner)
+        } else if self.models.has(Tier::Worker) {
+            Some(Tier::Worker)
+        } else if self.models.has(Tier::Planner) {
+            Some(Tier::Planner)
         } else {
             None
         }
@@ -294,7 +294,7 @@ impl Inner {
         let mut result = result;
         for _ in 0..2 {
             let Err(f) = &result else { break };
-            if !(f.message.contains("is malformed") && step.how.as_deref().is_some_and(|h| h.contains("slm")) && self.models.has(Tier::Slm)) {
+            if !(f.message.contains("is malformed") && step.how.as_deref().is_some_and(|h| h.contains("worker")) && self.models.has(Tier::Worker)) {
                 break;
             }
             self.emit(ctx, EventKind::Warning { message: format!("step {id}: {}; the local model writes it again", f.message) }).await;
@@ -325,7 +325,7 @@ impl Inner {
                 // external planner hears of it
                 if let Some(why) = verdict.clone()
                     && step.kind == StepKind::Reasoning
-                    && self.step_tier(&step) == Some(Tier::Slm)
+                    && self.step_tier(&step) == Some(Tier::Worker)
                     && let Ok(second) = self.run_reasoning(ctx, &step, mode, &deps, Some(&why)).await
                 {
                     let again = self.judge_step(ctx, &step, &second.content).await;
@@ -465,7 +465,11 @@ impl Inner {
         if let Some(f) = feedback {
             user.push_str(&format!("\nYOUR PREVIOUS ANSWER WAS REJECTED: {f}\nWrite it again so that it meets the expectation."));
         }
-        let mut text = self.generate_text(ctx, tier, self.gen_request(tier, prompts::STEP_SYSTEM, user, "step")).await.map_err(to_err)?;
+        let mut first = self.gen_request(tier, prompts::STEP_SYSTEM, user, "step");
+        if tier == Tier::Worker && crate::implement::content_like(&step.description) {
+            first.max_tokens = self.cfg.worker.content_max_tokens;
+        }
+        let mut text = self.generate_text(ctx, tier, first).await.map_err(to_err)?;
         let mut evidence = Vec::new();
         if lazy_on {
             let need = economy::lazy::parse_need(&text, &ids);
@@ -507,12 +511,12 @@ impl Inner {
         let tier = self.pick_tier(mode).ok_or_else(|| {
             StepFailure::new(
                 ErrorKind::Policy,
-                "no language model is configured, so I can only run tool requests (files, calculator, web search and pages…) — set SLM_BASE_URL or STRONG_API_KEY to chat",
+                "no language model is configured, so I can only run tool requests (files, calculator, web search and pages…) — set WORKER_BASE_URL or PLANNER_API_KEY to chat",
             )
         })?;
-        // history for a self-hosted model is generous; for the paid one the last three turns, trimmed
-        let paid = tier == Tier::Strong;
-        let (keep, q_tok, a_tok) = if paid { (3, 48, 80) } else { (8, 150, 250) };
+        // history costs tokens on every reply: the last few turns, trimmed
+        let paid = tier == Tier::Planner;
+        let (keep, q_tok, a_tok) = if paid { (3, 48, 80) } else { (4, 60, 120) };
         let all = ctx.base_ctx.lock().turns.clone();
         let turns: Vec<(String, String)> =
             all.iter().skip(all.len().saturating_sub(keep)).map(|(q, a)| (tokens::truncate_tokens(q, q_tok), tokens::truncate_tokens(a, a_tok))).collect();
@@ -534,12 +538,12 @@ impl Inner {
         let text = match self.generate_text(ctx, tier, req.clone()).await {
             Ok(t) => t,
             // the external model cannot be reached: the self-hosted one answers instead of the user getting an error
-            Err(e) if paid && self.models.has(Tier::Slm) && e.contains("model request failed") => {
+            Err(e) if paid && self.models.has(Tier::Worker) && e.contains("model request failed") => {
                 self.emit(ctx, EventKind::Warning { message: format!("the external model is unavailable ({e}); the self-hosted model answers instead") }).await;
-                let mut local = self.gen_request(Tier::Slm, prompts::CHAT_SYSTEM, String::new(), "chat");
+                let mut local = self.gen_request(Tier::Worker, prompts::CHAT_SYSTEM, String::new(), "chat");
                 local.messages = req.messages.clone();
                 local.temperature = 0.6;
-                self.generate_text(ctx, Tier::Slm, local).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?
+                self.generate_text(ctx, Tier::Worker, local).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?
             }
             Err(e) => return Err(StepFailure::new(ErrorKind::Transient, e)),
         };
@@ -662,7 +666,8 @@ impl Inner {
     /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the external model
     /// reads this instead of a mechanical cut of the first lines. Kept only if it states nothing the output lacks.
     async fn condense(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> Option<String> {
-        if !self.cfg.economy.condense || step.kind != StepKind::Tool || !self.models.has(Tier::Slm) || tokens::estimate_tokens(content) < CONDENSE_MIN_TOKENS {
+        if !self.cfg.economy.condense || step.kind != StepKind::Tool || !self.models.has(Tier::Worker) || tokens::estimate_tokens(content) < CONDENSE_MIN_TOKENS
+        {
             return None;
         }
         let goal = ctx.rec.lock().await.goal.clone();
@@ -672,9 +677,9 @@ impl Inner {
             tokens::truncate_tokens(&step.description, 40),
             dfae_core::safety::wrap_untrusted(step.tool.as_deref().unwrap_or("output"), &tokens::truncate_tokens(content, 6000))
         );
-        let mut req = self.gen_request(Tier::Slm, prompts::CONDENSE_SYSTEM, user, "condense");
+        let mut req = self.gen_request(Tier::Worker, prompts::CONDENSE_SYSTEM, user, "condense");
         req.max_tokens = req.max_tokens.min(500);
-        let text = self.generate_text(ctx, Tier::Slm, req).await.ok()?;
+        let text = self.generate_text(ctx, Tier::Worker, req).await.ok()?;
         let text = text.trim().to_string();
         let grounded = crate::answer::ungrounded_claims(&text, content, "").is_empty();
         (grounded && !text.is_empty() && tokens::estimate_tokens(&text) < tokens::estimate_tokens(content) / 2).then(|| format!("[condensed] {text}"))
@@ -776,7 +781,7 @@ impl Inner {
         if matches!(f.kind, ErrorKind::InvalidArgs | ErrorKind::NotFound) && self.repair_failed_step(ctx, &step, f.kind).await {
             return None;
         }
-        let generative = self.models.has(Tier::Slm) || self.models.has(Tier::Strong);
+        let generative = self.models.has(Tier::Worker) || self.models.has(Tier::Planner);
         let mut st = self.decision_state(&goal, &entities);
         st.step_facts = Some(StepFacts {
             step_id: id.into(),
@@ -789,7 +794,7 @@ impl Inner {
             // an agent step is retried or escalated, never replanned: its own pipeline already replans internally
             max_replans: if generative && step.kind != StepKind::Agent { budget.max_replans } else { 0 },
             optional: false,
-            strong_available: self.models.has(Tier::Strong),
+            planner_available: self.models.has(Tier::Planner),
         });
         let action = self.note(ctx, self.decider.assess_recovery(st).await).await;
         let label = format!("step {id} ({}) failed: {}", step.tool.as_deref().unwrap_or("reasoning"), f.message);
@@ -817,7 +822,7 @@ impl Inner {
                 None
             }
             Escalate if step.kind == StepKind::Agent => {
-                // supervision: run the sub-task again on the stronger model
+                // supervision: run the sub-task again on the planner model
                 {
                     let mut r = ctx.rec.lock().await;
                     if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
@@ -833,15 +838,16 @@ impl Inner {
                     return Some(label);
                 }
                 let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
-                let tier = if action == Escalate { Tier::Strong } else { self.planner_tier(mode).unwrap_or(Tier::Slm) };
+                let tier = if action == Escalate { Tier::Planner } else { self.planner_tier(mode).unwrap_or(Tier::Worker) };
                 if !self.models.has(tier) {
                     return Some(label);
                 }
-                if tier == Tier::Strong {
+                if tier == Tier::Planner {
                     ctx.rec.lock().await.mode = Some(ExecMode::Escalated);
                 }
                 let problem = format!(
-                    "step {id} ({} {}) failed with {}: {}",
+                    "step {id} \"{}\" ({} {}) failed with {}: {}",
+                    tokens::truncate_tokens(&step.description, 30),
                     step.tool.as_deref().unwrap_or("reasoning"),
                     tokens::truncate_tokens(&step.args.to_string(), 30),
                     kind_str(f.kind),
@@ -857,8 +863,9 @@ impl Inner {
         }
     }
 
-    /// Ask a model to revise the plan. The failed step and every not-yet-run
-    /// step are replaced; completed steps (and their outputs) are kept.
+    /// Ask a model to revise the plan. The planner answers with a patch (edit / add / drop) of the plan as it stands, so only what
+    /// changes is written and only that runs again; completed steps (and their outputs) are never touched. With no planner
+    /// configured the worker model writes the remaining steps instead.
     pub(crate) async fn replan(self: &Arc<Self>, ctx: &Arc<TaskCtx>, tier: Tier, goal: &str, problem: &str, failed: Option<&str>) -> Result<bool, String> {
         let (replans, budget) = {
             let mut r = ctx.rec.lock().await;
@@ -895,7 +902,10 @@ impl Inner {
             }
             a.clone()
         };
-        let done_tokens = if tier == Tier::Strong { 40 } else { 250 };
+        if tier == Tier::Planner {
+            return self.patch_plan(ctx, goal, problem, replans, &budget, &allowed).await;
+        }
+        // No planner model is configured: the worker model re-plans in concrete steps (the remaining steps replace the old ones).
         let (done, kept_ids) = {
             let r = ctx.rec.lock().await;
             let plan = r.plan.as_ref().ok_or("no plan")?;
@@ -903,14 +913,7 @@ impl Inner {
                 .steps
                 .iter()
                 .filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped))
-                .map(|s| {
-                    format!(
-                        "{} {}: {}",
-                        s.id,
-                        s.tool.as_deref().unwrap_or("reasoning"),
-                        tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), done_tokens)
-                    )
-                })
+                .map(|s| format!("{} {}: {}", s.id, s.tool.as_deref().unwrap_or("reasoning"), tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), 120)))
                 .collect();
             let kept: Vec<String> =
                 plan.steps.iter().filter(|s| matches!(s.status, StepStatus::Succeeded | StepStatus::Skipped)).map(|s| s.id.clone()).collect();
@@ -918,38 +921,19 @@ impl Inner {
         };
         let prefix = format!("r{replans}_");
         let ctx_text = self.context_text(ctx, false, tier).await;
-        // the external model re-plans in intents, as it planned; a self-hosted one in concrete steps
-        let brief = tier == Tier::Strong;
-        let lines = brief && self.cfg.economy.plan_lines;
-        let mut req = if brief {
-            self.brief_request(ctx, &allowed, &ctx_text, budget.max_steps.min(12), Some((&done, problem, &prefix)), "replan")
-        } else {
-            let user = prompts::replan_user(&self.tools.signatures_detailed(&allowed), &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
-            let mut req = self.gen_request(tier, prompts::REPLAN_SYSTEM, user, "replan");
-            req.json = true;
-            req
-        };
-        let mut new_report: Option<String> = None;
-        // Like the first plan, a re-plan gets one repair round: what was wrong with it is told to the model.
+        let user = prompts::replan_user(&self.tools.signatures(&allowed), &ctx_text, &done, problem, &prefix, budget.max_steps.min(12));
+        let mut req = self.gen_request(tier, prompts::REPLAN_SYSTEM, user, "replan");
+        req.json = true;
         let mut merged: Option<Vec<Step>> = None;
         let mut last_problem = String::new();
         for attempt in 0..2 {
-            let (reply, raw) = self.gen_plan(ctx, tier, req.clone(), lines).await?;
-            let parsed = reply.and_then(|v| {
-                let steps = if brief {
-                    planner::parse_brief_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
-                } else {
-                    planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools)
-                }?;
-                Ok((steps, v))
-            });
-            let problems: Vec<String> = match parsed {
+            let v = self.gen_json(ctx, tier, req.clone()).await?;
+            let problems: Vec<String> = match planner::parse_plan(&v, goal, PlanSource::Replan, &prefix, &self.tools) {
                 Err(e) => vec![e],
-                Ok((mut new_steps, v)) => {
+                Ok(mut new_steps) => {
                     if new_steps.is_empty() {
                         return Ok(false);
                     }
-                    new_report = planner::plan_report(&v, &new_steps);
                     self.repair_plan_args(ctx, &mut new_steps, goal).await;
                     let mut all: Vec<Step> = {
                         let r = ctx.rec.lock().await;
@@ -973,31 +957,105 @@ impl Inner {
             };
             last_problem = problems.join("; ");
             if attempt == 0 {
-                req.messages.push(Message::assistant(tokens::truncate_tokens(&raw, 500)));
-                let again = if lines {
-                    "Return the corrected plan lines only, one step per line, e.g.\ns1 fs_read: read a.txt\ns2 - after=s1: summarise it"
-                } else {
-                    "Return the corrected JSON only."
-                };
-                req.messages.push(Message::user(format!("Invalid plan:\n- {}\n{again}", problems.join("\n- "))));
+                req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
+                req.messages.push(Message::user(format!("Invalid plan:\n- {}\nReturn the corrected JSON only.", problems.join("\n- "))));
                 req.purpose = "replan_repair".into();
             }
         }
         let merged = merged.ok_or(last_problem)?;
+        self.commit_revision(ctx, merged, None, problem).await;
+        let _ = failed;
+        Ok(true)
+    }
+
+    /// Re-planning by the planner model: it answers with a typed patch of the plan (edit / add / drop), which is applied to the
+    /// plan as it stands. Only what changes is written, and only what changes runs again.
+    async fn patch_plan(
+        self: &Arc<Self>,
+        ctx: &Arc<TaskCtx>,
+        goal: &str,
+        problem: &str,
+        replans: u32,
+        budget: &Budget,
+        allowed: &[String],
+    ) -> Result<bool, String> {
+        let prefix = format!("r{replans}_");
+        let ctx_text = self.context_text(ctx, false, Tier::Planner).await;
+        let (current, state) = {
+            let r = ctx.rec.lock().await;
+            let plan = r.plan.as_ref().ok_or("no plan")?;
+            let lines: Vec<String> = plan
+                .steps
+                .iter()
+                .map(|s| {
+                    let what = format!("{} {}", s.tool.as_deref().unwrap_or("think"), tokens::truncate_tokens(&s.description, 40));
+                    let after = if s.depends_on.is_empty() { String::new() } else { format!(" (after {})", s.depends_on.join(",")) };
+                    match s.status {
+                        StepStatus::Succeeded => format!("{} DONE {what} → {}", s.id, tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), 40)),
+                        StepStatus::Failed => format!("{} FAILED {what}{after}: {}", s.id, tokens::truncate_tokens(s.error.as_deref().unwrap_or("error"), 40)),
+                        StepStatus::Skipped => format!("{} SKIPPED {what}", s.id),
+                        _ => format!("{} TODO {what}{after}", s.id),
+                    }
+                })
+                .collect();
+            (plan.steps.clone(), format!("PLAN:\n{}", lines.join("\n")))
+        };
+        let existing: std::collections::HashSet<String> = current.iter().map(|s| s.id.clone()).collect();
+        let tools: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
+        let mut req = self.brief_request(ctx, allowed, &ctx_text, budget.max_steps.min(12), Some((&state, problem, &prefix)), "replan");
+        let mut last_problem = String::new();
+        for attempt in 0..2 {
+            let v = self.gen_json(ctx, Tier::Planner, req.clone()).await?;
+            let problems: Vec<String> = match crate::plandoc::PatchDoc::from_value(&v, &tools, &existing) {
+                Err(r) => r.issues,
+                Ok((patch, reading)) => {
+                    for note in &reading.repairs {
+                        self.emit(ctx, EventKind::Repaired { step_id: "plan".into(), note: note.clone() }).await;
+                    }
+                    match planner::apply_patch(&current, &patch, &prefix, &self.tools) {
+                        Err(e) => e,
+                        Ok(mut all) => {
+                            self.admit_readonly_tools(ctx, &all).await;
+                            planner::prune_unknown_deps(&mut all);
+                            planner::infer_dependencies(&mut all, &self.tools);
+                            let allowed_now = ctx.allowed.lock().clone();
+                            let remaining = self.remaining_budget(ctx).await;
+                            match planner::validate_plan(&all, &self.tools, &allowed_now, &remaining) {
+                                Ok(()) => {
+                                    self.commit_revision(ctx, all, Some(&patch), problem).await;
+                                    return Ok(true);
+                                }
+                                Err(errs) => errs,
+                            }
+                        }
+                    }
+                }
+            };
+            last_problem = problems.join("; ");
+            if attempt == 0 {
+                req.messages.push(Message::assistant(tokens::truncate_tokens(&v.to_string(), 500)));
+                req.messages
+                    .push(Message::user(format!("The patch has problems:\n- {}\nReturn the corrected patch (the same JSON shape).", problems.join("\n- "))));
+                req.purpose = "replan_repair".into();
+            }
+        }
+        let _ = goal;
+        Err(last_problem)
+    }
+
+    /// Install a revised plan and tell everyone.
+    async fn commit_revision(&self, ctx: &Arc<TaskCtx>, steps: Vec<Step>, _patch: Option<&crate::plandoc::PatchDoc>, problem: &str) {
         let revised = {
             let mut r = ctx.rec.lock().await;
-            let p = r.plan.as_mut().ok_or("no plan")?;
-            p.steps = merged;
-            // the pre-written reply of the old plan describes steps that no longer stand; the re-plan may bring its own,
-            // but only its own new steps are ids it can refer to
-            p.report = if self.cfg.economy.plan_report { new_report.filter(|r| planner::report_refs_exist(r, &p.steps)) } else { None };
+            let Some(p) = r.plan.as_mut() else { return };
+            p.steps = steps;
+            // the pre-written reply of the old plan describes steps that no longer stand
+            p.report = None;
             p.revision += 1;
             p.clone()
         };
-        let _ = failed;
         self.emit(ctx, EventKind::PlanRevised { plan: revised, reason: tokens::truncate_tokens(problem, 40) }).await;
         self.persist(ctx).await;
-        Ok(true)
     }
 }
 

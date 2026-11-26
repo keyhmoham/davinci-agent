@@ -201,7 +201,7 @@ impl Decider {
 
     /// Pick the execution mode. Hard rules run *after* the provider: a
     /// provider can never select `direct` when no deterministic binding
-    /// exists, nor `escalated` when no stronger model is configured.
+    /// exists, nor `escalated` when no planner model is configured.
     pub async fn select_mode(&self, state: DecisionState, requested: ModeRequest) -> Decided<ModeChoice> {
         let facts = state.mode_facts.clone().unwrap_or_default();
         let (r, record, entry) = self.decide(mode_request(state)).await;
@@ -238,32 +238,32 @@ impl Decider {
             ModeRequest::Auto => {}
         }
         if mode == ExecMode::Direct && !facts.direct_bindable {
-            mode = if facts.slm_available {
+            mode = if facts.worker_available {
                 ExecMode::Assisted
-            } else if facts.strong_available {
+            } else if facts.planner_available {
                 ExecMode::Escalated
             } else {
                 ExecMode::Assisted
             };
             reason = "no deterministic binding for this request".into();
-        } else if mode == ExecMode::Direct && requested == ModeRequest::Auto && conf < self.thresholds.direct_min_confidence && facts.slm_available {
+        } else if mode == ExecMode::Direct && requested == ModeRequest::Auto && conf < self.thresholds.direct_min_confidence && facts.worker_available {
             mode = ExecMode::Assisted;
             reason = format!("direct confidence {conf:.2} below {:.2}", self.thresholds.direct_min_confidence);
         }
-        if mode == ExecMode::Escalated && !facts.strong_available {
+        if mode == ExecMode::Escalated && !facts.planner_available {
             mode = ExecMode::Assisted;
-            reason = "no stronger model configured; using SLM".into();
+            reason = "no planner model configured; using worker model".into();
         }
-        if mode == ExecMode::Assisted && !facts.slm_available {
-            if facts.strong_available {
+        if mode == ExecMode::Assisted && !facts.worker_available {
+            if facts.planner_available {
                 mode = ExecMode::Escalated;
-                reason = "no SLM configured; using stronger model".into();
+                reason = "no worker model configured; using planner model".into();
             } else if facts.direct_bindable {
                 mode = ExecMode::Direct;
                 reason = "no language model configured; using deterministic binding".into();
             }
         }
-        if requested == ModeRequest::Auto && mode == ExecMode::Assisted && conf < self.thresholds.escalate_below && facts.strong_available {
+        if requested == ModeRequest::Auto && mode == ExecMode::Assisted && conf < self.thresholds.escalate_below && facts.planner_available {
             mode = ExecMode::Escalated;
             reason = format!("low confidence {conf:.2}; escalating");
         }
@@ -291,12 +291,12 @@ impl Decider {
             action = RecoveryAction::Replan;
         }
         if action == RecoveryAction::Replan && facts.replans_used >= facts.max_replans {
-            action = if facts.strong_available { RecoveryAction::Escalate } else { RecoveryAction::Fail };
+            action = if facts.planner_available { RecoveryAction::Escalate } else { RecoveryAction::Fail };
         }
         if action == RecoveryAction::Skip && !facts.optional {
             action = RecoveryAction::Fail;
         }
-        if action == RecoveryAction::Escalate && !facts.strong_available {
+        if action == RecoveryAction::Escalate && !facts.planner_available {
             action = RecoveryAction::Fail;
         }
         Decided { value: action, record, entry }
@@ -365,10 +365,10 @@ mod tests {
     async fn direct_requires_binding() {
         let d = decider();
         let mut st = DecisionState { request: "calculate 2+2".into(), ..Default::default() };
-        st.mode_facts = Some(ModeFacts { direct_bindable: false, slm_available: true, ..Default::default() });
+        st.mode_facts = Some(ModeFacts { direct_bindable: false, worker_available: true, ..Default::default() });
         let m = d.select_mode(st.clone(), ModeRequest::Direct).await.value;
         assert_eq!(m.mode, ExecMode::Assisted);
-        st.mode_facts = Some(ModeFacts { direct_bindable: true, slm_available: true, ..Default::default() });
+        st.mode_facts = Some(ModeFacts { direct_bindable: true, worker_available: true, ..Default::default() });
         let m = d.select_mode(st, ModeRequest::Auto).await.value;
         assert_eq!(m.mode, ExecMode::Direct);
     }
@@ -377,7 +377,7 @@ mod tests {
     async fn escalation_needs_a_strong_model() {
         let d = decider();
         let mut st = DecisionState { request: "x".into(), ..Default::default() };
-        st.mode_facts = Some(ModeFacts { slm_available: true, strong_available: false, ..Default::default() });
+        st.mode_facts = Some(ModeFacts { worker_available: true, planner_available: false, ..Default::default() });
         let m = d.select_mode(st, ModeRequest::Escalated).await.value;
         assert_eq!(m.mode, ExecMode::Assisted);
     }
@@ -385,15 +385,15 @@ mod tests {
     #[tokio::test]
     async fn medium_and_complex_tasks_go_to_the_external_model_when_there_is_one() {
         let d = decider();
-        let mode = |complexity: f32, direct: bool, strong: bool, requested: ModeRequest| {
+        let mode = |complexity: f32, direct: bool, planner: bool, requested: ModeRequest| {
             let st = DecisionState {
                 request: "x".into(),
                 mode_facts: Some(ModeFacts {
                     complexity,
                     direct_bindable: direct,
-                    strong_available: strong,
-                    slm_available: true,
-                    external_min_complexity: 0.3,
+                    planner_available: planner,
+                    worker_available: true,
+                    plan_min_complexity: 0.3,
                     ..Default::default()
                 }),
                 ..Default::default()

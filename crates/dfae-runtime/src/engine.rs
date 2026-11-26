@@ -346,7 +346,7 @@ impl Engine {
     /// `(tier, reason)` for every configured language model that cannot be used right now.
     pub async fn model_problems(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (name, tier) in [("slm", Tier::Slm), ("external model", Tier::Strong)] {
+        for (name, tier) in [("worker", Tier::Worker), ("external model", Tier::Planner)] {
             if let Some(why) = self.inner.models.diagnose(tier).await {
                 out.push((name.to_string(), why));
             }
@@ -369,7 +369,7 @@ impl Engine {
             None => ("ok", "local rules".to_string()),
         };
         comps.push(ComponentHealth { name: "decision".into(), status: dstatus.into(), detail: ddetail });
-        for (name, tier) in [("slm", Tier::Slm), ("strong", Tier::Strong)] {
+        for (name, tier) in [("worker", Tier::Worker), ("planner", Tier::Planner)] {
             let (status, detail) = match i.models.health(tier).await {
                 Some(true) => ("ok", i.models.model_name(tier).unwrap_or_default()),
                 Some(false) => (
@@ -425,27 +425,32 @@ impl Engine {
             if is_agent {
                 l.baseline_tokens = 0;
             }
-            totals.slm_tokens += l.slm_tokens;
-            totals.strong_tokens += l.strong_tokens;
+            totals.worker_tokens += l.worker_tokens;
+            totals.planner_tokens += l.planner_tokens;
             totals.decision_tokens += l.decision_tokens;
             totals.generative_tokens += l.generative_tokens;
             totals.baseline_tokens += l.baseline_tokens;
-            totals.slm_calls += l.slm_calls;
-            totals.strong_calls += l.strong_calls;
+            totals.worker_calls += l.worker_calls;
+            totals.planner_calls += l.planner_calls;
             totals.decision_calls += l.decision_calls;
             totals.gliner_calls += l.gliner_calls;
             totals.cache_hits += l.cache_hits;
-            totals.external_cached_tokens += l.external_cached_tokens;
-            totals.external_effective_tokens += l.external_effective_tokens;
-            for (k, v) in l.external_by_purpose {
-                *totals.external_by_purpose.entry(k).or_default() += v;
+            totals.planner_cached_tokens += l.planner_cached_tokens;
+            totals.planner_effective_tokens += l.planner_effective_tokens;
+            totals.worker_cached_tokens += l.worker_cached_tokens;
+            totals.worker_effective_tokens += l.worker_effective_tokens;
+            for (k, v) in l.planner_by_purpose {
+                *totals.planner_by_purpose.entry(k).or_default() += v;
+            }
+            for (k, v) in l.worker_by_purpose {
+                *totals.worker_by_purpose.entry(k).or_default() += v;
             }
         }
-        totals.external_tokens = totals.strong_tokens;
-        totals.saved_tokens = totals.baseline_tokens.saturating_sub(totals.external_tokens);
+        totals.saved_tokens = totals.baseline_tokens.saturating_sub(totals.generative_tokens);
         totals.saved_pct = if totals.baseline_tokens > 0 { 100.0 * totals.saved_tokens as f32 / totals.baseline_tokens as f32 } else { 0.0 };
-        s.effective_per_completed = if s.completed > 0 { totals.external_effective_tokens as f64 / s.completed as f64 } else { 0.0 };
-        s.effective_per_verified = if s.verified > 0 { totals.external_effective_tokens as f64 / s.verified as f64 } else { 0.0 };
+        let hosted_effective = (totals.planner_effective_tokens + totals.worker_effective_tokens) as f64;
+        s.effective_per_completed = if s.completed > 0 { hosted_effective / s.completed as f64 } else { 0.0 };
+        s.effective_per_verified = if s.verified > 0 { hosted_effective / s.verified as f64 } else { 0.0 };
         s.totals = totals;
         let sh = &self.inner.shadow;
         (s.shadow_requests, s.shadow_agree, s.shadow_compared) = (sh[0].load(Ordering::Relaxed), sh[1].load(Ordering::Relaxed), sh[2].load(Ordering::Relaxed));
@@ -513,7 +518,7 @@ impl Inner {
     /// `DFAE_PLAN_PREFIX=always` — only while traffic is dense enough for the cache to stay warm (`PrefixPolicy`).
     pub(crate) fn prefix_enabled(&self) -> bool {
         let eco = &self.cfg.economy;
-        if !eco.plan_prefix || !self.models.caches_prompts(Tier::Strong) || self.prefix_misses.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+        if !eco.plan_prefix || !self.models.caches_prompts(Tier::Planner) || self.prefix_misses.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
             return false;
         }
         eco.plan_prefix_always || self.prefix_policy.lock().decide(std::time::Instant::now())
@@ -521,7 +526,7 @@ impl Inner {
 
     pub(crate) async fn add_ledger(&self, ctx: &Arc<TaskCtx>, entry: LedgerEntry) {
         use std::sync::atomic::Ordering::Relaxed;
-        if entry.component == Component::Strong
+        if entry.component == Component::Planner
             && matches!(entry.purpose.as_str(), "plan" | "plan_escalated" | "plan_repair" | "replan" | "replan_repair")
             && entry.prompt_tokens >= 1200
         {
@@ -532,7 +537,7 @@ impl Inner {
                 self.prefix_misses.fetch_add(1, Relaxed);
             }
         }
-        if matches!(entry.component, Component::Slm | Component::Strong) {
+        if matches!(entry.component, Component::Worker | Component::Planner) {
             self.emit(
                 ctx,
                 EventKind::Model {
@@ -568,25 +573,25 @@ impl Inner {
         let r = ctx.rec.lock().await;
         let mut b = r.budget.clone();
         // the plan gate asks "can the calls this plan needs be afforded?" of the tier that will make them
-        let tier = self.pick_tier(r.mode.unwrap_or(ExecMode::Assisted)).unwrap_or(Tier::Slm);
+        let tier = self.pick_tier(r.mode.unwrap_or(ExecMode::Assisted)).unwrap_or(Tier::Worker);
         b.max_model_calls =
-            if tier == Tier::Strong { b.max_model_calls.saturating_sub(r.usage.model_calls) } else { b.max_local_calls.saturating_sub(r.usage.local_calls) };
+            if tier == Tier::Planner { b.max_model_calls.saturating_sub(r.usage.model_calls) } else { b.max_worker_calls.saturating_sub(r.usage.worker_calls) };
         b
     }
 
     /// External calls are metered against the paid budget; local ones only against a runaway guard.
     pub(crate) async fn take_model_call(&self, ctx: &Arc<TaskCtx>, tier: Tier, n: u32) -> Result<(), String> {
         let mut r = ctx.rec.lock().await;
-        if tier == Tier::Strong {
+        if tier == Tier::Planner {
             if r.usage.model_calls + n > r.budget.max_model_calls {
                 return Err(format!("model-call budget exceeded ({} allowed)", r.budget.max_model_calls));
             }
             r.usage.model_calls += n;
         } else {
-            if r.usage.local_calls + n > r.budget.max_local_calls {
-                return Err(format!("local model-call budget exceeded ({} allowed)", r.budget.max_local_calls));
+            if r.usage.worker_calls + n > r.budget.max_worker_calls {
+                return Err(format!("local model-call budget exceeded ({} allowed)", r.budget.max_worker_calls));
             }
-            r.usage.local_calls += n;
+            r.usage.worker_calls += n;
         }
         Ok(())
     }
@@ -624,33 +629,8 @@ impl Inner {
         }
     }
 
-    /// A plan reply. In the compact line format one call yields text that is parsed here (the model never has to produce
-    /// JSON syntax); as JSON the gateway's own repair applies. The outer `Err` is a failed model call; the inner one is
-    /// a reply that could not be read (with the raw text, for the repair round).
-    pub(crate) async fn gen_plan(
-        &self,
-        ctx: &Arc<TaskCtx>,
-        tier: Tier,
-        mut req: GenerationRequest,
-        lines: bool,
-    ) -> Result<(Result<Value, String>, String), String> {
-        if !lines {
-            let v = self.gen_json(ctx, tier, req).await?;
-            let raw = v.to_string();
-            return Ok((Ok(v), raw));
-        }
-        req.json = false;
-        let text = self.generate_text(ctx, tier, req).await?;
-        let parsed = crate::planner::parse_line_plan(&text, &self.tools.names());
-        if let Err(e) = &parsed {
-            // what the model actually wrote is the only way to know what to fix
-            tracing::warn!(error = %e, reply = %tokens::truncate_tokens(&text, 300), "the planner's reply could not be read as a plan");
-        }
-        Ok((parsed, text))
-    }
-
     pub(crate) fn pick_tier(&self, mode: ExecMode) -> Option<Tier> {
-        let (first, second) = if mode == ExecMode::Escalated { (Tier::Strong, Tier::Slm) } else { (Tier::Slm, Tier::Strong) };
+        let (first, second) = if mode == ExecMode::Escalated { (Tier::Planner, Tier::Worker) } else { (Tier::Worker, Tier::Planner) };
         if self.models.has(first) {
             Some(first)
         } else if self.models.has(second) {
@@ -662,16 +642,23 @@ impl Inner {
 
     /// Who writes and revises plans: the external model whenever there is one; the self-hosted one only when there is no other.
     pub(crate) fn planner_tier(&self, mode: ExecMode) -> Option<Tier> {
-        if self.models.has(Tier::Strong) { Some(Tier::Strong) } else { self.pick_tier(mode) }
+        if self.models.has(Tier::Planner) { Some(Tier::Planner) } else { self.pick_tier(mode) }
     }
 
     /// Would reasoning in this mode go to the external (paid) model? Self-hosted models are free.
-    pub(crate) fn is_external(&self, mode: ExecMode) -> bool {
-        self.pick_tier(mode) == Some(Tier::Strong)
+    pub(crate) fn uses_planner(&self, mode: ExecMode) -> bool {
+        self.pick_tier(mode) == Some(Tier::Planner)
     }
 
     pub(crate) fn gen_request(&self, tier: Tier, system: &str, user: String, purpose: &str) -> GenerationRequest {
-        let max = if tier == Tier::Slm { self.cfg.slm.max_tokens } else { self.cfg.strong.max_tokens };
+        // The worker's output is billed: ordinary work (choosing arguments, short reasoning, answers) is held to a small limit; writing
+        // a file's content is the one thing allowed to run long.
+        let max = match (tier, purpose) {
+            (Tier::Planner, _) => self.cfg.planner.max_tokens,
+            (Tier::Worker, "content") => self.cfg.worker.content_max_tokens,
+            (Tier::Worker, "bind") => self.cfg.worker.max_tokens.min(400),
+            (Tier::Worker, _) => self.cfg.worker.max_tokens,
+        };
         GenerationRequest {
             system: system.into(),
             messages: vec![Message::user(user)],
@@ -682,6 +669,7 @@ impl Inner {
             purpose: purpose.into(),
             cache: false,
             schema: None,
+            schema_strict: false,
         }
     }
 

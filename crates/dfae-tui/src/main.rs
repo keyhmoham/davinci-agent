@@ -192,13 +192,13 @@ async fn ask(api: &Api, goal: String, mode: ModeRequest, auto: bool) -> i32 {
             if let Ok(t) = api.task(&id).await {
                 let s = t.ledger.summary();
                 eprintln!(
-                    "\n[{status}] mode={} verification={} · generative tokens {} vs ~{} naive ({:.0}% saved) · slm calls {} · decision calls {}",
+                    "\n[{status}] mode={} verification={} · generative tokens {} vs ~{} naive ({:.0}% saved) · worker calls {} · decision calls {}",
                     t.mode.map(|m| format!("{m:?}").to_lowercase()).unwrap_or_default(),
                     t.verification.as_ref().map(|v| format!("{:?}", v.status).to_lowercase()).unwrap_or_else(|| "n/a".into()),
                     s.generative_tokens,
                     s.baseline_tokens,
                     s.saved_pct,
-                    s.slm_calls + s.strong_calls,
+                    s.worker_calls + s.planner_calls,
                     s.decision_calls
                 );
             }

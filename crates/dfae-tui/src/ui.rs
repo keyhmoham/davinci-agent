@@ -463,7 +463,7 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 push(badge("approve", if *status == ApprovalStatus::Approved { OK } else { BAD }), format!("{status:?}").to_lowercase(), Style::new())
             }
             EventKind::Model { component, model, purpose, prompt_tokens, completion_tokens, latency_ms } => push(
-                badge(if *component == Component::Strong { "strong" } else { "slm" }, VIOLET),
+                badge(if *component == Component::Planner { "planner" } else { "worker" }, VIOLET),
                 format!("{purpose} · {model} · {prompt_tokens}→{completion_tokens} tok · {latency_ms}ms"),
                 Style::new().fg(DIM),
             ),
@@ -543,7 +543,7 @@ fn welcome() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(vec![Span::styled("  D ", Style::new().fg(OK).bold()), ds("direct    decision model + code + tools. No generative model.")]),
         Line::from(vec![Span::styled("  A ", Style::new().fg(WARN).bold()), ds("assisted  small language model plans / reasons / writes.")]),
-        Line::from(vec![Span::styled("  E ", Style::new().fg(VIOLET).bold()), ds("escalated stronger model, only when needed.")]),
+        Line::from(vec![Span::styled("  E ", Style::new().fg(VIOLET).bold()), ds("escalated planner model, only when needed.")]),
         Line::from(""),
         d("  Talk to it, or give it a job. Try:  hi · what is a mutex? · weather in Paris (searches the web)"),
         d("        what is 12 * (3 + 4)?"),
@@ -791,8 +791,8 @@ fn draw_cognition(f: &mut Frame, area: Rect, app: &App) {
             "external calls {}/{} · local calls {}/{} · tool calls {}/{} · replans {}/{}",
             d.usage.model_calls,
             d.budget.max_model_calls,
-            d.usage.local_calls,
-            d.budget.max_local_calls,
+            d.usage.worker_calls,
+            d.budget.max_worker_calls,
             d.usage.tool_calls,
             d.budget.max_tool_calls,
             d.usage.replans,
@@ -1043,25 +1043,25 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
     let max = s.baseline_tokens.max(s.generative_tokens).max(1);
     let lines = vec![
         bar("naive LLM agent (est.)", s.baseline_tokens, max, w, BAD),
-        bar("external LLM (paid)", s.strong_tokens, max, w, VIOLET),
-        bar("self-hosted SLM (free)", s.slm_tokens, max, w, WARN),
+        bar("external LLM (paid)", s.planner_tokens, max, w, VIOLET),
+        bar("self-hosted worker model (free)", s.worker_tokens, max, w, WARN),
         bar("self-hosted decision (free)", s.decision_tokens, max, w, ACCENT),
         Line::from(vec![
             label(" calls   "),
             Span::raw(format!(
-                "slm {} · strong {} · decision {} · extractor {} · cache hits {}",
-                s.slm_calls, s.strong_calls, s.decision_calls, s.gliner_calls, s.cache_hits
+                "worker {} · planner {} · decision {} · extractor {} · cache hits {}",
+                s.worker_calls, s.planner_calls, s.decision_calls, s.gliner_calls, s.cache_hits
             )),
         ]),
         Line::from(vec![
             label(" external "),
             Span::raw({
-                let by: Vec<String> = s.external_by_purpose.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                let by: Vec<String> = s.planner_by_purpose.iter().map(|(k, v)| format!("{k} {v}")).collect();
                 format!(
                     "{} tokens · {} from the provider's cache · {} effective · {}",
-                    s.external_tokens,
-                    s.external_cached_tokens,
-                    s.external_effective_tokens,
+                    s.planner_tokens,
+                    s.planner_cached_tokens,
+                    s.planner_effective_tokens,
                     if by.is_empty() { "—".to_string() } else { by.join(" · ") }
                 )
             }),
@@ -1099,8 +1099,8 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
                         Cell::from(Span::styled(
                             format!("{:?}", e.component).to_lowercase(),
                             Style::new().fg(match e.component {
-                                Component::Slm => WARN,
-                                Component::Strong => VIOLET,
+                                Component::Worker => WARN,
+                                Component::Planner => VIOLET,
                                 Component::Decision => ACCENT,
                                 Component::Gliner => OK,
                             }),
@@ -1144,10 +1144,10 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             label(" tokens "),
             Span::raw(format!(
-                "generative {} (slm {} / strong {}) · decision {} · naive baseline {}",
+                "generative {} (worker {} / planner {}) · decision {} · naive baseline {}",
                 fmt_tokens(t("generative_tokens")),
-                fmt_tokens(t("slm_tokens")),
-                fmt_tokens(t("strong_tokens")),
+                fmt_tokens(t("worker_tokens")),
+                fmt_tokens(t("planner_tokens")),
                 fmt_tokens(t("decision_tokens")),
                 fmt_tokens(t("baseline_tokens"))
             )),
@@ -1272,7 +1272,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let saved = app.stats.as_ref().map(|s| {
         (
             s["totals"]["saved_pct"].as_f64().unwrap_or(0.0),
-            s["totals"]["external_tokens"].as_u64().unwrap_or(0),
+            s["totals"]["planner_tokens"].as_u64().unwrap_or(0),
             s["totals"]["baseline_tokens"].as_u64().unwrap_or(0),
         )
     });
@@ -1447,7 +1447,7 @@ mod tests {
         }];
         app.detail = Some(rec);
         app.health = Some(
-            serde_json::json!({"components": [{"name": "memory", "status": "ok"}, {"name": "slm", "status": "off"}, {"name": "extractor", "status": "down"}]}),
+            serde_json::json!({"components": [{"name": "memory", "status": "ok"}, {"name": "worker", "status": "off"}, {"name": "extractor", "status": "down"}]}),
         );
         app.info = Some(
             serde_json::json!({"tools": [{"name": "fs_write", "risk": "moderate", "side_effects": true, "signature": "fs_write(path:str*, content:str*)"}]}),
