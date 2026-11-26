@@ -7,48 +7,6 @@ use dfae_core::*;
 use regex::Regex;
 use std::sync::Arc;
 
-#[cfg(test)]
-mod probe_tests {
-    use super::probe_url;
-    use std::time::Duration;
-
-    async fn serve(body: &'static str, status: u16) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = l.local_addr().unwrap();
-        tokio::spawn(async move {
-            while let Ok((mut s, _)) = l.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = s.read(&mut buf).await;
-                let reply = format!("HTTP/1.1 {status} X\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
-                let _ = s.write_all(reply.as_bytes()).await;
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    #[tokio::test]
-    async fn a_served_page_is_asked_for_what_it_says_and_a_wrong_one_says_what_it_shows_instead() {
-        let page = "<html><head><title>Create Next App</title></head><body><h1>To get started, edit the page</h1></body></html>";
-        let url = serve(page, 200).await;
-        let ok = probe_url(&url, Some("to get started"), Duration::from_secs(3)).await.unwrap();
-        assert!(ok.starts_with("HTTP 200 OK") || ok.starts_with("HTTP 200"), "{ok}");
-        // a name that is only in the title is not on the page
-        let titled =
-            serve("<html><head><title>Acme Analytics</title></head><body><h1>To get started</h1><script>var x=\"Acme Analytics\"</script></body></html>", 200)
-                .await;
-        assert!(probe_url(&titled, Some("Acme Analytics"), Duration::from_secs(1)).await.unwrap_err().contains("does not say"));
-        let err = probe_url(&url, Some("Acme Analytics"), Duration::from_secs(1)).await.unwrap_err();
-        assert!(
-            err.contains("does not say 'Acme Analytics'") && err.contains("title \"Create Next App\"") && err.contains("first heading \"To get started"),
-            "{err}"
-        );
-        assert!(probe_url(&serve("gone", 500).await, None, Duration::from_secs(1)).await.unwrap_err().contains("HTTP 500"));
-        assert!(probe_url("http://127.0.0.1:1", None, Duration::from_secs(1)).await.unwrap_err().contains("no answer"));
-        assert!(probe_url("https://example.com", None, Duration::from_secs(1)).await.unwrap_err().contains("not on this machine"));
-    }
-}
-
 /// Ask something the agent started on this machine whether it answers, waiting for it to come up (a dev server builds on its first
 /// request). `Ok(evidence)` when it answers 2xx and, if a text is wanted, the page has it; `Err(why)` says what was found instead — the
 /// title and first heading, which is what a planner needs to see that a scaffold's default page is being served.
@@ -252,5 +210,47 @@ impl Inner {
             VerificationStatus::Verified
         };
         VerificationResult { status, checks, failed_checks, unverified_claims: vec![], completion_confidence: completion }
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::probe_url;
+    use std::time::Duration;
+
+    async fn serve(body: &'static str, status: u16) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = s.read(&mut buf).await;
+                let reply = format!("HTTP/1.1 {status} X\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_served_page_is_asked_for_what_it_says_and_a_wrong_one_says_what_it_shows_instead() {
+        let page = "<html><head><title>Create Next App</title></head><body><h1>To get started, edit the page</h1></body></html>";
+        let url = serve(page, 200).await;
+        let ok = probe_url(&url, Some("to get started"), Duration::from_secs(3)).await.unwrap();
+        assert!(ok.starts_with("HTTP 200 OK") || ok.starts_with("HTTP 200"), "{ok}");
+        // a name that is only in the title is not on the page
+        let titled =
+            serve("<html><head><title>Acme Analytics</title></head><body><h1>To get started</h1><script>var x=\"Acme Analytics\"</script></body></html>", 200)
+                .await;
+        assert!(probe_url(&titled, Some("Acme Analytics"), Duration::from_secs(1)).await.unwrap_err().contains("does not say"));
+        let err = probe_url(&url, Some("Acme Analytics"), Duration::from_secs(1)).await.unwrap_err();
+        assert!(
+            err.contains("does not say 'Acme Analytics'") && err.contains("title \"Create Next App\"") && err.contains("first heading \"To get started"),
+            "{err}"
+        );
+        assert!(probe_url(&serve("gone", 500).await, None, Duration::from_secs(1)).await.unwrap_err().contains("HTTP 500"));
+        assert!(probe_url("http://127.0.0.1:1", None, Duration::from_secs(1)).await.unwrap_err().contains("no answer"));
+        assert!(probe_url("https://example.com", None, Duration::from_secs(1)).await.unwrap_err().contains("not on this machine"));
     }
 }
