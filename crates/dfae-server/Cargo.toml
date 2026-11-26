@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 dfae-core = { workspace = true }
 dfae-runtime = { workspace = true }
+dfae-mcp = { workspace = true }
 dfae-memory = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

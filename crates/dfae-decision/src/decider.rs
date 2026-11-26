@@ -145,6 +145,7 @@ impl Decider {
     // ------------------------------------------------------------ route ----
 
     pub async fn route_task(&self, state: DecisionState) -> Decided<Routing> {
+        let request = state.request.clone();
         let (r, record, entry) = self.decide(route_request(state)).await;
         let (tt, tconf) = r.choice("task_type").map(|(c, p)| (c.to_string(), p)).unwrap_or(("other".into(), 0.3));
         let (cscore, _) = r.score("complexity").unwrap_or((1.0, 0.5));
@@ -166,6 +167,9 @@ impl Decider {
         // an answer that depends on what the world looks like now has to be looked up: that is a task, not a conversation
         routing.fresh_data = yes("fresh_data");
         routing.needs_tools |= routing.fresh_data;
+        // the model's judgement, or a service named outright in a request that has something to do (not "what is GitHub?")
+        routing.external = yes("external_service") || (routing.needs_tools && crate::local::names_external_service(&request));
+        routing.needs_tools |= routing.external;
         routing.smalltalk = smalltalk;
         routing.role = role;
         routing.feedback = pick("feedback").filter(|c| c != "none");

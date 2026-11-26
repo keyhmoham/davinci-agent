@@ -111,6 +111,12 @@ services:
       # web search backends (optional; without them DuckDuckGo's HTML endpoint and Wikipedia are used)
       SEARXNG_URL: ${SEARXNG_URL:-}
       BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      # MCP: with a Glama key the agent finds, connects and uses MCP servers from the Glama directory when a request needs one
+      GLAMA_API_KEY: ${GLAMA_API_KEY:-}
+      GLAMA_BASE_URL: ${GLAMA_BASE_URL:-}
+      DFAE_MCP_AUTO: ${DFAE_MCP_AUTO:-}
+      DFAE_MCP_MAX_AUTO: ${DFAE_MCP_MAX_AUTO:-}
+      DFAE_MCP_TIMEOUT_SECS: ${DFAE_MCP_TIMEOUT_SECS:-}
       DFAE_API_TOKEN: ${DFAE_API_TOKEN:-}
       DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
       # never (default): no tool call waits for a human. ask: risky calls wait for approval in the TUI.

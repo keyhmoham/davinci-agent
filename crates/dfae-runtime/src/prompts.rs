@@ -145,3 +145,6 @@ pub fn bind_user(signature: &str, step: &str, entities: &str, prebound: &str, in
     }
     u
 }
+
+/// What to look for in a directory of MCP servers.
+pub const MCP_QUERY_SYSTEM: &str = "You turn a user's request into a short search query (2 to 5 words) for a directory of MCP servers, which are integrations with outside services and systems. Name the service or the capability, not the action: \"github issues\", \"slack messages\", \"postgres database\", \"google calendar\". Reply with the query only.";

@@ -493,6 +493,15 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                     ),
                 ]));
             }
+            EventKind::McpConnected { server, tools, source, listing } => push(
+                badge("mcp", ACCENT),
+                format!(
+                    "{server}: {} tool(s) from {source}{}",
+                    tools.len(),
+                    listing.as_ref().map(|l| format!(" · {l} · MCP data from Glama (https://glama.ai)")).unwrap_or_default()
+                ),
+                Style::new(),
+            ),
             EventKind::Warning { message } => push(badge("warn", WARN), message.clone(), Style::new().fg(WARN)),
         }
     }

@@ -46,7 +46,47 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     // models
     let models = ModelGateway::new(build_model(&config.worker), build_model(&config.planner));
 
-    let engine = Engine::new(EngineDeps { config, store, extractor, decider, models, tools: Arc::new(registry), policy });
+    // MCP: the operator's servers, and the directory to find more in
+    let mcp_cfg = config.mcp.clone();
+    let workspace = config.workspace.clone();
+    let registry = Arc::new(registry);
+    let hub = (mcp_cfg.servers_file.is_some() || mcp_cfg.discovery()).then(|| {
+        let glama = mcp_cfg.glama_api_key.as_deref().map(|k| dfae_mcp::Glama::new(&mcp_cfg.glama_base_url, k));
+        let state_path = mcp_cfg.state_path.clone().or_else(|| default_mcp_state(&workspace));
+        dfae_mcp::McpHub::new(
+            (*registry).clone(),
+            dfae_mcp::HubConfig {
+                call_timeout: std::time::Duration::from_secs(mcp_cfg.call_timeout_secs),
+                max_auto: mcp_cfg.max_auto,
+                keys: dfae_mcp::HubConfig::keys_from_env(),
+                state_path,
+                ..Default::default()
+            },
+            glama,
+        )
+    });
+    let engine = Engine::new(EngineDeps { config, store, extractor, decider, models, tools: registry, policy });
+    if let Some(hub) = hub {
+        if let Some(file) = &mcp_cfg.servers_file {
+            let text = std::fs::read_to_string(file).map_err(|e| format!("reading DFAE_MCP_SERVERS {}: {e}", file.display()))?;
+            let n = hub.load_config(&text).map_err(|e| format!("DFAE_MCP_SERVERS {}: {e}", file.display()))?;
+            tracing::info!("{n} MCP server(s) from {}", file.display());
+        }
+        if mcp_cfg.discovery() {
+            hub.restore();
+            tracing::info!("MCP discovery on: servers are found in the Glama directory when a request needs one");
+        }
+        engine.set_mcp(hub);
+    }
     engine.restore().await;
     Ok(engine)
+}
+
+/// Servers found in the directory are remembered outside the workspace (the agent works in it, and must not be able to add servers
+/// by writing a file): `$XDG_DATA_HOME/dfae/mcp.json`, else `~/.local/share/dfae/mcp.json`.
+fn default_mcp_state(_workspace: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("dfae/mcp.json"))
 }

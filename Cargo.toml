@@ -7,6 +7,7 @@ members = [
   "crates/dfae-models",
   "crates/dfae-memory",
   "crates/dfae-tools",
+  "crates/dfae-mcp",
   "crates/dfae-runtime",
   "crates/dfae-server",
   "crates/dfae-tui",
@@ -25,6 +26,7 @@ dfae-extract = { path = "crates/dfae-extract" }
 dfae-models = { path = "crates/dfae-models" }
 dfae-memory = { path = "crates/dfae-memory" }
 dfae-tools = { path = "crates/dfae-tools" }
+dfae-mcp = { path = "crates/dfae-mcp" }
 dfae-runtime = { path = "crates/dfae-runtime" }
 
 tokio = { version = "1", features = ["full"] }

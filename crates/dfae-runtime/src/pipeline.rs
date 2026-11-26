@@ -93,7 +93,11 @@ impl Inner {
         // ---- 3. route -------------------------------------------------------
         let mut state = self.decision_state(&goal, &entities);
         state.recent = ctx.base_ctx.lock().turns.iter().map(|(q, a)| format!("user: {q} → assistant: {a}")).collect();
-        let routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
+        let mut routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
+        // a request about an outside service may be served by an MCP server: attach the ones that fit (finding them if need be)
+        if ctx.depth == 0 && !is_member && self.stage_mcp(ctx, &goal, &routing).await {
+            routing.needs_tools = true;
+        }
         ctx.rec.lock().await.route = Some(routing.clone());
         if self.cfg.economy_shadow_on() && !is_member && crate::shadow::sampled(&ctx.id, self.cfg.shadow_eval) {
             self.shadow_evaluate(ctx, &state, &routing).await;

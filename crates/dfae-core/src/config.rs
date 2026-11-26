@@ -164,6 +164,7 @@ impl TeamConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    pub mcp: McpConfig,
     pub bind: String,
     #[serde(skip_serializing)]
     pub api_token: Option<String>,
@@ -193,6 +194,33 @@ pub struct Config {
     pub log_json: bool,
 }
 
+/// MCP (Model Context Protocol) servers as tools, and the directory they are found in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpConfig {
+    /// `GLAMA_API_KEY`: the key of the Glama MCP directory. With it, the engine finds, connects and uses servers on demand.
+    #[serde(skip_serializing)]
+    pub glama_api_key: Option<String>,
+    /// `GLAMA_BASE_URL` (default `https://glama.ai/api/mcp`).
+    pub glama_base_url: String,
+    /// `DFAE_MCP_AUTO` (default on): find servers in the directory when a request needs one. Only used with a key.
+    pub auto: bool,
+    /// `DFAE_MCP_MAX_AUTO` (default 2): servers added from the directory for one request.
+    pub max_auto: usize,
+    /// `DFAE_MCP_SERVERS`: a JSON file in the usual `{"mcpServers": {...}}` shape (stdio commands and remote URLs) of servers the
+    /// operator wants. Only the operator's own file can start a local command.
+    pub servers_file: Option<PathBuf>,
+    /// `DFAE_MCP_STATE`: where servers found in the directory are remembered between runs (default: `<workspace>/.dfae/mcp.json`).
+    pub state_path: Option<PathBuf>,
+    /// `DFAE_MCP_TIMEOUT_SECS` (default 60): one tool call.
+    pub call_timeout_secs: u64,
+}
+
+impl McpConfig {
+    pub fn discovery(&self) -> bool {
+        self.auto && self.glama_api_key.is_some()
+    }
+}
+
 /// `researcher=4,operator=1` -> map. Malformed entries are ignored.
 fn parse_slots(s: &str) -> std::collections::BTreeMap<String, usize> {
     s.split(',').filter_map(|kv| kv.split_once('=')).filter_map(|(k, v)| v.trim().parse::<usize>().ok().map(|n| (k.trim().to_string(), n))).collect()
@@ -214,6 +242,15 @@ impl Config {
             }
         }
         Self {
+            mcp: McpConfig {
+                glama_api_key: env("GLAMA_API_KEY"),
+                glama_base_url: env_or("GLAMA_BASE_URL", "https://glama.ai/api/mcp").trim_end_matches('/').to_string(),
+                auto: env_bool("DFAE_MCP_AUTO", true),
+                max_auto: env_parse("DFAE_MCP_MAX_AUTO", 2usize).clamp(1, 5),
+                servers_file: env("DFAE_MCP_SERVERS").map(PathBuf::from),
+                state_path: env("DFAE_MCP_STATE").map(PathBuf::from),
+                call_timeout_secs: env_parse("DFAE_MCP_TIMEOUT_SECS", 60u64).clamp(5, 600),
+            },
             bind: env_or("DFAE_BIND", "0.0.0.0:8080"),
             api_token: env("DFAE_API_TOKEN"),
             allow_auto_approve: env_bool("DFAE_ALLOW_AUTO_APPROVE", false),
@@ -289,6 +326,8 @@ impl Default for Config {
         c.worker.provider = "none".into();
         c.planner.provider = "none".into();
         c.api_token = None;
+        c.mcp.glama_api_key = None;
+        c.mcp.servers_file = None;
         c
     }
 }

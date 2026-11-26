@@ -434,6 +434,10 @@ pub struct Routing {
     /// The answer depends on information that changes (a price, the weather, news): it has to be looked up, never answered from memory.
     #[serde(default)]
     pub fresh_data: bool,
+    /// The request is about a specific outside service or system (GitHub, Slack, Notion, a database, a map, a calendar...) that files,
+    /// shell, calculator and plain web tools cannot serve: an MCP server may.
+    #[serde(default)]
+    pub external: bool,
     /// What the message says about the previous reply: `negative` ("that's wrong", "try again") or `positive`.
     #[serde(default)]
     pub feedback: Option<String>,
@@ -452,6 +456,7 @@ impl Routing {
             smalltalk: None,
             role: None,
             fresh_data: false,
+            external: false,
             feedback: None,
         }
     }

@@ -30,6 +30,9 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/tools", get(tools))
         .route("/v1/dispatch", get(dispatch))
         .route("/v1/cost", get(cost))
+        .route("/v1/mcp/servers", get(mcp_servers).post(mcp_add))
+        .route("/v1/mcp/servers/{name}", axum::routing::delete(mcp_remove))
+        .route("/v1/mcp/search", get(mcp_search))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
@@ -117,6 +120,48 @@ async fn dispatch(State(s): State<AppState>) -> Json<dfae_runtime::DispatchSnaps
 
 async fn tools(State(s): State<AppState>) -> Json<Vec<ToolMetadata>> {
     Json(s.engine.tools())
+}
+
+// MCP servers: what is connected, what the directory has, and adding and removing by hand.
+
+async fn mcp_servers(State(s): State<AppState>) -> Json<Value> {
+    match s.engine.mcp() {
+        Some(h) => Json(json!({"servers": h.servers(), "discovery": h.discovery_enabled(), "credit": dfae_mcp::CREDIT})),
+        None => Json(json!({"servers": [], "discovery": false})),
+    }
+}
+
+#[derive(Deserialize)]
+struct McpSearchQ {
+    q: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn mcp_search(State(s): State<AppState>, Query(q): Query<McpSearchQ>) -> ApiResult<Value> {
+    let hub = s.engine.mcp().ok_or_else(|| err(StatusCode::NOT_FOUND, "MCP is not configured"))?;
+    let found = hub.search(&q.q, q.limit.unwrap_or(10).min(50)).await.map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    let results: Vec<Value> = found.iter().map(|c| json!({"connector": c, "usable": c.open()})).collect();
+    Ok(Json(json!({"results": results, "credit": dfae_mcp::CREDIT})))
+}
+
+#[derive(Deserialize)]
+struct McpAdd {
+    name: String,
+    url: String,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+}
+
+async fn mcp_add(State(s): State<AppState>, Json(a): Json<McpAdd>) -> ApiResult<Value> {
+    s.engine.mcp_add_remote(&a.name, &a.url, a.headers).await.map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    let hub = s.engine.mcp().ok_or_else(|| err(StatusCode::NOT_FOUND, "MCP is not configured"))?;
+    Ok(Json(json!(hub.server(&dfae_mcp::server_name(&a.name)))))
+}
+
+async fn mcp_remove(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
+    let hub = s.engine.mcp().ok_or_else(|| err(StatusCode::NOT_FOUND, "MCP is not configured"))?;
+    if hub.remove(&name).await { Ok(Json(json!({"removed": name}))) } else { Err(err(StatusCode::NOT_FOUND, format!("no MCP server '{name}'"))) }
 }
 
 #[derive(Serialize)]

@@ -12,6 +12,7 @@ pub mod economy;
 mod engine;
 mod executor;
 mod implement;
+mod mcp;
 mod pipeline;
 pub mod plandoc;
 pub mod planner;

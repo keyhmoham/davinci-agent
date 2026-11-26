@@ -179,6 +179,7 @@ that against splits justified only by parallelism. The TUI **Team** view shows a
 | `dfae-models` | OpenAI-compatible and Anthropic providers, tier gateway, JSON extraction + one repair retry |
 | `dfae-memory` | hash embedder · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
 | `dfae-tools` | registry · **policy engine** · 11 native tools · direct binder · calculator |
+| `dfae-mcp` | MCP client (Streamable HTTP and stdio) · the hub that turns servers' tools into engine tools · **Glama directory** search and on-demand connection |
 | `dfae-runtime` | pipeline, planner/validator, DAG executor, approvals, recovery/replan, verification, skills, resume · **team: decomposer, roles, dispatcher, subagent supervision** |
 | `dfae-server` | REST + SSE API, bearer auth, Prometheus metrics |
 | `dfae-tui` | the `dfae` terminal client (also `dfae --ask "…"`) |
@@ -277,6 +278,34 @@ Simple phrasings of the file operations bind directly and cost no model tokens (
 `replace "foo()" with "bar()" in src/lib.rs`, `find files matching **/*.rs`, ``run `cargo test` ``). The container image ships git, ripgrep, curl, jq, make, gcc, python3 and friends
 (`DEV_TOOLS=0` builds it without them); its root is read-only, so use a virtualenv or project-local installs in the workspace.
 
+### MCP servers: found and used on demand
+
+Set `GLAMA_API_KEY` (a key from [glama.ai/settings/api-keys](https://glama.ai/settings/api-keys)) and nothing else. When a request is about an
+outside service — GitHub, DeepWiki, Notion, a database, a calendar — the decision model says so (`external_service`; a service named outright
+in a request that has something to do counts too, and so does saying "MCP"). The engine then:
+
+1. looks at the servers it already has (the registry: connected earlier in this run, reopened from the previous one, or configured) and uses the
+   ones whose tools fit the request;
+2. if none does, has the worker model write a **2–5 word search query** (the only thing the directory hears of the request), searches the
+   [Glama MCP directory](https://glama.ai/mcp/reference) for remote servers, and connects the best ones that can be used as they are —
+   streamable HTTP, no login, not deprecated, not reported down. OAuth servers are skipped; one that wants an API key is used when
+   `DFAE_MCP_KEY_<SLUG>` is set;
+3. registers their tools as `mcp__<server>__<tool>` (the JSON Schema becomes typed parameters; objects and arrays are written as JSON text and
+   parsed before the call) and **attaches them to that task only** — the planner's catalogue for an unrelated request never lists them;
+4. the planner plans with them, the worker binds their arguments, and a tool call is a normal step (retried, verified, re-planned).
+
+A dropped connection is reopened once and the call repeated; a server that is down is not retried for a minute; a search that found nothing
+is not repeated for ten. Servers from the directory ask for approval (`DFAE_APPROVALS=ask`) before any tool that is not read-only;
+the output of every MCP tool is scanned for prompt injection like any other. Servers found are remembered in
+`~/.local/share/dfae/mcp.json` (outside the workspace, so the agent cannot add servers by writing a file) and reopened at start.
+
+Your own servers go in a file in the usual shape (`DFAE_MCP_SERVERS=/etc/dfae/mcp.json`):
+`{"mcpServers": {"files": {"command": "npx", "args": ["-y", "…"], "env": {"TOKEN": "${TOKEN}"}}, "docs": {"url": "https://…/mcp", "headers": {"Authorization": "Bearer ${DOCS_KEY}"}, "always": true}}}`.
+Only that file can start a local command (a stdio server gets a bare environment plus its own `env`, not the engine's keys); `always: true` offers
+a server's tools to every task. `GET /v1/mcp/servers` lists what is connected, `GET /v1/mcp/search?q=…` searches the directory,
+`POST /v1/mcp/servers {"name","url","headers"}` adds a public remote server by hand and `DELETE /v1/mcp/servers/{name}` removes one.
+Glama's data licence asks for credit and a link to each server's listing: events and API answers carry both ("MCP data from Glama").
+
 ### Answers
 
 Answers are terse by design: the final answer gives only the information asked for — no preamble, no recap of steps, no offers of help,
@@ -315,6 +344,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `PLANNER_API_KEY` / `PLANNER_MODEL` / `PLANNER_PROVIDER` / `PLANNER_BASE_URL` | the planner model (default `gpt-6-luna`; provider `openai` = any OpenAI-compatible endpoint, default base URL `https://ai-gateway.vercel.sh/v1`; or `anthropic`) |
 | `WORKER_API_KEY` / `WORKER_MODEL` / `WORKER_PROVIDER` / `WORKER_BASE_URL` | the worker model, configured exactly like the planner (default `glm-5.3-flash`; with no key of its own it uses the planner's when they share a base URL) |
 | `PLANNER_MAX_TOKENS` / `WORKER_MAX_TOKENS` / `WORKER_CONTENT_MAX_TOKENS` | output limits: a plan; ordinary worker work (800); a file's content (16000) |
+| `GLAMA_API_KEY` | turns on MCP discovery (see *MCP servers*); `DFAE_MCP_AUTO=off`, `DFAE_MCP_MAX_AUTO`, `DFAE_MCP_TIMEOUT_SECS`, `DFAE_MCP_STATE`, `DFAE_MCP_KEY_<SLUG>`, `DFAE_MCP_SERVERS` tune it |
 | `PLANNER_REASONING` / `WORKER_REASONING` | thinking effort of a hosted model: `off`, `low`, `medium`, `high` (planner default `low`, worker `off`: hidden thinking is billed and eats the output limit; a gateway that rejects the field is asked without it from then on) |
 | `*_TIMEOUT_SECS`, `PLANNER_PROMPT_CACHE` | request timeouts; declare that an OpenAI-compatible endpoint caches repeated prompt prefixes (Anthropic and `api.openai.com` are known to) |
 | `DFAE_API_TOKEN` | bearer token for the API |
