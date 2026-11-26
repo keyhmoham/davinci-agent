@@ -93,6 +93,10 @@ fn bind_clause(metas: &[ToolMetadata], clause: &str, entities: &[Entity]) -> Opt
         for (idx, pat) in m.direct_patterns.iter().enumerate() {
             let Some(re) = regex(pat) else { continue };
             let Some(caps) = re.captures(clause) else { continue };
+            // "run `a.py` using `.venv/bin/python a.py`": two commands in one sentence, and the first is not the one to run
+            if m.name == "shell" && clause.matches('`').count() >= 4 {
+                continue;
+            }
             let mut args = Map::new();
             let (mut explicit, mut defaulted, mut ok) = (0u32, 0u32, true);
             // texts already bound to a parameter are not offered to another one (a quoted file name is not the content)
@@ -195,6 +199,12 @@ mod tests {
 
     fn ent(label: &str, text: &str) -> Entity {
         Entity { label: label.into(), text: text.into(), start: None, end: None, score: 1.0, source: "t".into() }
+    }
+
+    #[test]
+    fn a_sentence_with_two_commands_is_not_bound_to_the_first() {
+        assert!(bind("run `fetch.py` using `.venv/bin/python fetch.py`").is_none(), "which one is the command is for a model to say");
+        assert_eq!(one("run `cargo test`").1, json!({"command": "cargo test"}));
     }
 
     #[test]

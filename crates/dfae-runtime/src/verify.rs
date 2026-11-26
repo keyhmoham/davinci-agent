@@ -19,8 +19,8 @@ impl Inner {
                 Err(e) => (false, format!("bad pattern: {e}")),
             },
             Check::ExitOk => (true, "tool reported success".into()),
-            Check::FileExists { path } => match self.policy.guard().read_path(path) {
-                Ok(p) => (p.exists(), format!("{}", p.display())),
+            Check::FileExists { path } => match self.policy.guard().exists(path) {
+                Ok(found) => (found, path.clone()),
                 Err(e) => (false, e.message),
             },
             Check::FileContains { path, value } => match self.policy.guard().read_path(path) {

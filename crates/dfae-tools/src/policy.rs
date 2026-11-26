@@ -54,6 +54,15 @@ pub struct ShellPolicy {
     pub denied_args: std::collections::BTreeMap<String, Vec<String>>,
     pub timeout_secs: u64,
     pub max_output_bytes: usize,
+    /// (sandbox mode) Where the agent installs what a task needs — packages, programs, downloaded binaries. It lives in the
+    /// workspace so installs outlive the container; `{workspace}` expands.
+    pub tools_dir: String,
+    /// (sandbox mode) Default `timeout_secs` of a command, and of one that installs or builds (pip, npm, cargo, apt, make, git clone…).
+    pub default_timeout_secs: u64,
+    pub install_timeout_secs: u64,
+    /// (sandbox mode) Variables of the engine's own environment that commands inherit: proxies and certificate bundles, so installs work
+    /// behind them. Keys and tokens are never on this list.
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +124,35 @@ impl Default for ShellPolicy {
             .collect(),
             timeout_secs: 10,
             max_output_bytes: 64 * 1024,
+            tools_dir: "{workspace}/.tools".into(),
+            default_timeout_secs: 120,
+            install_timeout_secs: 600,
+            env_passthrough: [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+                "all_proxy",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+                "GIT_SSL_CAINFO",
+                "NODE_EXTRA_CA_CERTS",
+                "PIP_INDEX_URL",
+                "PIP_EXTRA_INDEX_URL",
+                "PIP_TRUSTED_HOST",
+                "NPM_CONFIG_REGISTRY",
+                "GOPROXY",
+                "GOSUMDB",
+                "TZ",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         }
     }
 }
@@ -458,6 +496,20 @@ impl PathGuard {
         self.resolve(raw, &self.read_roots, "read")
     }
 
+    /// Does `raw` exist, as an entry of the workspace? A symbolic link counts as existing without following it: a virtualenv's
+    /// `.venv/bin/python` points at the system's python, outside the roots, and is still there.
+    pub fn exists(&self, raw: &str) -> Result<bool, ToolError> {
+        let joined = if Path::new(raw).is_absolute() { PathBuf::from(raw) } else { self.workspace.join(raw) };
+        let norm = normalize(&joined);
+        let (Some(parent), Some(name)) = (norm.parent(), norm.file_name()) else { return self.read_path(raw).map(|p| p.exists()) };
+        // the directory that holds it is resolved and must be inside the roots; the entry itself is not followed
+        let real_parent = self.resolve(&parent.to_string_lossy(), &self.read_roots, "read")?;
+        if self.deny_names.iter().any(|d| name.to_string_lossy() == d.as_str()) {
+            return Err(ToolError::policy(format!("access to '{}' is not permitted", name.to_string_lossy())));
+        }
+        Ok(std::fs::symlink_metadata(real_parent.join(name)).is_ok())
+    }
+
     pub fn write_path(&self, raw: &str) -> Result<PathBuf, ToolError> {
         if raw.trim().is_empty() {
             return Err(ToolError::args("empty path"));
@@ -469,6 +521,20 @@ impl PathGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_program_outside_the_workspace_still_exists_there() {
+        let (p, d) = engine();
+        std::fs::create_dir_all(d.path().join(".venv/bin")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", d.path().join(".venv/bin/python")).unwrap();
+        let g = p.guard();
+        assert!(g.read_path(".venv/bin/python").is_err(), "reading through the link leaves the workspace");
+        assert!(g.exists(".venv/bin/python").unwrap());
+        assert!(!g.exists(".venv/bin/python3").unwrap());
+        assert!(g.exists("../outside").is_err() && g.exists("/etc/passwd").is_err(), "a path outside the roots is still refused");
+        assert!(g.exists(".git").is_err(), "protected names stay protected");
+    }
 
     fn engine() -> (PolicyEngine, tempfile::TempDir) {
         let d = tempfile::tempdir().unwrap();

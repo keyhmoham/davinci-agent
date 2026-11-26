@@ -100,6 +100,21 @@ fn bind_view(meta: &ToolMetadata, step_text: &str) -> ToolMetadata {
     m
 }
 
+/// The directory of the workspace a shell step says it runs in ("…in proj", "inside the folder site", "cwd app"), unless the command
+/// already goes there itself (`cd`, `-C`, a path through it).
+pub(crate) fn directory_named(step: &str, command: &str, workspace: &std::path::Path) -> Option<String> {
+    static IN_DIR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\b(?:in|inside|within|under|into|from|cwd|directory|folder|dir)\s+(?:the\s+|a\s+|an\s+)?(?:(?:directory|folder|dir|repo|repository|project)\s+)?[`"']?([A-Za-z0-9_][A-Za-z0-9_./-]*)[`"']?"#).unwrap()
+    });
+    if command.trim_start().starts_with("cd ") || command.contains(" cd ") || command.contains("&& cd") {
+        return None;
+    }
+    IN_DIR
+        .captures_iter(step)
+        .map(|c| c[1].trim_end_matches(['.', '/']).to_string())
+        .find(|d| !d.is_empty() && !d.starts_with("..") && workspace.join(d).is_dir() && !command.contains(d.as_str()))
+}
+
 /// Some models end a reply with their own tool-call syntax (`</arg_value><arg_key>path</arg_key>…</tool_call>`): it is never part
 /// of a file or an argument.
 pub(crate) fn strip_tool_markup(text: &str) -> String {
@@ -263,7 +278,10 @@ impl Inner {
             step.description.clone()
         };
         let user = prompts::bind_user(&sig, &step_text, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
-        let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
+        // what binds a shell command is told what the shell is, and that it may install (other tools need no such words)
+        let system =
+            if meta.name == "shell" { format!("{}\n{}", prompts::BIND_SYSTEM, self.shell_environment(true)) } else { prompts::BIND_SYSTEM.to_string() };
+        let mut req = self.gen_request(tier, &system, user, "bind");
         req.json = true;
         req.temperature = temperature;
         // a self-hosted server can be told the exact shape: wrong parameter names and types become impossible
@@ -556,6 +574,15 @@ impl Inner {
             }
         }
 
+        // "…in proj": a command that does not say where it runs, for a step that names a directory that exists, runs there
+        if tool == "shell" && args.get("cwd").is_none() && meta.params.iter().any(|p| p.name == "cwd") {
+            let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            if let Some(dir) = directory_named(&step.description, command, self.policy.workspace()) {
+                args.insert("cwd".into(), Value::String(dir));
+                how.push("rules");
+            }
+        }
+
         // A server never returns: run in the foreground it holds the step until its timeout. The planner's sentence ("in the background") and
         // the command itself say so; a small model forgets to set the flag.
         if tool == "shell" && args.get("background").is_none() && meta.params.iter().any(|p| p.name == "background") {
@@ -704,6 +731,20 @@ mod content_tests {
         assert_eq!(names(&bind_view(&shell, "serve it on port 8001")), ["command", "cwd"], "a port is not a timeout");
         assert_eq!(names(&bind_view(&shell, "run the tests with a timeout of 300 seconds")), ["command", "cwd", "timeout_secs"]);
         assert_eq!(names(&bind_view(&shell, "run it in the background")), ["command", "cwd", "background"]);
+    }
+
+    #[test]
+    fn a_shell_step_that_names_a_directory_runs_in_it() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("proj/src")).unwrap();
+        let d = |step: &str, cmd: &str| super::directory_named(step, cmd, ws.path());
+        assert_eq!(d("show the Git log in proj using git log", "git log").as_deref(), Some("proj"));
+        assert_eq!(d("run the tests inside the folder `proj`", "pytest").as_deref(), Some("proj"));
+        assert_eq!(d("compile with cwd proj/src", "make").as_deref(), Some("proj/src"));
+        assert_eq!(d("show the log in proj", "cd proj && git log"), None, "it goes there itself");
+        assert_eq!(d("show the log in proj", "git -C proj log"), None);
+        assert_eq!(d("run in the workspace root", "ls"), None);
+        assert_eq!(d("list files in nowhere", "ls"), None, "a directory that is not there is no cwd");
     }
 
     #[test]

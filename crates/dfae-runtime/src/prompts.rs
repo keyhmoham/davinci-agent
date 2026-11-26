@@ -67,11 +67,13 @@ Re-plan example (s3, which starts the server with cwd site, failed because the d
 
 /// The planner's system prompt: rules, the whole tool catalogue (always — the planner must see every tool), and, when the prompt is
 /// cacheable, worked examples. One prompt serves planning and re-planning.
-pub fn brief_system(report: bool, catalog: &str, examples: bool) -> String {
+pub fn brief_system(report: bool, environment: &str, catalog: &str, examples: bool) -> String {
     let mut s = BRIEF_RULES.to_string();
     if report {
         s.push_str(BRIEF_REPORT);
     }
+    s.push_str("\n\n");
+    s.push_str(environment);
     s.push_str("\n\nTOOLS (every tool there is):\n");
     s.push_str(catalog);
     if examples {
@@ -148,3 +150,14 @@ pub fn bind_user(signature: &str, step: &str, entities: &str, prebound: &str, in
 
 /// What to look for in a directory of MCP servers.
 pub const MCP_QUERY_SYSTEM: &str = "You turn a user's request into a short search query (2 to 5 words) for a directory of MCP servers, which are integrations with outside services and systems. Name the service or the capability, not the action: \"github issues\", \"slack messages\", \"postgres database\", \"google calendar\". Reply with the query only.";
+
+/// Where the shell runs and what the agent may do in it. Said to every model that decides what to run, because a model that is not told
+/// it may install things refuses, or asks the user to.
+pub const ENV_SANDBOX: &str = r#"ENVIRONMENT: the shell is a sandboxed Linux container that you fully control, as an unprivileged user with network access. You ARE ALLOWED to install any tool, library or program a task needs, and you must: never refuse, never say a tool is unavailable without having tried to install it, never ask the user to install or run something, never settle for less than the task asks. Installs are user-space and persist; installed programs are on PATH in every command: `pip install <package>` (or `python3 -m venv .venv` for a project), `npm install -g <package>` / `npx -y <package>`, `cargo install <crate>`, `go install <module>@latest`, `dfae-apt <debian-package>` for system packages (ffmpeg, imagemagick, sqlite3, ...), or a release binary fetched with curl into $DFAE_TOOLS/bin. Never use sudo or apt-get. A missing tool is a step of the plan: install it first (one shell step may chain dependent commands with &&; an install or build takes minutes), then use it. Commands run without a terminal: pass -y/--yes, no editors, no prompts. Every shell call is a fresh bash: cd and exports do not carry over, so use the step's cwd, or `cd dir && command` in one command. When a command fails, read its error, fix the cause (install what is missing, fix the argument, try the other tool) and run it again before giving up."#;
+
+/// The same, for a model that only binds one command.
+pub const ENV_SANDBOX_SHORT: &str = "The shell is a sandboxed Linux container you fully control: you may install anything the task needs (pip install, npm install -g, cargo install, go install, dfae-apt <debian-package>, or curl a binary into $DFAE_TOOLS/bin); never use sudo or apt-get. No terminal: pass -y/--yes, no prompts. Every call is a fresh bash: use `cd dir && command` or the cwd parameter. Chain dependent commands with &&; an install takes minutes (timeout_secs 600).";
+
+pub const ENV_RESTRICTED: &str = r#"ENVIRONMENT: the shell only runs a short list of read-only commands (ls, cat, grep, df, ps, ...), one at a time, with no pipes or redirects, and nothing can be installed. Plan what these allow; when the task needs more, do the part that is possible and say in one line that the operator must enable the sandbox shell (shell.mode = "sandbox" in the policy file, inside the container) for the rest."#;
+
+pub const ENV_RESTRICTED_SHORT: &str = "The shell runs only one allowlisted read-only command at a time (no pipes, redirects or installs).";

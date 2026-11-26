@@ -858,7 +858,7 @@ impl Inner {
         // the whole catalogue is always in the system prompt; with a provider that caches prompts and traffic that keeps the cache
         // warm, the worked examples ride along too and the prompt is marked cacheable
         let cached = self.prefix_enabled();
-        let system = prompts::brief_system(eco.plan_report, &self.tools.catalog_lines(&names), cached);
+        let system = prompts::brief_system(eco.plan_report, self.shell_environment(false), &self.tools.catalog_lines(&names), cached);
         let user = match replan {
             None => prompts::plan_request(ctx_text, max_steps),
             Some((state, problem, prefix)) => prompts::patch_request(ctx_text, state, problem, prefix, max_steps),

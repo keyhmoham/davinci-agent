@@ -12,6 +12,7 @@ mod native;
 mod policy;
 mod registry;
 mod sandbox;
+mod toolbox;
 mod web;
 
 pub use binder::{DirectCall, bind_direct};

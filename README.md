@@ -274,6 +274,29 @@ messages say how to fix the call, and tools that belong together are offered tog
 | `shell_output` · `shell_kill` | read new output of / stop a background job |
 | `http_get` · `web_search` | the web (see above) |
 
+#### The shell is a sandbox the agent may install into
+
+In sandbox mode (`shell.mode = "sandbox"`, what the container image ships) every model that decides what to run is told, in so many words, that it
+is in a sandbox it fully controls and **may install whatever a task needs — and must, rather than refuse or ask the user to**. As an
+unprivileged user in a read-only container, "install" means user-space installs into a *toolbox* (`{workspace}/.tools`, so it survives restarts)
+that is on `PATH` in every command:
+
+| Need | How |
+|---|---|
+| Python packages | `pip install x` (user installs; `python3 -m venv .venv` for a project) |
+| Node | `npm install -g x`, `npx -y x` |
+| Rust · Go | `cargo install x` · `go install x@latest` (a toolchain itself: `curl` the official installer into the toolbox) |
+| System packages | `dfae-apt <debian-package>` (apt downloads, `dpkg -x` unpacks into the toolbox; no root; `update-alternatives` links are made) |
+| Anything else | a release binary fetched with `curl` into `$DFAE_TOOLS/bin` |
+
+Commands run the way an agent needs them to: no terminal (nothing prompts; `DEBIAN_FRONTEND`, `GIT_TERMINAL_PROMPT`, `npm_config_yes` are set),
+git has an identity and `main` as its default branch, proxies and certificate bundles are passed through (`env_passthrough`; the engine's keys
+never are), stderr is merged into the output in the order it was written, colour codes and progress bars are cleaned up, a long log keeps its
+start and its end, and a command that installs or builds gets 10 minutes instead of 2. A command that times out is killed *with everything it
+started* and what it printed is kept. A failure explains itself: `command not found`, a missing Python or Node module, or a read-only system path
+comes with a one-line hint that says what to install. A step that names a directory ("… in proj") runs in it. Without sandbox mode the models are
+told the truth instead: one allowlisted read-only command at a time, nothing installable.
+
 Simple phrasings of the file operations bind directly and cost no model tokens (`move a.txt to b/a.txt`, `delete notes/old.txt`,
 `replace "foo()" with "bar()" in src/lib.rs`, `find files matching **/*.rs`, ``run `cargo test` ``). The container image ships git, ripgrep, curl, jq, make, gcc, python3 and friends
 (`DEV_TOOLS=0` builds it without them); its root is read-only, so use a virtualenv or project-local installs in the workspace.

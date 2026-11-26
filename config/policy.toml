@@ -29,6 +29,14 @@ approval = ["mkdir", "touch", "cp", "mv"]
 path_checked = ["cat", "head", "tail", "wc", "grep", "find", "ls", "stat", "du", "sort", "diff", "cut", "tr"]
 timeout_secs = 10
 max_output_bytes = 65536
+# (sandbox mode) Where the agent installs what a task needs — pip, npm -g, cargo, go, `dfae-apt <debian-package>`, downloaded binaries.
+# It is on PATH in every command and, being in the workspace, survives restarts. Nothing outside it is touched.
+tools_dir = "{workspace}/.tools"
+# default timeout of a command, and of one that installs or builds (pip, npm, cargo, apt, make, git clone, ...)
+default_timeout_secs = 120
+install_timeout_secs = 600
+# variables of the engine's environment that commands inherit, so installs work behind a proxy (keys and tokens never do)
+# env_passthrough = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "PIP_INDEX_URL", "NPM_CONFIG_REGISTRY"]
 
 # per-command arguments that would make a read-only command write or execute
 [shell.denied_args]

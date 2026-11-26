@@ -522,7 +522,8 @@ impl Inner {
             all.iter().skip(all.len().saturating_sub(keep)).map(|(q, a)| (tokens::truncate_tokens(q, q_tok), tokens::truncate_tokens(a, a_tok))).collect();
         let gap = if step.description.contains("no tool fits") { "NOTE: no tool fits this request\n" } else { "" };
         let user = format!("CAN: {can}\n{gap}{goal}");
-        let mut req = self.gen_request(tier, prompts::CHAT_SYSTEM, user, "chat");
+        let chat_system = format!("{}\n{}", prompts::CHAT_SYSTEM, self.shell_environment(true));
+        let mut req = self.gen_request(tier, &chat_system, user, "chat");
         req.temperature = 0.6;
         let current = req.messages.pop();
         for (q, a) in turns {
@@ -540,7 +541,7 @@ impl Inner {
             // the planner model cannot be reached: the self-hosted one answers instead of the user getting an error
             Err(e) if paid && self.models.has(Tier::Worker) && e.contains("model request failed") => {
                 self.emit(ctx, EventKind::Warning { message: format!("the planner model is unavailable ({e}); the worker model answers instead") }).await;
-                let mut local = self.gen_request(Tier::Worker, prompts::CHAT_SYSTEM, String::new(), "chat");
+                let mut local = self.gen_request(Tier::Worker, &chat_system, String::new(), "chat");
                 local.messages = req.messages.clone();
                 local.temperature = 0.6;
                 self.generate_text(ctx, Tier::Worker, local).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?

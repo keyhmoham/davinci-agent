@@ -686,6 +686,17 @@ impl Inner {
         self.pick_tier(mode) == Some(Tier::Planner)
     }
 
+    /// What the models that decide what to run are told about the shell: what it is, and that they may install what they need.
+    pub(crate) fn shell_environment(&self, short: bool) -> &'static str {
+        let sandbox = self.policy.config().shell.mode == dfae_tools::ShellMode::Sandbox;
+        match (sandbox, short) {
+            (true, false) => crate::prompts::ENV_SANDBOX,
+            (true, true) => crate::prompts::ENV_SANDBOX_SHORT,
+            (false, false) => crate::prompts::ENV_RESTRICTED,
+            (false, true) => crate::prompts::ENV_RESTRICTED_SHORT,
+        }
+    }
+
     pub(crate) fn gen_request(&self, tier: Tier, system: &str, user: String, purpose: &str) -> GenerationRequest {
         // The worker's output is billed: ordinary work (choosing arguments, short reasoning, answers) is held to a small limit; writing
         // a file's content is the one thing allowed to run long.

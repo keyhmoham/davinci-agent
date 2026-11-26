@@ -54,6 +54,7 @@ deadpool-postgres = "0.14"
 ratatui = "0.30"
 crossterm = "0.29"
 shlex = "2"
+libc = "0.2"
 toml = "1"
 
 [profile.release]

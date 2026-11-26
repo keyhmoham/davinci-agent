@@ -170,16 +170,13 @@ async fn the_sandbox_shell_is_a_real_shell_with_exit_codes_timeouts_and_a_cwd() 
     assert!(in_sub.starts_with("hello") && in_sub.trim_end().ends_with("/sub"), "{in_sub}");
     let fail = e.run("shell", json!({"command": "echo out; echo err >&2; exit 3"})).await.unwrap();
     assert!(
-        !fail.ok
-            && fail.exit_code == Some(3)
-            && fail.content.contains("out")
-            && fail.content.contains("[stderr] err")
-            && fail.content.contains("[exit code 3]"),
+        !fail.ok && fail.exit_code == Some(3) && fail.content.contains("out") && fail.content.starts_with("out\nerr") && fail.content.contains("[exit code 3]"),
         "{}",
         fail.content
     );
-    let slow = e.run("shell", json!({"command": "sleep 5", "timeout_secs": 1})).await.unwrap_err();
-    assert_eq!(slow.kind, ErrorKind::Timeout);
+    // a timeout is a result (the command was killed; what it printed is kept), not a failure to run
+    let slow = e.run("shell", json!({"command": "echo begun; sleep 5", "timeout_secs": 1})).await.unwrap();
+    assert!(!slow.ok && slow.content.starts_with("begun") && slow.content.contains("timed out after 1s"), "{}", slow.content);
     // a redirect writes into the workspace; the cwd cannot leave it
     e.run("shell", json!({"command": "echo made > made.txt"})).await.unwrap();
     assert_eq!(e.read("made.txt").trim(), "made");
