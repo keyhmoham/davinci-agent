@@ -39,9 +39,12 @@ fn coerce(ty: ParamType, v: &Value) -> Option<Value> {
 
 /// The value a parameter takes from the request's entities — only when there is exactly one candidate:
 /// with two file paths in the sentence ("copy a.txt to b.txt") which one is which is a question for a model, not a guess.
-fn entity_value(p: &ParamSpec, goal: &str, entities: &[Entity]) -> Option<Value> {
+///
+/// A text already taken by another parameter is not a candidate: the same `` `site/index.html` `` is a path, and is not also the
+/// content of the file.
+fn entity_value(p: &ParamSpec, goal: &str, entities: &[Entity], taken: &HashSet<String>) -> Option<Value> {
     let mut candidates: Vec<&Entity> = Vec::new();
-    for e in entities.iter().filter(|e| p.entity_hints.iter().any(|h| h == &e.label) && goal.contains(e.text.as_str())) {
+    for e in entities.iter().filter(|e| p.entity_hints.iter().any(|h| h == &e.label) && goal.contains(e.text.as_str()) && !taken.contains(&e.text)) {
         if !candidates.iter().any(|c| c.text == e.text) {
             candidates.push(e);
         }
@@ -80,10 +83,14 @@ pub fn fix_args(meta: &ToolMetadata, args: &Value, goal: &str, entities: &[Entit
             }
         }
     }
+    let mut taken: HashSet<String> = obj.values().filter_map(|v| v.as_str().map(String::from)).collect();
     let missing: Vec<&ParamSpec> = meta.params.iter().filter(|p| p.required && !obj.contains_key(&p.name)).collect();
     for p in missing {
-        if let Some(v) = entity_value(p, goal, entities).or_else(|| p.default.clone()) {
+        if let Some(v) = entity_value(p, goal, entities, &taken).or_else(|| p.default.clone()) {
             notes.push(format!("filled '{}' from the request", p.name));
+            if let Some(s) = v.as_str() {
+                taken.insert(s.to_string());
+            }
             obj.insert(p.name.clone(), v);
         }
     }
@@ -96,11 +103,15 @@ pub fn fix_args(meta: &ToolMetadata, args: &Value, goal: &str, entities: &[Entit
 pub fn fill_partial(meta: &ToolMetadata, args: &Value, goal: &str, entities: &[Entity]) -> (Value, bool) {
     let mut obj: Map<String, Value> = args.as_object().cloned().unwrap_or_default();
     let mut added = false;
+    let mut taken: HashSet<String> = obj.values().filter_map(|v| v.as_str().map(String::from)).collect();
     for p in meta.params.iter().filter(|p| p.required) {
         if obj.get(&p.name).map(|v| !v.is_null()).unwrap_or(false) {
             continue;
         }
-        if let Some(v) = entity_value(p, goal, entities) {
+        if let Some(v) = entity_value(p, goal, entities, &taken) {
+            if let Some(s) = v.as_str() {
+                taken.insert(s.to_string());
+            }
             obj.insert(p.name.clone(), v);
             added = true;
         }
@@ -241,5 +252,26 @@ mod tests {
             assert!(repair_after_failure(&m, &json!({"path": "x", "max_bytes": "5"}), k, "", &[], d.path()).is_none(), "{k:?}");
         }
         assert!(repair_after_failure(&m, &json!({"path": "x", "max_bytes": "5"}), ErrorKind::InvalidArgs, "", &[], d.path()).is_some());
+    }
+
+    #[test]
+    fn a_text_that_is_the_path_is_not_also_the_content() {
+        // `site/index.html` is both a file path and a quoted word in the planner's sentence: it is the path, and the file's content is
+        // for a model to write — not the file's own name
+        let m = ToolMetadata {
+            params: vec![
+                ParamSpec::new("path", ParamType::String, true, "").hints(&["file path"]),
+                ParamSpec::new("content", ParamType::String, true, "").hints(&["quoted"]),
+            ],
+            ..meta()
+        };
+        let goal = "Create `site/index.html` as a landing page about Earth";
+        let ents = vec![ent("file path", "site/index.html"), ent("quoted", "site/index.html")];
+        let (args, added) = fill_partial(&m, &json!({}), goal, &ents);
+        assert!(added);
+        assert_eq!(args, json!({"path": "site/index.html"}), "the content stays unbound");
+        // a different quoted text is still the content
+        let ents = vec![ent("file path", "a.txt"), ent("quoted", "hello")];
+        assert_eq!(fill_partial(&m, &json!({}), "write \"hello\" to a.txt", &ents).0, json!({"path": "a.txt", "content": "hello"}));
     }
 }

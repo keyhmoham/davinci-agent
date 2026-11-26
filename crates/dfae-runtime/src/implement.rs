@@ -56,6 +56,26 @@ pub(crate) fn strip_fences(text: &str) -> String {
     t.to_string()
 }
 
+/// Should this shell command run in the background? The step's sentence says so, or the command is a server (`http.server`, `uvicorn`,
+/// `npm start`, `flask run`…), which would otherwise hold the step until its timeout.
+pub(crate) fn implies_background(description: &str, command: &str) -> bool {
+    static SENTENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:in the background|background(?:ed)?|detached|as a daemon|keep(?:s|ing)? (?:it )?running|leave (?:it )?running|and serve)\b",
+        )
+        .unwrap()
+    });
+    static SERVER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:http\.server|SimpleHTTPServer|uvicorn|gunicorn|flask\s+run|php\s+-S|npm\s+(?:run\s+)?(?:start|dev|serve)|yarn\s+(?:start|dev)|vite(?:\s|$)|next\s+dev|live-server|http-server|python3?\s+-m\s+(?:http\.server|flask|uvicorn))\b").unwrap()
+    });
+    SENTENCE.is_match(description) || SERVER.is_match(command)
+}
+
+/// Parameters whose values are content (text to write): the one thing allowed to run long.
+const CONTENT_PARAMS: &[&str] = &["content", "new_string", "body", "text"];
+/// Parameters that hold a command line, which may carry a short script.
+const COMMAND_PARAMS: &[&str] = &["command", "script"];
+
 /// Is this step writing something that is itself the product — a page, code, a document, data — rather than doing ordinary work?
 /// Only then may the worker model write at length.
 pub(crate) fn content_like(description: &str) -> bool {
@@ -65,17 +85,53 @@ pub(crate) fn content_like(description: &str) -> bool {
     RE.is_match(description)
 }
 
-/// A long text whose lines are mostly copies of each other: a small model stuck in a loop.
+/// The tool as the binding model sees it: its required parameters, the optional text ones, and the optional numbers and flags the
+/// step names; the rest is left to the tool's defaults. (Digits in the step are no reason: a port is not a timeout.)
+fn bind_view(meta: &ToolMetadata, step_text: &str) -> ToolMetadata {
+    let text = step_text.to_lowercase();
+    let mut m = meta.clone();
+    m.params.retain(|p| {
+        p.required
+            || text.contains(&p.name.to_lowercase())
+            // a word of the name ("timeout" of `timeout_secs`, "lines" of `max_lines`) is the step asking for it
+            || p.name.split('_').any(|w| w.len() >= 4 && text.contains(&w.to_lowercase()))
+            || p.ty == ParamType::String
+    });
+    m
+}
+
+/// Some models end a reply with their own tool-call syntax (`</arg_value><arg_key>path</arg_key>…</tool_call>`): it is never part
+/// of a file or an argument.
+pub(crate) fn strip_tool_markup(text: &str) -> String {
+    const MARKS: [&str; 5] = ["</arg_value>", "<arg_key>", "<tool_call>", "</tool_call>", "<arg_value>"];
+    let cut = MARKS.iter().filter_map(|m| text.find(m)).min().unwrap_or(text.len());
+    text[..cut].trim_end().to_string()
+}
+
+/// A long text stuck in a loop: one substantial line over and over (`*.egg-info` a hundred times), or a text that is mostly copies of
+/// its own lines. Structural lines every real page and program repeats (`}`, `</div>`, `end`) are not evidence: only lines of 12
+/// characters or more count (8 for a run of identical lines).
 pub(crate) fn degenerate(text: &str) -> bool {
-    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-    if lines.len() < 30 {
+    // the same line (of 8 characters or more) forty times in a row: a starfield of 30 `<div class="star"></div>` is a page, a
+    // loop goes on until the token limit
+    let near: Vec<&str> = text.lines().map(str::trim).filter(|l| l.chars().count() >= 8).collect();
+    let mut run = 1;
+    for w in near.windows(2) {
+        run = if w[0] == w[1] { run + 1 } else { 1 };
+        if run >= 40 {
+            return true;
+        }
+    }
+    let lines: Vec<&str> = near.into_iter().filter(|l| l.chars().count() >= 12).collect();
+    if lines.len() < 40 {
         return false;
     }
     let unique: std::collections::HashSet<&str> = lines.iter().copied().collect();
-    (unique.len() as f64) / (lines.len() as f64) < 0.4
+    (unique.len() as f64) / (lines.len() as f64) < 0.25
 }
 
-/// Keep each line at most twice in a row (and three times in all): what is left of a loop.
+/// Keep each line at most twice in a row (and a long line three times in all): what is left of a loop. Short structural lines
+/// (`</div>`, `}`) are legitimately everywhere and are only collapsed when they run on.
 pub(crate) fn collapse_repeats(text: &str) -> String {
     let mut seen: std::collections::HashMap<&str, u32> = Default::default();
     let mut out: Vec<&str> = Vec::new();
@@ -87,7 +143,7 @@ pub(crate) fn collapse_repeats(text: &str) -> String {
         }
         let n = seen.entry(key).or_insert(0);
         *n += 1;
-        if *n <= 3 && !(out.len() >= 2 && out[out.len() - 1].trim() == key && out[out.len() - 2].trim() == key) {
+        if (*n <= 3 || key.chars().count() < 20) && !(out.len() >= 2 && out[out.len() - 1].trim() == key && out[out.len() - 2].trim() == key) {
             out.push(l);
         }
     }
@@ -127,6 +183,7 @@ impl Inner {
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         cached_tokens: 0,
+                        prefixed: false,
                         latency_ms: res.latency_ms,
                         cached: res.cached,
                         origin: None,
@@ -181,6 +238,10 @@ impl Inner {
             .map(|e| format!("{}={}", e.label.replace(' ', "_"), e.text))
             .collect::<Vec<_>>()
             .join(" | ");
+        // The model is asked for what the step needs, not for every knob of the tool: an optional number nobody mentioned
+        // (`timeout_secs`) is a number a small model can run away with ("1200120120…" until the token limit).
+        let asked = bind_view(meta, &step.description);
+        let meta = &asked;
         // both hosted models are billed by the token: compact signature (the parameter help rides in the schema), trimmed inputs
         let sig = meta.signature();
         let inputs = Self::inputs_text(deps, if paid { 120 } else { 400 });
@@ -207,13 +268,26 @@ impl Inner {
         req.temperature = temperature;
         // a self-hosted server can be told the exact shape: wrong parameter names and types become impossible
         req.schema = Some(meta.args_schema());
-        if paid {
+        // Choosing a path or a pattern is a few dozen tokens and is held to a small limit. A tool whose arguments *are* content — a
+        // file's text, a shell command that may carry a script — is not: cutting that off mid-string is a broken JSON object.
+        let has = |names: &[&str]| meta.params.iter().any(|p| names.contains(&p.name.as_str()));
+        if has(CONTENT_PARAMS) {
+            req.max_tokens = req.max_tokens.max(self.cfg.worker.content_max_tokens);
+        } else if has(COMMAND_PARAMS) {
+            req.max_tokens = req.max_tokens.max(600); // a command line: not a document, and a runaway must be cheap
+        } else if paid {
             req.max_tokens = req.max_tokens.min(400);
         }
         let v = self.gen_json(ctx, tier, req).await?;
         // some models wrap the arguments: {"args": {...}}
         let v = v.get("args").filter(|a| a.is_object()).cloned().unwrap_or(v);
-        v.as_object().cloned().ok_or_else(|| "the reply was not a JSON object of arguments".to_string())
+        let mut args = v.as_object().cloned().ok_or_else(|| "the reply was not a JSON object of arguments".to_string())?;
+        for value in args.values_mut() {
+            if let Value::String(t) = value {
+                *t = strip_tool_markup(t);
+            }
+        }
+        Ok(args)
     }
 
     /// "write {{prev_code}} to index.html", "save that code": the content is something said earlier, used by name — never
@@ -257,15 +331,17 @@ impl Inner {
             user.push_str(&format!("YOUR PREVIOUS VERSION WAS REJECTED: {f}\nWrite the whole file again and fix that.\n"));
         }
         let mut req = self.gen_request(tier, prompts::CONTENT_SYSTEM, user.clone(), "content");
+        // No frequency penalty: markup and code repeat their own tokens (`</div>`, `class`) by nature, and a penalty on them makes a
+        // long page decay into word salad. Loops are caught afterwards by `degenerate`.
         req.temperature = 0.2;
-        req.frequency_penalty = 0.4;
-        let text = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
+        let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
         let why =
             if degenerate(&text) { Some("it repeated the same lines".to_string()) } else { crate::syntax::problem(std::path::Path::new(path), &text).await };
         let Some(why) = why else {
             return (!text.trim().is_empty()).then_some(text);
         };
+        self.emit(ctx, EventKind::Warning { message: format!("{path}: the first version was rejected ({why}); it is written again") }).await;
         // once more, hotter and with a heavier penalty, told what went wrong and to keep it short
         let mut req = self.gen_request(
             tier,
@@ -273,9 +349,8 @@ impl Inner {
             format!("{user}YOUR PREVIOUS VERSION WAS REJECTED: {why}. Write the whole file again, complete, with its styles inside it and no external files, and with no repetition.\n"),
             "content",
         );
-        req.temperature = 0.5;
-        req.frequency_penalty = 0.8;
-        let again = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
+        req.temperature = 0.4;
+        let again = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
         let text = if degenerate(&again) { collapse_repeats(&again) } else { again };
         (!text.trim().is_empty()).then_some(text)
     }
@@ -316,6 +391,11 @@ impl Inner {
         };
         let meta = scoped.iter().find(|m| m.name == tool).cloned().ok_or_else(|| fail(ErrorKind::NotFound, format!("tool '{tool}' is not available")))?;
 
+        // A planner's sentence about a file describes it ("a landing page with `Earth` in the title"): a quoted word in it is not the file's
+        // content. Content comes from a model that writes it, unless the sentence is a short, literal "write 'x' to y".
+        let describes_content = meta.name == "fs_write" && step.description.split_whitespace().count() >= 12;
+        let entities_for_args: Vec<Entity> =
+            if describes_content { entities.iter().filter(|e| e.label != "quoted").cloned().collect() } else { entities.clone() };
         // ---- arguments: the planner's, then rules, then entities --------------------
         let mut args = object(&step.args);
         if feedback.is_some() {
@@ -337,14 +417,14 @@ impl Inner {
             }
         }
         if meta.validate_args(&Value::Object(args.clone())).is_err() {
-            if let Some(f) = repair::fix_args(&meta, &Value::Object(args.clone()), &step.description, &entities) {
+            if let Some(f) = repair::fix_args(&meta, &Value::Object(args.clone()), &step.description, &entities_for_args) {
                 args = object(&f.args);
                 if !how.contains(&"rules") {
                     how.push("rules");
                 }
             } else {
                 // not complete yet, but what the entities do supply is taken before any model is asked
-                let (partial, added) = repair::fill_partial(&meta, &Value::Object(args.clone()), &step.description, &entities);
+                let (partial, added) = repair::fill_partial(&meta, &Value::Object(args.clone()), &step.description, &entities_for_args);
                 if added {
                     args = object(&partial);
                     if !how.contains(&"rules") {
@@ -366,6 +446,15 @@ impl Inner {
             for k in ["path", "cwd", "from", "to", "dir", "directory"] {
                 if a.get(k).and_then(|v| v.as_str()).is_some_and(|p| p.contains("{{")) {
                     return Err(format!("`{k}` must be written out as a path, not taken from a step's output ({{{{…}}}})"));
+                }
+            }
+            // a directory to run in is one the workspace has by now (the steps before this one have run): a made-up one
+            // (`/workspace/site`, `site/background`) is the model's mistake to correct here, not a failed step to re-plan
+            if let Some(c) = a.get("cwd").and_then(|v| v.as_str()).filter(|c| !c.is_empty() && !c.contains("{{")) {
+                match self.policy.guard().read_path(c) {
+                    Ok(p) if p.is_dir() => {}
+                    Ok(_) => return Err(format!("`cwd` '{c}' is not a directory of the workspace: use one that exists, or leave cwd out")),
+                    Err(_) => return Err(format!("`cwd` '{c}' is outside the workspace: use a directory inside it, relative (`site`), or leave cwd out")),
                 }
             }
             // a `{{id}}` template may only name a step this one depends on
@@ -424,10 +513,16 @@ impl Inner {
                             for (k, v) in got {
                                 merged.entry(k).or_insert(v);
                             }
-                            if let Some(f) = repair::fix_args(&meta, &Value::Object(merged.clone()), &step.description, &entities) {
+                            if let Some(f) = repair::fix_args(&meta, &Value::Object(merged.clone()), &step.description, &entities_for_args) {
                                 merged = object(&f.args);
                             }
-                            match valid(&merged) {
+                            let mut verdict = valid(&merged);
+                            // a directory that is nowhere is no reason to throw the command away: without it the command runs in the workspace
+                            if verdict.as_ref().is_err_and(|e| e.starts_with("`cwd`")) && !meta.params.iter().any(|p| p.name == "cwd" && p.required) {
+                                merged.remove("cwd");
+                                verdict = valid(&merged);
+                            }
+                            match verdict {
                                 Ok(()) => candidates.push(merged),
                                 Err(e) => problem = Some(e),
                             }
@@ -461,6 +556,15 @@ impl Inner {
             }
         }
 
+        // A server never returns: run in the foreground it holds the step until its timeout. The planner's sentence ("in the background") and
+        // the command itself say so; a small model forgets to set the flag.
+        if tool == "shell" && args.get("background").is_none() && meta.params.iter().any(|p| p.name == "background") {
+            let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            if implies_background(&step.description, command) {
+                args.insert("background".into(), Value::Bool(true));
+                how.push("rules");
+            }
+        }
         done.kind = StepKind::Tool;
         done.tool = Some(tool.clone());
         done.args = Value::Object(args.clone());
@@ -545,7 +649,7 @@ mod tests {
 
 #[cfg(test)]
 mod content_tests {
-    use super::{collapse_repeats, degenerate, strip_fences};
+    use super::{bind_view, collapse_repeats, degenerate, strip_fences, strip_tool_markup};
 
     #[test]
     fn a_file_comes_out_of_whatever_a_small_model_wraps_around_it() {
@@ -559,6 +663,69 @@ mod content_tests {
     }
 
     #[test]
+    fn a_real_page_is_not_a_loop_however_much_structure_it_repeats() {
+        let mut page = String::from("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<style>\n");
+        for i in 0..60 {
+            page.push_str(&format!(".card-{i} {{\n  margin: 0 auto;\n  padding: 1rem;\n  color: #fff;\n}}\n"));
+        }
+        page.push_str("</style>\n</head>\n<body>\n");
+        for i in 0..40 {
+            page.push_str(&format!("<div class=\"card-{i}\">\n  <h3>Card {i}</h3>\n  <p>Text of card {i}.</p>\n</div>\n"));
+        }
+        page.push_str("</body>\n</html>\n");
+        assert!(!degenerate(&page), "a page with 400 lines of repeated structure is a page");
+    }
+
+    #[test]
+    fn the_binding_model_is_not_asked_for_numbers_nobody_mentioned() {
+        use dfae_core::*;
+        let shell = ToolMetadata {
+            name: "shell".into(),
+            description: "run".into(),
+            category: "system".into(),
+            risk: Risk::Low,
+            requires_approval: false,
+            side_effects: true,
+            reversible: false,
+            cost_class: "low".into(),
+            keywords: vec![],
+            direct_patterns: vec![],
+            cacheable: false,
+            contract: vec![],
+            params: vec![
+                ParamSpec::new("command", ParamType::String, true, "command"),
+                ParamSpec::new("cwd", ParamType::String, false, "directory"),
+                ParamSpec::new("timeout_secs", ParamType::Integer, false, "seconds"),
+                ParamSpec::new("background", ParamType::Boolean, false, "detach"),
+            ],
+        };
+        let names = |m: &ToolMetadata| m.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&bind_view(&shell, "start the server in the site directory")), ["command", "cwd"]);
+        assert_eq!(names(&bind_view(&shell, "serve it on port 8001")), ["command", "cwd"], "a port is not a timeout");
+        assert_eq!(names(&bind_view(&shell, "run the tests with a timeout of 300 seconds")), ["command", "cwd", "timeout_secs"]);
+        assert_eq!(names(&bind_view(&shell, "run it in the background")), ["command", "cwd", "background"]);
+    }
+
+    #[test]
+    fn a_models_own_tool_call_syntax_never_reaches_a_file_or_an_argument() {
+        let page = "<html><body>x</body></html>";
+        assert_eq!(strip_tool_markup(&format!("{page}\n</arg_value><arg_key>path</arg_key><arg_value>a.html</arg_value></tool_call>")), page);
+        assert_eq!(strip_tool_markup("site/index.html</arg_value>"), "site/index.html");
+        assert_eq!(strip_tool_markup(page), page);
+    }
+
+    #[test]
+    fn a_page_with_a_starfield_is_not_cut_down() {
+        let mut page = String::from("<!DOCTYPE html>\n<html>\n<body>\n<div class=\"sky\">\n");
+        page.push_str(&"<div class=\"star\"></div>\n".repeat(30));
+        page.push_str("</div>\n<div>\n<div>\n<div>\nx\n</div>\n</div>\n</div>\n</body>\n</html>");
+        assert!(!degenerate(&page));
+        // what a loop leaves is still a whole file: the closing tags far from the loop stay
+        let kept = collapse_repeats(&format!("{page}\n{}", "<p>some line of text</p>\n".repeat(50)));
+        assert!(kept.contains("</html>") && kept.matches("</body>").count() == 1, "{kept}");
+    }
+
+    #[test]
     fn a_loop_is_recognised_and_cut_down() {
         let looped = format!("# ignore\n*.pyc\n{}", "*.egg-info\n".repeat(200));
         assert!(degenerate(&looped));
@@ -568,5 +735,20 @@ mod content_tests {
         let cut = collapse_repeats(&looped);
         assert_eq!(cut.matches("*.egg-info").count(), 2);
         assert!(cut.starts_with("# ignore\n*.pyc"));
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::implies_background;
+
+    #[test]
+    fn servers_and_background_work_do_not_hold_the_step() {
+        assert!(implies_background("start the server in the background on port 8000", "python3 -m http.server 8000"));
+        assert!(implies_background("serve the site directory", "python3 -m http.server 8000 --bind 0.0.0.0"));
+        assert!(implies_background("run the dev server", "npm run dev"));
+        assert!(implies_background("run it", "uvicorn app:app --port 8001"));
+        assert!(!implies_background("list the files", "ls -la"));
+        assert!(!implies_background("run the tests", "cargo test"));
     }
 }

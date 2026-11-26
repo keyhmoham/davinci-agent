@@ -126,41 +126,29 @@ async fn health_requires_the_model_to_be_pulled() {
 }
 
 #[tokio::test]
-async fn tool_selection_asks_one_yes_no_question_per_tool() {
+async fn tool_selection_is_one_multiple_choice_question_over_all_tools() {
     let seen: Seen = Arc::default();
     let base = serve(Router::new().route("/v1/chat/completions", post(chat)).with_state(seen.clone())).await;
     let d = decider(OpenModelProvider::new(&cfg(base)).unwrap());
-    let tool =
-        |n: &str| ToolBrief { name: n.into(), description: format!("{n} tool"), category: "x".into(), risk: Risk::Low, side_effects: false, keywords: vec![] };
-    let mut st = DecisionState { request: "read a.txt".into(), ..Default::default() };
-    st.tools = vec![tool("fs_read"), tool("calc"), tool("http_get")];
-    let picked = d.select_tools(st).await;
-    assert_eq!(picked.value.len(), 3, "the fake model says yes (0.84) to every tool");
-    assert_eq!(seen.lock().unwrap().len(), 3);
-    assert!(seen.lock().unwrap().iter().any(|(_, b)| b["messages"][1]["content"].as_str().unwrap().contains("Is the tool `calc`")));
-}
-
-#[tokio::test]
-async fn a_self_hosted_model_judges_every_tool_because_its_questions_are_free() {
-    let seen: Seen = Arc::default();
-    let base = serve(Router::new().route("/v1/chat/completions", post(chat)).with_state(seen.clone())).await;
-    let d = decider(OpenModelProvider::new(&cfg(base)).unwrap());
-    let tool = |n: &str, desc: &str| ToolBrief {
+    let tool = |n: &str| ToolBrief {
         name: n.into(),
-        description: desc.into(),
+        description: format!("{n} tool. More detail that is cut."),
         category: "x".into(),
         risk: Risk::Low,
         side_effects: false,
         keywords: vec![],
     };
-    let mut st = DecisionState { request: "read the file a.txt".into(), ..Default::default() };
-    st.tools = ["fs_read", "fs_list", "fs_write", "fs_search", "calc", "time_now", "system_info", "memory_store"]
-        .iter()
-        .map(|n| tool(n, &format!("{n} tool")))
-        .collect();
+    let mut st = DecisionState { request: "read a.txt".into(), ..Default::default() };
+    st.tools = ["fs_read", "fs_list", "fs_write", "fs_search", "calc", "time_now", "system_info", "memory_store"].iter().map(|n| tool(n)).collect();
     let picked = d.select_tools(st).await;
-    assert_eq!(seen.lock().unwrap().len(), 8, "one question per tool, no pre-filtering to save calls");
-    assert_eq!(picked.value.len(), 8);
+    let calls = seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "one question for all tools, not one per tool");
+    let prompt = calls[0].1["messages"][1]["content"].as_str().unwrap().to_string();
+    for n in ["fs_read", "calc", "memory_store", "none"] {
+        assert!(prompt.contains(n), "{n} is an option");
+    }
+    assert!(!prompt.contains("More detail"), "descriptions are cut to their first sentence");
+    assert!(!picked.value.is_empty() && picked.value.iter().all(|(n, _)| n != "none"), "`none` is no tool");
 }
 
 #[tokio::test]

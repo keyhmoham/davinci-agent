@@ -60,6 +60,10 @@ pub fn render_report(plan: &Plan) -> Option<String> {
 /// Tools whose steps change something: their one-line result is what the user needs to read.
 const CHANGES: &[&str] = &["fs_write", "fs_edit", "fs_mkdir", "fs_move", "fs_copy", "fs_delete", "shell_kill", "memory_store"];
 
+/// Tools that only look: when the run also changed something, what they read was for the change (the page that was read to be
+/// edited is not part of the answer).
+const LOOKS: &[&str] = &["fs_read", "fs_list", "fs_search", "fs_stat", "fs_find"];
+
 /// Deterministic answer built from step outputs (no model involved).
 pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
     let Some(plan) = &rec.plan else {
@@ -76,7 +80,11 @@ pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
     if ok.len() == 1 && exec_error.is_none() {
         out.push_str(&tokens::truncate_tokens(ok[0].summary.as_deref().or(ok[0].output.as_deref()).unwrap_or(""), 700));
     } else {
+        let changed = ok.iter().any(|s| s.tool.as_deref().is_some_and(|t| CHANGES.contains(&t)));
         for s in &ok {
+            if changed && s.tool.as_deref().is_some_and(|t| LOOKS.contains(&t)) {
+                continue;
+            }
             // a step that changed something says what it did in one line ("wrote 2070 bytes to site/index.html"): its arguments
             // (a whole page, say) are not an answer
             if s.tool.as_deref().is_some_and(|t| CHANGES.contains(&t)) {
@@ -279,6 +287,23 @@ mod tests {
         let bad = ungrounded_claims("The load is 0.99 and /var/log/app/errors.log is full", evidence, goal);
         assert!(bad.contains(&"0.99".to_string()));
         assert!(bad.contains(&"/var/log/app/errors.log".to_string()));
+    }
+
+    #[test]
+    fn what_was_read_to_make_a_change_is_not_part_of_the_answer() {
+        let mut rec = TaskRecord::new(TaskRequest { goal: "retitle the page".into(), ..Default::default() }, Budget::default());
+        let mut read = Step::tool("s1", "fs_read", "read the page", serde_json::json!({"path": "index.html"}));
+        read.status = StepStatus::Succeeded;
+        read.output = Some("<html>the whole page</html>".into());
+        let mut edit = Step::tool("s2", "fs_edit", "retitle", serde_json::json!({"path": "index.html", "old_string": "Old", "new_string": "New"}));
+        edit.status = StepStatus::Succeeded;
+        edit.summary = Some("replaced 1 occurrence in index.html".into());
+        rec.plan = Some(Plan { goal: "g".into(), steps: vec![read.clone(), edit], source: PlanSource::Planner, revision: 0, estimate: None, report: None });
+        let answer = templated_answer(&rec, None);
+        assert!(answer.contains("replaced 1 occurrence") && !answer.contains("whole page"), "{answer}");
+        // a request that only reads still shows what was read
+        rec.plan.as_mut().unwrap().steps.truncate(1);
+        assert!(templated_answer(&rec, None).contains("whole page"));
     }
 
     #[test]

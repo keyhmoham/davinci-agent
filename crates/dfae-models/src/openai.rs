@@ -14,6 +14,8 @@ pub struct OpenAiCompat {
     /// Cleared the first time the server rejects `response_format: json_schema`: later calls ask for plain JSON.
     schema_ok: std::sync::atomic::AtomicBool,
     /// When a test request last proved an unlisted model usable: health is polled often, and every ping is a billed request.
+    /// Cleared the first time the server rejects the non-standard request fields (`reasoning`, `frequency_penalty`): later calls omit them.
+    extras_ok: std::sync::atomic::AtomicBool,
     pinged_ok: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
@@ -31,6 +33,7 @@ impl OpenAiCompat {
             name: format!("openai:{model}"),
             caches,
             schema_ok: true.into(),
+            extras_ok: true.into(),
             pinged_ok: Default::default(),
         }
     }
@@ -64,8 +67,17 @@ impl LanguageModel for OpenAiCompat {
             "temperature": req.temperature,
             "stream": false,
         });
-        if req.frequency_penalty > 0.0 {
+        let extras = self.extras_ok.load(std::sync::atomic::Ordering::Relaxed);
+        if extras && req.frequency_penalty > 0.0 {
             body["frequency_penalty"] = json!(req.frequency_penalty);
+        }
+        // thinking is a cost and a latency: `off` switches it off, a level sets the effort (gateways and OpenAI-compatible servers
+        // take `reasoning` / `reasoning_effort`; a server that rejects them is asked without, from then on)
+        let has_reasoning = extras && req.reasoning.is_some();
+        match req.reasoning.as_deref().filter(|_| extras) {
+            Some("off" | "none") => body["reasoning"] = json!({"enabled": false}),
+            Some(level) => body["reasoning_effort"] = json!(level),
+            None => {}
         }
         let schema = req.schema.as_ref().filter(|_| self.schema_ok.load(std::sync::atomic::Ordering::Relaxed));
         if let Some(schema) = schema {
@@ -103,10 +115,21 @@ impl LanguageModel for OpenAiCompat {
                 if is_retryable(status) {
                     continue;
                 }
-                // a server that does not know json_schema is asked for plain JSON from now on, and this call is repeated
-                if status == reqwest::StatusCode::BAD_REQUEST && schema.is_some() {
-                    self.schema_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+                // a server that does not know json_schema is asked for plain JSON from now on, and this call is repeated; so with the
+                // non-standard fields (reasoning, penalties)
+                if status == reqwest::StatusCode::BAD_REQUEST && schema.is_some() && self.schema_ok.swap(false, std::sync::atomic::Ordering::Relaxed) {
                     body["response_format"] = json!({"type": "json_object"});
+                    continue;
+                }
+                if status == reqwest::StatusCode::BAD_REQUEST
+                    && (has_reasoning || req.frequency_penalty > 0.0)
+                    && self.extras_ok.swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    if let Some(b) = body.as_object_mut() {
+                        for k in ["reasoning", "reasoning_effort", "frequency_penalty"] {
+                            b.remove(k);
+                        }
+                    }
                     continue;
                 }
                 return Err(ModelError::Request(last));

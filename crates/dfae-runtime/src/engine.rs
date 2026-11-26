@@ -528,9 +528,9 @@ impl Inner {
         use std::sync::atomic::Ordering::Relaxed;
         if entry.component == Component::Planner
             && matches!(entry.purpose.as_str(), "plan" | "plan_escalated" | "plan_repair" | "replan" | "replan_repair")
-            && entry.prompt_tokens >= 1200
+            && entry.prefixed
         {
-            // a planner call this large carried the prefix: did the provider serve it from cache?
+            // this planner call carried the cacheable prefix: did the provider serve it from cache?
             if entry.cached_tokens > 0 {
                 self.prefix_misses.store(0, Relaxed);
             } else {
@@ -627,18 +627,14 @@ impl Inner {
 
     pub(crate) async fn gen_json(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<Value, String> {
         self.take_model_call(ctx, tier, 1).await?;
-        match self.models.generate_json(tier, req).await {
-            Ok((v, calls)) => {
-                if calls.len() > 1 {
-                    self.take_model_call(ctx, tier, (calls.len() - 1) as u32).await.ok();
-                }
-                for c in calls {
-                    self.add_ledger(ctx, c.entry).await;
-                }
-                Ok(v)
-            }
-            Err(e) => Err(e.to_string()),
+        let (result, calls) = self.models.generate_json(tier, req).await;
+        if calls.len() > 1 {
+            self.take_model_call(ctx, tier, (calls.len() - 1) as u32).await.ok();
         }
+        for c in calls {
+            self.add_ledger(ctx, c.entry).await;
+        }
+        result.map_err(|e| e.to_string())
     }
 
     pub(crate) fn pick_tier(&self, mode: ExecMode) -> Option<Tier> {
@@ -682,6 +678,7 @@ impl Inner {
             cache: false,
             schema: None,
             schema_strict: false,
+            reasoning: if tier == Tier::Planner { self.cfg.planner.reasoning.clone() } else { self.cfg.worker.reasoning.clone() },
         }
     }
 

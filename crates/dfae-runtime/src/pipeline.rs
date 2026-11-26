@@ -351,7 +351,13 @@ impl Inner {
             reasoning_steps: plan.steps.len() - plan.tool_steps(),
             side_effect_steps: side,
             max_risk,
-            summary: plan.steps.iter().map(|s| format!("{}:{}", s.id, s.tool.as_deref().unwrap_or("reason"))).collect::<Vec<_>>().join(","),
+            // the decision model is free and judges only what it can see: the steps, in words, not just their tool names
+            summary: plan
+                .steps
+                .iter()
+                .map(|s| format!("{} {}: {}", s.id, s.tool.as_deref().unwrap_or("think"), tokens::truncate_tokens(&s.description, 60)))
+                .collect::<Vec<_>>()
+                .join("; "),
         }
     }
 
@@ -385,6 +391,7 @@ impl Inner {
                     prompt_tokens: 0,
                     completion_tokens: 0,
                     cached_tokens: 0,
+                    prefixed: false,
                     latency_ms: latency,
                     cached,
                     origin: None,
@@ -611,24 +618,29 @@ impl Inner {
         base_state: &DecisionState,
         calls: Option<&[DirectCall]>,
     ) -> Result<(Plan, ExecMode), String> {
-        // tool selection (decision layer), unioned with deterministic matches
-        let mut tstate = base_state.clone();
-        tstate.tools = self.scoped_briefs(ctx);
-        let picked = self.note(ctx, self.decider.select_tools(tstate).await).await;
-        let top_tool = picked.first().map(|(n, _)| n.clone());
-        let mut allowed: Vec<String> = picked.into_iter().map(|(n, _)| n).collect();
-        // every tool listed is prompt text: a paid model gets the six best, a self-hosted one all that were judged relevant
-        if self.pick_tier(mode) == Some(Tier::Planner) {
-            allowed.truncate(6);
-        }
-        for c in calls.unwrap_or(&[]) {
-            if !allowed.contains(&c.tool) {
-                allowed.push(c.tool.clone());
+        let is_member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
+        let has_planner = self.models.has(Tier::Planner);
+        // With a planner, a request that is not a quick one is planned by it — and the planner sees the *whole* tool catalogue.
+        // What a small decision model judges "relevant" per tool is not allowed to hide a tool from it: a plan without `fs_write`
+        // writes files with shell heredocs. The decision layer picks tools only for what the worker system does alone.
+        let quick = mode == ExecMode::Assisted && has_planner && !is_member;
+        let planner_plans = has_planner && !quick;
+        let (allowed, top_tool): (Vec<String>, Option<String>) = if planner_plans {
+            (self.scoped_metas(ctx).into_iter().map(|m| m.name).collect(), None)
+        } else {
+            // tool selection (decision layer), unioned with deterministic matches
+            let mut tstate = base_state.clone();
+            tstate.tools = self.scoped_briefs(ctx);
+            let picked = self.note(ctx, self.decider.select_tools(tstate).await).await;
+            let top_tool = picked.first().map(|(n, _)| n.clone());
+            let mut allowed: Vec<String> = picked.into_iter().map(|(n, _)| n).collect();
+            for c in calls.unwrap_or(&[]) {
+                if !allowed.contains(&c.tool) {
+                    allowed.push(c.tool.clone());
+                }
             }
-        }
-        // tools that are only useful together: a model that edits must be able to read and find, one that
-        // starts a background job must be able to read its output and stop it
-        if !allowed.is_empty() {
+            // tools that are only useful together: a model that edits must be able to read and find, one that
+            // starts a background job must be able to read its output and stop it
             for name in allowed.clone() {
                 for friend in planner::companions(&name) {
                     // background-job tools only exist for a shell that can start jobs
@@ -639,17 +651,17 @@ impl Inner {
                     }
                 }
             }
-        }
-        // an answer that changes over time cannot come from memory: the web tools are available to it whatever the tool ranking said
-        if ctx.rec.lock().await.route.as_ref().is_some_and(|r| r.fresh_data) {
-            for m in self.scoped_metas(ctx).into_iter().filter(|m| m.category == "web") {
-                if !allowed.contains(&m.name) {
-                    allowed.push(m.name);
+            // an answer that changes over time cannot come from memory: the web tools are available to it whatever the ranking said
+            if ctx.rec.lock().await.route.as_ref().is_some_and(|r| r.fresh_data) {
+                for m in self.scoped_metas(ctx).into_iter().filter(|m| m.category == "web") {
+                    if !allowed.contains(&m.name) {
+                        allowed.push(m.name);
+                    }
                 }
             }
-        }
+            (allowed, top_tool)
+        };
         // no tool fits: this is a conversation (or a request we have no tool for) — answer it, don't plan it
-        let is_member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
         if allowed.is_empty() && !is_member {
             return Ok((planner::chat_plan(goal, true), ExecMode::Assisted));
         }
@@ -658,7 +670,7 @@ impl Inner {
         // The decision model said this needs no plan: one step, made here without asking anyone to plan it. The best-fitting
         // tool (or none: the local model writes the reply) is the step; the local system binds its arguments just before it
         // runs. If that is not enough, the step fails and the planner model re-plans with the actual result in hand.
-        if mode == ExecMode::Assisted && self.models.has(Tier::Planner) && !is_member {
+        if quick {
             // information that changes over time lives on the web: the decision model said so (`fresh_data`), so a web tool leads
             let fresh = ctx.rec.lock().await.route.as_ref().is_some_and(|r| r.fresh_data);
             let web = fresh.then(|| allowed.iter().find(|n| self.tools.meta(n).is_some_and(|m| m.category == "web") && ctx.in_scope(n)).cloned()).flatten();
@@ -682,7 +694,7 @@ impl Inner {
 
         let budget = ctx.rec.lock().await.budget.clone();
         let mut tier = self
-            .pick_tier(mode)
+            .planner_tier(mode)
             .ok_or("no language model is configured (set WORKER_BASE_URL or PLANNER_API_KEY) and this request cannot be handled deterministically")?;
         let mut used_mode = if tier == Tier::Planner { ExecMode::Escalated } else { mode };
         let mut last_err = String::new();
@@ -702,7 +714,7 @@ impl Inner {
             let ctx_text = format!("{ctx_text}{}", self.workspace_line(ctx).await);
             let purpose = if attempt == 0 { "plan" } else { "plan_escalated" };
             let req = if brief {
-                self.brief_request(ctx, &allowed, &ctx_text, budget.max_steps.min(12), None, purpose)
+                self.brief_request(ctx, &ctx_text, budget.max_steps.min(12), None, purpose)
             } else {
                 let sigs = self.tools.signatures_detailed(&allowed);
                 let user = prompts::plan_user(&sigs, &ctx_text, budget.max_steps.min(12));
@@ -831,7 +843,6 @@ impl Inner {
     pub(crate) fn brief_request(
         &self,
         ctx: &Arc<TaskCtx>,
-        allowed: &[String],
         ctx_text: &str,
         max_steps: u32,
         replan: Option<(&str, &str, &str)>,
@@ -840,13 +851,13 @@ impl Inner {
         let eco = &self.cfg.economy;
         let mut names: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
         names.sort();
-        let catalog = self.prefix_enabled().then(|| self.tools.catalog_lines(&names));
-        let system = prompts::brief_system(eco.plan_report, catalog.as_deref());
-        let user = match (&catalog, replan) {
-            (Some(_), None) => prompts::plan_user_shortlist(allowed, ctx_text, max_steps),
-            (Some(_), Some((state, problem, prefix))) => prompts::replan_user_shortlist(allowed, ctx_text, state, problem, prefix, max_steps),
-            (None, None) => prompts::plan_user(&self.tools.brief_lines(allowed), ctx_text, max_steps),
-            (None, Some((state, problem, prefix))) => prompts::replan_user_brief(&self.tools.brief_lines(allowed), ctx_text, state, problem, prefix, max_steps),
+        // the whole catalogue is always in the system prompt; with a provider that caches prompts and traffic that keeps the cache
+        // warm, the worked examples ride along too and the prompt is marked cacheable
+        let cached = self.prefix_enabled();
+        let system = prompts::brief_system(eco.plan_report, &self.tools.catalog_lines(&names), cached);
+        let user = match replan {
+            None => prompts::plan_request(ctx_text, max_steps),
+            Some((state, problem, prefix)) => prompts::patch_request(ctx_text, state, problem, prefix, max_steps),
         };
         let mut req = self.gen_request(Tier::Planner, &system, user, purpose);
         req.json = true;
@@ -856,7 +867,7 @@ impl Inner {
             crate::plandoc::plan_schema(&names, max_steps, eco.plan_report)
         });
         req.schema_strict = true;
-        req.cache = catalog.is_some();
+        req.cache = cached;
         req
     }
 

@@ -42,7 +42,8 @@ Request: Which files mention TODO, and what is the first one about?
 const BRIEF_RULES: &str = r#"You are the planner of an agent. You write plans; a worker system (a small hosted model, a decision model and an entity extractor, with deterministic rules) carries them out step by step, fixes what it can by itself, and comes back to you only when it cannot continue. Reply with ONE JSON object and nothing else.
 
 PLAN: {"steps":[{"id":"s1","tool":"fs_mkdir","do":"create the directory site","after":[],"expect":"site exists","planner":false}]}
-- "do": the intent in one sentence. The worker chooses the arguments from it, so put every concrete value (paths, names, patterns, text to write, commands, ports) in it.
+- "do": the intent in one or two sentences. The worker chooses the arguments from it, so put every concrete value (paths, names, patterns, commands, ports, short literal text) in it. The CONTENT of a file (a page, code, a document, data) is never written into the plan: say what it must contain and for whom; the worker model writes it.
+- Files are written with fs_write (new or whole file) and fs_edit (a change), never with shell redirects, heredocs, echo or sed. Use shell to run things: servers, builds, tests, git. A server the user will open runs in the background on 0.0.0.0, on a port from 8000 to 8010 (the next one when a port is in use). A command runs in another directory through the step's cwd, never `cd dir &&`.
 - "tool": exactly one of the listed tool names, or null for a step that thinks or writes from earlier results (the worker model does it; set "planner":true only when that step needs your own reasoning).
 - "after": ids of the steps whose output or effect this step needs (a step that uses a file or directory another step makes must list it). Steps without it run in parallel.
 - "expect": what any correct result shows ("site/index.html exists", "config.toml now contains port = 9090", "the command exits 0", "the output lists X"), checked automatically; null for exploratory steps (listing, searching) whose result you cannot predict. Never a wish.
@@ -64,26 +65,32 @@ Request: In config.toml change the port 8080 to 9090
 {"steps":[{"id":"s1","tool":"fs_read","do":"read config.toml","after":[],"expect":null,"planner":false},{"id":"s2","tool":"fs_edit","do":"in config.toml replace \"port = 8080\" with \"port = 9090\"","after":["s1"],"expect":"config.toml now contains port = 9090","planner":false}]}
 Re-plan example (s3, which starts the server with cwd site, failed because the directory does not exist): {"edit":[{"id":"s3","tool":"shell","do":"start `python3 -m http.server 8000 --bind 0.0.0.0` in the background with cwd site","after":["s2","r1_1"],"expect":"the command started","planner":false}],"add":[{"id":"r1_1","tool":"fs_mkdir","do":"create the directory site","after":[],"expect":"site exists","planner":false}],"drop":[]}"#;
 
-/// The planner's system prompt. With `catalog` (every tool the agent has, in a fixed order) the prompt is a large, identical
-/// prefix that a caching provider bills at a fraction; the per-task tool shortlist then goes in the user message. Without it the
-/// prompt is the rules alone and the user message lists the relevant tools in full.
-pub fn brief_system(report: bool, catalog: Option<&str>) -> String {
+/// The planner's system prompt: rules, the whole tool catalogue (always — the planner must see every tool), and, when the prompt is
+/// cacheable, worked examples. One prompt serves planning and re-planning.
+pub fn brief_system(report: bool, catalog: &str, examples: bool) -> String {
     let mut s = BRIEF_RULES.to_string();
     if report {
         s.push_str(BRIEF_REPORT);
     }
-    if let Some(c) = catalog {
-        s.push_str("\n\nTOOLS (all; the task message names the likely ones):\n");
-        s.push_str(c);
+    s.push_str("\n\nTOOLS (every tool there is):\n");
+    s.push_str(catalog);
+    if examples {
         s.push_str("\n\n");
         s.push_str(BRIEF_EXAMPLES);
     }
     s
 }
 
-/// What a re-plan needs told besides the system prompt: the new steps' id prefix.
-fn replan_rule(prefix: &str) -> String {
-    format!("Re-plan with a patch: edit/add/drop. New step ids start with \"{prefix}\" (e.g. {prefix}1). Finished steps are kept; do not repeat what failed.")
+/// The plan request: the limits and the context. (The tools are in the system prompt.)
+pub fn plan_request(ctx: &str, max_steps: u32) -> String {
+    format!("MAX_STEPS: {max_steps}\n{ctx}")
+}
+
+/// The re-plan request: the state of the plan, what went wrong, and the id prefix for new steps.
+pub fn patch_request(ctx: &str, state: &str, problem: &str, prefix: &str, max_steps: u32) -> String {
+    format!(
+        "MAX_STEPS: {max_steps}\n{ctx}\n{state}\nPROBLEM: {problem}\nRe-plan with a patch: edit/add/drop. New step ids start with \"{prefix}\" (e.g. {prefix}1). Finished steps are kept; do not repeat what failed."
+    )
 }
 
 /// Local binding: the self-hosted worker model fills in one tool's arguments for one step.
@@ -115,26 +122,6 @@ pub fn plan_user(tools: &str, ctx: &str, max_steps: u32) -> String {
     } else {
         format!("TOOLS:\n{tools}\nMAX_STEPS: {max_steps}\n{ctx}")
     }
-}
-
-/// The plan request when the tool catalogue lives in the (cached) system prompt: only the shortlist is named here.
-pub fn plan_user_shortlist(likely: &[String], ctx: &str, max_steps: u32) -> String {
-    let likely = if likely.is_empty() { "(none: reasoning steps only)".to_string() } else { likely.join(", ") };
-    format!(
-        "LIKELY TOOLS: {likely}
-MAX_STEPS: {max_steps}
-{ctx}"
-    )
-}
-
-pub fn replan_user_shortlist(likely: &[String], ctx: &str, state: &str, problem: &str, prefix: &str, max_steps: u32) -> String {
-    let likely = likely.join(", ");
-    format!("LIKELY TOOLS: {likely}\nMAX_STEPS: {max_steps}\n{ctx}\n{state}\nPROBLEM: {problem}\n{}", replan_rule(prefix))
-}
-
-/// A re-plan request for the planner model when its tool list is the narrow one in the message.
-pub fn replan_user_brief(tools: &str, ctx: &str, state: &str, problem: &str, prefix: &str, max_steps: u32) -> String {
-    format!("TOOLS:\n{tools}\nMAX_STEPS: {max_steps}\n{ctx}\n{state}\nPROBLEM: {problem}\n{}", replan_rule(prefix))
 }
 
 pub fn replan_user(tools: &str, ctx: &str, done: &str, problem: &str, prefix: &str, max_steps: u32) -> String {

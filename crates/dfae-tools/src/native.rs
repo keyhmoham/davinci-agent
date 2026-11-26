@@ -596,7 +596,10 @@ impl Tool for Shell {
             let cwd = crate::coding::resolve_cwd(&self.policy, &input)?;
             if input.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
                 let id = crate::coding::spawn_job(cmd, &cwd)?;
-                return Ok(ToolOutput::ok(format!("started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it")));
+                let first = crate::coding::settle_job(id, Duration::from_millis(1500)).await?;
+                return Ok(ToolOutput::ok(format!(
+                    "started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it{first}"
+                )));
             }
             let secs = input.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(120).clamp(1, cfg.max_timeout_secs.max(1));
             return crate::coding::run_script(cmd, &cwd, Duration::from_secs(secs), cfg.max_output_bytes.max(65_536), &ctx).await;

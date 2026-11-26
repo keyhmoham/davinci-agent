@@ -245,6 +245,15 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
             s.status = StepStatus::Pending;
         }
     }
+    // A patch that adds steps and says nothing of the failed one has replaced it: the failed step is not worth a second round
+    // with the planner (which tends to answer with a patch that has lost its additions).
+    if !patch.add.is_empty() {
+        let failed: HashSet<String> = steps.iter().filter(|s| s.status == StepStatus::Failed).map(|s| s.id.clone()).collect();
+        steps.retain(|s| !failed.contains(&s.id));
+        for s in &mut steps {
+            s.depends_on.retain(|d| !failed.contains(d));
+        }
+    }
     for s in &steps {
         if s.status == StepStatus::Failed {
             issues.push(format!("{} failed ({}) and is neither edited nor dropped", s.id, tokens::truncate_tokens(s.error.as_deref().unwrap_or("error"), 20)));
@@ -296,6 +305,9 @@ pub fn expect_checks(expect: &str) -> (Vec<Check>, bool) {
         i += 1;
     }
     clauses.push(cur);
+    // An unquoted phrase after "contains" ("contains the title Moon Landing") describes a thing, it does not quote the text: looking
+    // for those words verbatim would send a good result back to the planner. Only a quoted value, or a single word, is a check.
+    let bare_phrase = |c: &regex::Captures, group: usize| c.get(group).is_some_and(|m| m.as_str().trim().contains(char::is_whitespace));
     for clause in clauses.iter().map(|c| c.trim()).filter(|c| !c.is_empty()) {
         let pick =
             |c: &regex::Captures, from: usize| (from..c.len()).find_map(|i| c.get(i)).map(|m| m.as_str().trim().trim_matches(['"', '`', '\'']).to_string());
@@ -303,11 +315,13 @@ pub fn expect_checks(expect: &str) -> (Vec<Check>, bool) {
             checks.push(Check::FileExists { path: c[1].to_string() });
         } else if let Some(c) = EXPECT_CONTAINS.captures(clause)
             && let Some(v) = pick(&c, 2).filter(|v| !v.is_empty())
+            && !bare_phrase(&c, 5)
             && (c[1].contains('.') || c[1].contains('/'))
         {
             checks.push(Check::FileContains { path: c[1].to_string(), value: v });
         } else if let Some(c) = EXPECT_OUTPUT.captures(clause)
             && let Some(v) = pick(&c, 1).filter(|v| !v.is_empty())
+            && !bare_phrase(&c, 4)
         {
             checks.push(Check::Contains { value: v });
         } else if EXPECT_OK.is_match(clause) {
@@ -603,6 +617,34 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_that_adds_steps_replaces_the_failed_one_it_does_not_mention() {
+        use crate::plandoc::{PatchDoc, StepDoc};
+        let r = registry();
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_mkdir", "do": "make a dir", "args": {"path": "site"}},
+            {"id": "s2", "tool": "shell", "do": "serve it", "args": {"command": "true"}, "after": ["s1"]}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
+        steps[0].status = StepStatus::Succeeded;
+        steps[1].status = StepStatus::Failed;
+        let replacement = StepDoc {
+            id: "x".into(),
+            tool: Some("shell".into()),
+            intent: "serve it on another port".into(),
+            after: vec!["s1".into()],
+            expect: None,
+            planner: false,
+            args: None,
+        };
+        let adds = PatchDoc { edit: vec![], add: vec![replacement.clone()], drop: vec![] };
+        let merged = apply_patch(&steps, &adds, "r1_", &r).expect("the addition replaces the failed step");
+        assert_eq!(merged.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "r1_1"]);
+        // with nothing added, a failed step that nobody handles is still a problem to hand back to the planner
+        let nothing = PatchDoc { edit: vec![], add: vec![], drop: vec![] };
+        assert!(apply_patch(&steps, &nothing, "r1_", &r).unwrap_err()[0].contains("neither edited nor dropped"));
+    }
+
+    #[test]
     fn rejects_bad_plans() {
         let r = registry();
         let bad = |v: Value| {
@@ -765,6 +807,14 @@ mod expect_tests {
         let (c, all) = expect_checks("site/index.html exists and the page looks professional");
         assert_eq!(c.len(), 1);
         assert!(!all, "one clause was not understood, so the model still judges");
+    }
+
+    #[test]
+    fn a_described_value_is_not_a_quotation() {
+        let (c, all) = expect_checks("site/index.html contains the title Moon Landing");
+        assert!(c.is_empty() && !all, "{c:?}: the decision model judges what code cannot read");
+        let (c, all) = expect_checks("config.toml contains port=9090");
+        assert_eq!((c, all), (vec![Check::FileContains { path: "config.toml".into(), value: "port=9090".into() }], true));
     }
 
     #[test]

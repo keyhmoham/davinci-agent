@@ -125,15 +125,23 @@ pub fn mode_request(state: DecisionState) -> DecisionRequest {
     DecisionRequest { kind: DecisionKind::SelectMode, state, questions: q }
 }
 
-pub fn tool_key(name: &str) -> String {
-    format!("tool:{name}")
-}
-
+/// Which tool does the request need most? One multiple-choice question over all tools (and `none`), not one yes/no per tool: a small
+/// model compares options far better than it judges each in isolation — asked one by one, a 4B model said "no" to every tool.
 pub fn tools_request(state: DecisionState) -> DecisionRequest {
-    let mut q = BTreeMap::new();
-    for t in &state.tools {
-        q.insert(tool_key(&t.name), Question::noul(format!("Is the tool `{}` ({}) needed for the request?", t.name, t.description)));
+    let mut criteria: BTreeMap<String, String> = BTreeMap::new();
+    criteria.insert("none".into(), "no tool: a conversation, or a question answered from knowledge".into());
+    for t in state.tools.iter().take(25) {
+        let first = t.description.split(". ").next().unwrap_or(&t.description);
+        criteria.insert(t.name.clone(), first.chars().take(180).collect());
     }
+    let mut q = BTreeMap::new();
+    q.insert(
+        "tool".into(),
+        Question::Choice {
+            instructions: "Which ONE tool does the request need most? Answer none if no tool is needed. (Several may be needed: name the main one.)".into(),
+            criteria,
+        },
+    );
     DecisionRequest { kind: DecisionKind::SelectTools, state, questions: q }
 }
 

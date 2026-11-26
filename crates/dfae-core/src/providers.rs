@@ -49,6 +49,9 @@ pub struct GenerationRequest {
     pub schema: Option<serde_json::Value>,
     /// The schema is in strict form (every property required, none extra): the server must follow it exactly.
     pub schema_strict: bool,
+    /// How hard a reasoning model may think before it answers: `off`, `minimal`, `low`, `medium`, `high`; `None` leaves the
+    /// provider's default. Hidden reasoning is billed as output and counts against `max_tokens`.
+    pub reasoning: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]

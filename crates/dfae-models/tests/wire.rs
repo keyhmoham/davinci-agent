@@ -30,6 +30,7 @@ fn req(json_mode: bool) -> GenerationRequest {
         cache: false,
         schema: None,
         schema_strict: false,
+        reasoning: None,
     }
 }
 

@@ -606,6 +606,26 @@ pub(crate) fn spawn_job(script: &str, cwd: &Path) -> Result<u32, ToolError> {
     Ok(id)
 }
 
+/// A server that dies at once (port in use, missing directory, syntax error) must not be reported as started: wait briefly,
+/// and if the job has exited, say why. Otherwise it is up (what it printed so far comes with the answer).
+pub(crate) async fn settle_job(id: u32, grace: Duration) -> Result<String, ToolError> {
+    let job = JOBS.lock().get(&id).cloned().ok_or_else(|| ToolError::new(ErrorKind::NotFound, format!("no background job {id}")))?;
+    let deadline = tokio::time::Instant::now() + grace;
+    while job.exit.lock().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // let the readers drain what the dying process wrote
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let out = job.out.lock().trim().to_string();
+    let tail: String = out.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect();
+    let code = *job.exit.lock();
+    match code {
+        Some(c) => Err(ToolError::new(ErrorKind::Other, format!("the background command exited at once [exit code {c}]: {tail}"))),
+        None if tail.is_empty() => Ok(String::new()),
+        None => Ok(format!("\nfirst output: {tail}")),
+    }
+}
+
 pub struct ShellOutput;
 pub struct ShellKill;
 
@@ -749,5 +769,26 @@ mod tests {
         assert!(m("src/*", "src/a") && !m("src/*", "src/a/b"), "a single star stays inside one directory");
         assert!(m("data/[0-9].csv", "data/5.csv"));
         assert!(m("a.b", "a.b") && !m("a.b", "aXb"), "dots are literal");
+    }
+}
+
+#[cfg(test)]
+mod job_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_background_command_that_dies_at_once_is_a_failure_with_its_output() {
+        let dir = std::env::temp_dir();
+        let id = spawn_job("echo 'Address already in use' >&2; exit 3", &dir).unwrap();
+        let err = settle_job(id, Duration::from_secs(3)).await.unwrap_err().to_string();
+        assert!(err.contains("exit code 3") && err.contains("Address already in use"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_running_background_command_is_started() {
+        let id = spawn_job("echo ready; sleep 5", &std::env::temp_dir()).unwrap();
+        let first = settle_job(id, Duration::from_millis(400)).await.unwrap();
+        assert!(first.contains("ready"), "{first}");
+        job(&json!({"job_id": id})).unwrap().1.kill.notify_one();
     }
 }

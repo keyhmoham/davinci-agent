@@ -24,7 +24,13 @@ No model owns control flow, permissions, or the claim that a task is done.
    writes a JSON plan; it is parsed, **validated** (schema, known tools, only the selected tools, argument
    types, DAG acyclicity, step/tool-call budgets), repaired once with the exact problems listed, and — if the
    worker model still fails and a planner model exists — re-planned there.
-7. **Execute** — DAG waves with bounded parallelism (`DFAE_MAX_PARALLEL`).
+   With a planner model the plan is requested through a strict JSON Schema (tools as an enum), read leniently, repaired by
+   code, and sent back to the planner with typed issues only when code cannot fix it; the planner sees the whole tool
+   catalogue (the decision model's tool choice only serves quick tasks and the worker-plans fallback).
+7. **Execute** — each brief step is bound just before it runs: rules and the extractor first, then the worker model
+   (asked only for the parameters the step needs; file content is written as plain text, not squeezed into JSON), then the
+   planner model. A bound `cwd` must exist; a background command that dies within 1.5 s is a failed step with its output.
+   DAG waves with bounded parallelism (`DFAE_MAX_PARALLEL`).
 8. **Verify** — evidence-based; one continuation round if the completion judgment is low.
 9. **Answer** — templated (no model) unless reasoning steps produced material to compose; model-written
    answers are checked for ungrounded numbers/paths/URLs.
@@ -207,7 +213,7 @@ effects that were mid-flight are marked failed ("outcome unknown") and never sil
 |---|---|---|
 | `route_task` | `task_type` (choice), `complexity` (score), `needs_tools` (noul), `risk` (choice) | context profile, calibration keys |
 | `select_mode` | `mode` (choice: direct / assisted / escalated) | execution tier |
-| `select_tools` | one `tool:<name>` (noul) per tool | which signatures the model sees |
+| `select_tools` | one multiple choice: the tools and `none` | which signatures the model sees (not asked when the planner model plans: it sees the whole catalogue) |
 | `assess_plan` | `plan_ok` (noul) | recorded; low value emits a warning (policy is the gate) |
 | `assess_recovery` | `recovery` (choice: retry / replan / skip / escalate / fail) | failure handling |
 | `assess_completion` | `complete` (noul) | only when evidence alone is ambiguous |
