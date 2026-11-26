@@ -522,7 +522,8 @@ impl Inner {
             all.iter().skip(all.len().saturating_sub(keep)).map(|(q, a)| (tokens::truncate_tokens(q, q_tok), tokens::truncate_tokens(a, a_tok))).collect();
         let gap = if step.description.contains("no tool fits") { "NOTE: no tool fits this request\n" } else { "" };
         let user = format!("CAN: {can}\n{gap}{goal}");
-        let mut req = self.gen_request(tier, prompts::CHAT_SYSTEM, user, "chat");
+        let chat_system = format!("{}\n{}", prompts::CHAT_SYSTEM, self.shell_environment(true));
+        let mut req = self.gen_request(tier, &chat_system, user, "chat");
         req.temperature = 0.6;
         let current = req.messages.pop();
         for (q, a) in turns {
@@ -540,7 +541,7 @@ impl Inner {
             // the planner model cannot be reached: the self-hosted one answers instead of the user getting an error
             Err(e) if paid && self.models.has(Tier::Worker) && e.contains("model request failed") => {
                 self.emit(ctx, EventKind::Warning { message: format!("the planner model is unavailable ({e}); the worker model answers instead") }).await;
-                let mut local = self.gen_request(Tier::Worker, prompts::CHAT_SYSTEM, String::new(), "chat");
+                let mut local = self.gen_request(Tier::Worker, &chat_system, String::new(), "chat");
                 local.messages = req.messages.clone();
                 local.temperature = 0.6;
                 self.generate_text(ctx, Tier::Worker, local).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?
@@ -641,8 +642,10 @@ impl Inner {
             sh.put(k, content.clone(), generation);
         }
         if !out.ok {
-            let first = content.lines().next().unwrap_or("").chars().take(160).collect::<String>();
-            return Err(StepFailure::new(ErrorKind::Other, format!("{name} reported failure (exit {}): {first}", out.exit_code.unwrap_or(-1))));
+            return Err(StepFailure::new(
+                ErrorKind::Other,
+                format!("{name} reported failure (exit {}): {}", out.exit_code.unwrap_or(-1), failure_digest(&content)),
+            ));
         }
         for c in &meta.contract {
             let (pass, ev) = self.eval_check(c, &content);
@@ -799,7 +802,7 @@ impl Inner {
         st.step_facts = Some(StepFacts {
             step_id: id.into(),
             tool: step.tool.clone(),
-            error: tokens::truncate_tokens(&f.message, 40),
+            error: clip_error(&f.message, 120),
             error_kind: kind_str(f.kind),
             attempts: step.attempts,
             max_attempts: step.retry.max_attempts,
@@ -864,7 +867,7 @@ impl Inner {
                     step.tool.as_deref().unwrap_or("reasoning"),
                     tokens::truncate_tokens(&step.args.to_string(), 30),
                     kind_str(f.kind),
-                    tokens::truncate_tokens(&f.message, 50)
+                    clip_error(&f.message, 380)
                 );
                 match self.replan(ctx, tier, &goal, &problem, Some(id)).await {
                     Ok(true) => None,
@@ -987,7 +990,7 @@ impl Inner {
     /// plan as it stands. Only what changes is written, and only what changes runs again.
     async fn patch_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, problem: &str, replans: u32, budget: &Budget) -> Result<bool, String> {
         let prefix = format!("r{replans}_");
-        let ctx_text = self.context_text(ctx, false, Tier::Planner).await;
+        let ctx_text = format!("{}{}", self.context_text(ctx, false, Tier::Planner).await, self.ports_line().await);
         let (current, state) = {
             let r = ctx.rec.lock().await;
             let plan = r.plan.as_ref().ok_or("no plan")?;
@@ -999,7 +1002,7 @@ impl Inner {
                     let after = if s.depends_on.is_empty() { String::new() } else { format!(" (after {})", s.depends_on.join(",")) };
                     match s.status {
                         StepStatus::Succeeded => format!("{} DONE {what} → {}", s.id, tokens::truncate_tokens(s.summary.as_deref().unwrap_or(""), 40)),
-                        StepStatus::Failed => format!("{} FAILED {what}{after}: {}", s.id, tokens::truncate_tokens(s.error.as_deref().unwrap_or("error"), 40)),
+                        StepStatus::Failed => format!("{} FAILED {what}{after}: {}", s.id, clip_error(s.error.as_deref().unwrap_or("error"), 150)),
                         StepStatus::Skipped => format!("{} SKIPPED {what}", s.id),
                         _ => format!("{} TODO {what}{after}", s.id),
                     }
@@ -1071,4 +1074,84 @@ impl Inner {
 #[allow(dead_code)]
 fn _unused(_: Value) -> Value {
     json!(null)
+}
+
+/// An error text cut to a size, keeping its END: what went wrong is said last.
+fn clip_error(msg: &str, max_tokens: usize) -> String {
+    let max_chars = max_tokens * 4;
+    let n = msg.chars().count();
+    if n <= max_chars { msg.to_string() } else { format!("…{}", msg.chars().skip(n - max_chars).collect::<String>()) }
+}
+
+/// What a failed command said that matters: the end of its output (where a build, a test run or an install says what went wrong), and,
+/// when the end holds no complaint, the last lines that do. The first line of a log is its banner.
+pub(crate) fn failure_digest(output: &str) -> String {
+    static COMPLAINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:error|failed|failure|exception|traceback|cannot|can't|not found|denied|fatal|panic|unable|invalid|missing)\b|^E {2,}|^\s*assert ",
+        )
+        .unwrap()
+    });
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty() && !l.starts_with("npm notice") && !l.starts_with("[hint]") && !l.starts_with("[exit code"))
+        .collect();
+    if lines.len() <= 3 {
+        return lines.join(" | ").chars().take(400).collect();
+    }
+    let tail_start = lines.len().saturating_sub(14);
+    let tail = &lines[tail_start..];
+    // The complaints before the tail, each said once: a test runner ends with a one-line summary per failure (cut with "…") and says what
+    // actually went wrong ("E   no such table: bookmarks") further up.
+    let mut out: Vec<&str> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let earlier: Vec<&str> = lines[..tail_start].iter().copied().filter(|l| COMPLAINT.is_match(l) && seen.insert(l.trim())).collect();
+    out.extend(earlier.iter().rev().take(6).rev());
+    if !out.is_empty() {
+        out.push("[…]");
+    }
+    out.extend(tail);
+    let text = out.join("\n");
+    // the end is what counts: when it is too long, the start is cut
+    if text.chars().count() > 1800 { format!("…{}", text.chars().skip(text.chars().count() - 1800).collect::<String>()) } else { text }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::failure_digest;
+
+    #[test]
+    fn a_failed_build_is_summarised_by_its_end_not_its_banner() {
+        let mut log = String::from("> app@0.1.0 build\n> next build\n");
+        for i in 0..60 {
+            log.push_str(&format!("  compiled route {i}\n"));
+        }
+        log.push_str("Error occurred prerendering page \"/\"\n  at src/app/page.tsx:405:54\nnpm notice New major version\n[exit code 1]");
+        let d = failure_digest(&log);
+        assert!(
+            d.contains("src/app/page.tsx:405:54") && d.contains("Error occurred prerendering") && !d.contains("npm notice") && !d.contains("[exit code"),
+            "{d}"
+        );
+        assert!(!d.contains("compiled route 3\n"), "the middle is not carried along");
+        assert_eq!(failure_digest("one line"), "one line");
+        // a complaint earlier than the tail is kept when the tail has none
+        let mut log = String::from("fatal: repository not found\n");
+        for i in 0..30 {
+            log.push_str(&format!("cleanup step {i}\n"));
+        }
+        let d = failure_digest(&log);
+        assert!(d.contains("fatal: repository not found") && d.contains("[…]") && d.contains("cleanup step 29"), "{d}");
+        // a test run: the cause is in the middle, each failure's summary is cut at the end
+        let mut run = String::from("============ FAILURES ============\n");
+        for _ in 0..4 {
+            run.push_str("    def test_x():\n>       db.execute(sql)\nE       sqlite3.OperationalError: no such table: bookmarks\n");
+        }
+        for i in 0..20 {
+            run.push_str(&format!("warning line {i}\n"));
+        }
+        run.push_str("FAILED test_main.py::test_add - sqlite3.OperationalError: table bo...\n4 failed in 1.2s");
+        let d = failure_digest(&run);
+        assert!(d.contains("no such table: bookmarks") && d.matches("no such table").count() == 1 && d.contains("4 failed"), "{d}");
+    }
 }

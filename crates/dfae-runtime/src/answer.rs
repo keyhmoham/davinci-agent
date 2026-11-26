@@ -144,8 +144,10 @@ pub fn ungrounded_claims(answer: &str, evidence: &str, goal: &str) -> Vec<String
         }
     };
     for m in NUMBER.find_iter(answer) {
+        // a number the answer worked out (a day of the month, an hour after a time-zone conversion, a count of three items) is not a
+        // claim about the evidence: only three digits or more, or a decimal, is
         let digits = m.as_str().chars().filter(|c| c.is_ascii_digit()).count();
-        if digits >= 2 {
+        if digits >= 3 || (digits >= 2 && m.as_str().contains('.')) {
             check(m.as_str());
         }
     }
@@ -160,6 +162,24 @@ pub fn ungrounded_claims(answer: &str, evidence: &str, goal: &str) -> Vec<String
 }
 
 impl Inner {
+    /// A plan that only looked something up (nothing changed) and got back a blob — JSON, a page, a long listing — has not answered the
+    /// question yet: the worker model writes the answer from it. A short plain result is the answer itself.
+    fn data_needs_composing(&self, plan: &Plan) -> bool {
+        let done: Vec<&Step> = plan.steps.iter().filter(|s| s.status == StepStatus::Succeeded).collect();
+        // (a file or a command's output is shown as it is: that is what was asked for; what outside services and the web return is data)
+        if done.is_empty()
+            || done.iter().any(|s| {
+                s.kind != StepKind::Tool
+                    || s.tool.as_deref().and_then(|t| self.tools.meta(t)).is_none_or(|m| m.side_effects || !matches!(m.category.as_str(), "mcp" | "web"))
+            })
+        {
+            return false;
+        }
+        let last = done.last().and_then(|s| s.output.as_deref()).unwrap_or("").trim();
+        let blob = last.starts_with('{') || last.starts_with('[') || last.starts_with('<');
+        blob || last.chars().count() > 600
+    }
+
     /// Did any step that changes something finish?
     fn did_change(&self, plan: &Plan) -> bool {
         plan.steps.iter().any(|s| {
@@ -202,7 +222,7 @@ impl Inner {
         // only tool output is ground truth: a model's own prose must never vouch for itself
         let evidence_full: String = plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
         let mut from_model = false;
-        let text = if exec_err.is_some() || !plan.has_reasoning() {
+        let text = if exec_err.is_some() || (!plan.has_reasoning() && !self.data_needs_composing(&plan)) {
             templated_answer(&snapshot, exec_err)
         } else if let Some(t) = single_leaf {
             from_model = true;

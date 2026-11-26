@@ -1,12 +1,15 @@
 use dfae_core::*;
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Registry of available tools with their metadata. The model only ever sees
 /// the subset the decision layer selected for the task.
+///
+/// Clones share their tools: MCP servers connect while the engine runs, and what they bring is registered for everyone.
 #[derive(Default, Clone)]
 pub struct ToolRegistry {
-    tools: BTreeMap<String, Arc<dyn Tool>>,
+    tools: Arc<RwLock<BTreeMap<String, Arc<dyn Tool>>>>,
 }
 
 impl ToolRegistry {
@@ -14,24 +17,33 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.metadata().name, tool);
+    pub fn register(&self, tool: Arc<dyn Tool>) {
+        self.tools.write().insert(tool.metadata().name, tool);
+    }
+
+    /// Remove every tool whose name starts with `prefix` (a disconnected server's tools).
+    pub fn unregister_prefix(&self, prefix: &str) -> usize {
+        let mut t = self.tools.write();
+        let before = t.len();
+        t.retain(|n, _| !n.starts_with(prefix));
+        before - t.len()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.get(name).cloned()
+        self.tools.read().get(name).cloned()
     }
 
     pub fn meta(&self, name: &str) -> Option<ToolMetadata> {
-        self.tools.get(name).map(|t| t.metadata())
+        self.get(name).map(|t| t.metadata())
     }
 
     pub fn metas(&self) -> Vec<ToolMetadata> {
-        self.tools.values().map(|t| t.metadata()).collect()
+        let tools: Vec<Arc<dyn Tool>> = self.tools.read().values().cloned().collect();
+        tools.iter().map(|t| t.metadata()).collect()
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.tools.keys().cloned().collect()
+        self.tools.read().keys().cloned().collect()
     }
 
     pub fn briefs(&self) -> Vec<ToolBrief> {
@@ -77,10 +89,10 @@ impl ToolRegistry {
     }
 
     pub fn len(&self) -> usize {
-        self.tools.len()
+        self.tools.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
+        self.tools.read().is_empty()
     }
 }

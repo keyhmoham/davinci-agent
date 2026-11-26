@@ -51,6 +51,10 @@ pub(crate) struct TaskCtx {
     pub done: Mutex<Option<oneshot::Sender<TaskRecord>>>,
     /// Results that did not meet the planner's expectation: the plan is revisited once the running steps finish.
     pub checkpoints: Mutex<Vec<String>>,
+    /// MCP servers attached to this task: only their tools are visible to it.
+    pub mcp: Mutex<HashSet<String>>,
+    /// Tools of those servers that this task does not see: a big server shows the planner the few that fit the request, not all of them.
+    pub mcp_hidden: Mutex<HashSet<String>>,
 }
 
 impl TaskCtx {
@@ -69,10 +73,18 @@ impl TaskCtx {
             permit: Mutex::new(None),
             done: Mutex::new(None),
             checkpoints: Mutex::new(Vec::new()),
+            mcp: Mutex::new(HashSet::new()),
+            mcp_hidden: Mutex::new(HashSet::new()),
         })
     }
 
     pub fn in_scope(&self, tool: &str) -> bool {
+        // an MCP server's tools belong to the tasks it was attached to
+        if let Some(server) = dfae_mcp::server_of(tool)
+            && (!self.mcp.lock().contains(server) || self.mcp_hidden.lock().contains(tool))
+        {
+            return false;
+        }
         self.scope.lock().as_ref().map(|s| s.contains(tool)).unwrap_or(true)
     }
 }
@@ -106,6 +118,8 @@ pub(crate) struct Inner {
     pub prefix_policy: Mutex<crate::economy::prefix::PrefixPolicy>,
     /// Shadow evaluation of the decision model: requests compared / questions agreed on / questions compared.
     pub shadow: [std::sync::atomic::AtomicU64; 3],
+    /// MCP servers: set once at startup, when any are configured or discoverable.
+    pub mcp: std::sync::OnceLock<Arc<dfae_mcp::McpHub>>,
 }
 
 /// The agent engine. Cheap to clone.
@@ -171,8 +185,25 @@ impl Engine {
                 prefix_misses: std::sync::atomic::AtomicU32::new(0),
                 prefix_policy: Mutex::new(Default::default()),
                 shadow: Default::default(),
+                mcp: std::sync::OnceLock::new(),
             }),
         }
+    }
+
+    /// Give the engine its MCP servers (once).
+    pub fn set_mcp(&self, hub: Arc<dfae_mcp::McpHub>) {
+        let _ = self.inner.mcp.set(hub);
+    }
+
+    pub fn mcp(&self) -> Option<Arc<dfae_mcp::McpHub>> {
+        self.inner.mcp.get().cloned()
+    }
+
+    /// Add a remote MCP server by URL. Only public hosts: a local server is the operator's to configure, not an API caller's.
+    pub async fn mcp_add_remote(&self, name: &str, url: &str, headers: std::collections::BTreeMap<String, String>) -> Result<(), String> {
+        let hub = self.mcp().ok_or("MCP is not configured (set DFAE_MCP_SERVERS or GLAMA_API_KEY)")?;
+        self.inner.policy.public_host(url)?;
+        hub.add(name, dfae_mcp::Spec::Http { url: url.into(), headers }, dfae_mcp::Source::Api, None, "", false).await.map(|_| ()).map_err(|e| e.to_string())
     }
 
     /// Load learned state (the cost model) from the store. Call once at startup.
@@ -656,6 +687,17 @@ impl Inner {
     /// Would reasoning in this mode go to the planner model? Self-hosted models are free.
     pub(crate) fn uses_planner(&self, mode: ExecMode) -> bool {
         self.pick_tier(mode) == Some(Tier::Planner)
+    }
+
+    /// What the models that decide what to run are told about the shell: what it is, and that they may install what they need.
+    pub(crate) fn shell_environment(&self, short: bool) -> &'static str {
+        let sandbox = self.policy.config().shell.mode == dfae_tools::ShellMode::Sandbox;
+        match (sandbox, short) {
+            (true, false) => crate::prompts::ENV_SANDBOX,
+            (true, true) => crate::prompts::ENV_SANDBOX_SHORT,
+            (false, false) => crate::prompts::ENV_RESTRICTED,
+            (false, true) => crate::prompts::ENV_RESTRICTED_SHORT,
+        }
     }
 
     pub(crate) fn gen_request(&self, tier: Tier, system: &str, user: String, purpose: &str) -> GenerationRequest {

@@ -497,11 +497,182 @@ fn shell_bin() -> &'static str {
     if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() { "bash" } else { "sh" }
 }
 
-/// Run `script` with the shell in `cwd`: pipes, redirects, `&&`, globbing — the lot.
-pub(crate) async fn run_script(script: &str, cwd: &Path, timeout: Duration, max_bytes: usize, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-    let argv = vec![shell_bin().to_string(), "-c".into(), script.to_string()];
-    let r = sandbox::run_argv(&argv, cwd, timeout, max_bytes, &ctx.cancel).await?;
-    Ok(format_exec(r))
+/// Output that keeps its start and its end: a long install or build log says what it was doing at the top and what went wrong at
+/// the bottom, and what is between is the part nobody needs.
+struct Capture {
+    head: Vec<u8>,
+    tail: std::collections::VecDeque<u8>,
+    head_max: usize,
+    tail_max: usize,
+    dropped: usize,
+}
+
+impl Capture {
+    fn new(max: usize) -> Self {
+        let max = max.max(1024);
+        Self { head: Vec::new(), tail: Default::default(), head_max: max / 3, tail_max: max - max / 3, dropped: 0 }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        let room = self.head_max.saturating_sub(self.head.len());
+        let (h, rest) = chunk.split_at(room.min(chunk.len()));
+        self.head.extend_from_slice(h);
+        self.tail.extend(rest);
+        while self.tail.len() > self.tail_max {
+            self.tail.pop_front();
+            self.dropped += 1;
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut bytes = self.head.clone();
+        if self.dropped > 0 {
+            bytes.extend_from_slice(format!("\n… [{} bytes omitted] …\n", self.dropped).as_bytes());
+        }
+        bytes.extend(self.tail.iter());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// What a terminal would have shown: no colour codes, and a progress bar redrawn with `\r` is its last frame.
+pub(crate) fn clean_output(s: &str) -> String {
+    static ANSI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07").unwrap());
+    let s = ANSI.replace_all(s, "");
+    s.lines().map(|l| l.rsplit('\r').find(|seg| !seg.is_empty()).unwrap_or("")).collect::<Vec<_>>().join("\n")
+}
+
+fn kill_group(pid: Option<u32>) {
+    if let Some(p) = pid {
+        // the command was started as the leader of its own process group: everything it started goes with it
+        unsafe {
+            libc::killpg(p as i32, libc::SIGKILL);
+        }
+    }
+}
+
+/// A command that installs or builds takes minutes, not seconds.
+pub(crate) fn default_timeout(policy: &PolicyEngine, command: &str) -> Duration {
+    static SLOW: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?x)\b(?:pip3?|pipx|uv|poetry|conda|npm|npx|yarn|pnpm|bun|cargo|rustup|go\s+(?:install|build|get|mod)|apt(?:-get)?|dfae-apt|brew|gem|bundle|composer|mvn|gradle|make|cmake|ninja|git\s+clone|docker|curl|wget)\b").unwrap()
+    });
+    let sh = &policy.config().shell;
+    Duration::from_secs(if SLOW.is_match(command) { sh.install_timeout_secs } else { sh.default_timeout_secs }.clamp(1, sh.max_timeout_secs.max(1)))
+}
+
+/// Run `script` with the shell in `cwd`: pipes, redirects, `&&`, globbing — the lot. stderr is merged into stdout (in the order the
+/// command wrote them), the command leads its own process group (a timeout ends everything it started), and what it printed before
+/// a timeout is not lost.
+pub(crate) async fn run_script(
+    policy: &PolicyEngine,
+    script: &str,
+    cwd: &Path,
+    timeout: Duration,
+    max_bytes: usize,
+    ctx: &ToolContext,
+) -> Result<ToolOutput, ToolError> {
+    let mut cmd = tokio::process::Command::new(shell_bin());
+    cmd.arg("-c")
+        .arg(format!("exec 2>&1\n{script}"))
+        .current_dir(cwd)
+        .env_clear()
+        .envs(crate::toolbox::shell_env(policy))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| ToolError::io(format!("spawn failed: {e}")))?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("piped");
+    let cap = Arc::new(Mutex::new(Capture::new(max_bytes)));
+    let reader = {
+        let cap = cap.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stdout.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                cap.lock().push(&buf[..n]);
+            }
+        })
+    };
+    let waited = tokio::select! {
+        _ = ctx.cancel.cancelled() => None,
+        r = tokio::time::timeout(timeout, child.wait()) => Some(r),
+    };
+    let (code, timed_out) = match waited {
+        None => {
+            kill_group(pid);
+            let _ = child.wait().await;
+            return Err(ToolError::new(ErrorKind::Cancelled, "cancelled"));
+        }
+        Some(Ok(Ok(status))) => {
+            use std::os::unix::process::ExitStatusExt;
+            (status.code().or(status.signal().map(|s| 128 + s)), false)
+        }
+        Some(Ok(Err(e))) => return Err(ToolError::io(e.to_string())),
+        Some(Err(_)) => {
+            kill_group(pid);
+            let _ = child.wait().await;
+            (None, true)
+        }
+    };
+    // what is left in the pipe; a process the command left running keeps it open, which is not worth waiting for
+    let _ = tokio::time::timeout(Duration::from_millis(400), reader).await;
+    let raw = cap.lock().text();
+    let mut text = clean_output(&raw).trim().to_string();
+    let code = code.unwrap_or(-1);
+    if timed_out {
+        text.push_str(&format!(
+            "\n[timed out after {}s and was killed: pass a larger timeout_secs (up to {}) if it needs longer; use background=true for something that keeps running]",
+            timeout.as_secs(),
+            policy.config().shell.max_timeout_secs
+        ));
+    } else if code != 0 {
+        text.push_str(&format!("\n[exit code {code}]"));
+    }
+    if (code != 0 || timed_out)
+        && let Some(h) = hint(script, &text)
+    {
+        text.push_str(&format!("\n[hint] {h}"));
+    }
+    Ok(ToolOutput { content: text.trim().to_string(), ok: code == 0 && !timed_out, exit_code: Some(code), evidence: vec![format!("exit code {code}")] })
+}
+
+/// What a failed command usually means here, said once and plainly: the agent may install what is missing.
+fn hint(script: &str, output: &str) -> Option<String> {
+    static NOT_FOUND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)(?:^|: )([\w.+-]+): (?:command )?not found").unwrap());
+    static PY_MODULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"No module named '?([\w.-]+)").unwrap());
+    static NODE_MODULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Cannot find module '([^']+)'").unwrap());
+    if let Some(c) = NOT_FOUND.captures(output) {
+        let tool = &c[1];
+        return Some(format!(
+            "`{tool}` is not installed. You are allowed to install it: `pip install <package>`, `npm install -g <package>`, `cargo install <crate>`, `go install <module>@latest`, \
+             `dfae-apt <debian-package>` for a system package, or download a release binary with curl into $DFAE_TOOLS/bin (chmod +x). Install it, then run the command again."
+        ));
+    }
+    if let Some(c) = PY_MODULE.captures(output) {
+        let m = c[1].split('.').next().unwrap_or(&c[1]);
+        return Some(format!(
+            "the Python module `{m}` is missing: `pip install {m}` (the package name may differ from the module name), then run the command again."
+        ));
+    }
+    if let Some(c) = NODE_MODULE.captures(output)
+        && !c[1].starts_with('.')
+        && !c[1].starts_with('/')
+    {
+        return Some(format!("the Node module `{}` is missing: `npm install {}` in the project directory, then run the command again.", &c[1], &c[1]));
+    }
+    if output.contains("no such option: -y") || output.contains("no such option: --yes") {
+        return Some("pip does not take -y (it never asks): run the command again without it.".into());
+    }
+    if (output.contains("Permission denied") || output.contains("Read-only file system") || output.contains("EACCES"))
+        && (output.contains("/usr") || output.contains("/etc") || output.contains("/var") || script.contains("sudo") || script.contains("apt"))
+    {
+        return Some("system directories are read-only and there is no root: install into the toolbox instead (`pip install` and `npm install -g` already do; `dfae-apt <package>` for Debian packages) and never use sudo.".into());
+    }
+    None
 }
 
 pub(crate) fn format_exec(r: sandbox::ExecResult) -> ToolOutput {
@@ -548,21 +719,20 @@ fn append(job: &Job, chunk: &[u8]) {
     }
 }
 
-pub(crate) fn spawn_job(script: &str, cwd: &Path) -> Result<u32, ToolError> {
+pub(crate) fn spawn_job(policy: &PolicyEngine, script: &str, cwd: &Path) -> Result<u32, ToolError> {
     let mut cmd = tokio::process::Command::new(shell_bin());
     cmd.arg("-c")
         .arg(script)
         .current_dir(cwd)
         .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-        .env("HOME", "/tmp")
-        .env("LANG", "C.UTF-8")
-        .env("TERM", "dumb")
+        .envs(crate::toolbox::shell_env(policy))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| ToolError::io(format!("spawn failed: {e}")))?;
+    let pid = child.id();
     let id = NEXT_JOB.fetch_add(1, Ordering::SeqCst);
     let job = Arc::new(Job {
         command: script.chars().take(80).collect(),
@@ -596,7 +766,8 @@ pub(crate) fn spawn_job(script: &str, cwd: &Path) -> Result<u32, ToolError> {
         let code = tokio::select! {
             s = child.wait() => s.ok().and_then(|s| s.code()).unwrap_or(-1),
             _ = job.kill.notified() => {
-                let _ = child.start_kill();
+                // the job and whatever it started (a server's workers, a watcher's children)
+                kill_group(pid);
                 let _ = child.wait().await;
                 -9
             }
@@ -623,6 +794,68 @@ pub(crate) async fn settle_job(id: u32, grace: Duration) -> Result<String, ToolE
         Some(c) => Err(ToolError::new(ErrorKind::Other, format!("the background command exited at once [exit code {c}]: {tail}"))),
         None if tail.is_empty() => Ok(String::new()),
         None => Ok(format!("\nfirst output: {tail}")),
+    }
+}
+
+/// The port a command says it listens on (`--port 8001`, `-p 8001`, `http.server 8001`, `PORT=8001`), if it says one.
+pub(crate) fn port_in(command: &str) -> Option<u16> {
+    static PORT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:--port|--listen|-p|-P|-l|PORT)[ =]+(?:[\w.]*:)?(\d{4,5})\b|http\.server\s+(\d{4,5})\b|--bind\s+[\w.]*:(\d{4,5})\b|\s(?:0\.0\.0\.0|127\.0\.0\.1|localhost):(\d{4,5})\b").unwrap()
+    });
+    let c = PORT.captures(command)?;
+    (1..=4).find_map(|i| c.get(i)).and_then(|m| m.as_str().parse::<u16>().ok()).filter(|p| *p >= 1024)
+}
+
+async fn listening(port: u16) -> bool {
+    tokio::time::timeout(Duration::from_millis(250), tokio::net::TcpStream::connect(("127.0.0.1", port))).await.is_ok_and(|r| r.is_ok())
+}
+
+/// Err when something already answers on `port`, naming the ports of 8000–8010 that are free.
+pub(crate) async fn refuse_taken_port(port: u16) -> Result<(), ToolError> {
+    if !listening(port).await {
+        return Ok(());
+    }
+    let mut free = Vec::new();
+    for p in 8000u16..=8010 {
+        if !listening(p).await {
+            free.push(p.to_string());
+        }
+    }
+    Err(ToolError::new(
+        ErrorKind::Other,
+        format!(
+            "port {port} is already in use by another process: start it on a free port instead (free in 8000-8010: {})",
+            if free.is_empty() { "none".into() } else { free.join(", ") }
+        ),
+    ))
+}
+
+/// A server that is started is checked to be *listening*, not merely not dead yet: a port already taken makes some servers print that they
+/// started and exit a moment later. The job must stay alive for a few seconds with the port answering; until then, an exit is a failure
+/// with what it printed.
+pub(crate) async fn await_listening(id: u32, port: u16, patience: Duration) -> Result<String, ToolError> {
+    let job = JOBS.lock().get(&id).cloned().ok_or_else(|| ToolError::new(ErrorKind::NotFound, format!("no background job {id}")))?;
+    let start = tokio::time::Instant::now();
+    let tail = |job: &Job| {
+        let out = job.out.lock().trim().to_string();
+        out.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+    };
+    loop {
+        if let Some(c) = *job.exit.lock() {
+            return Err(ToolError::new(ErrorKind::Other, format!("the server exited [exit code {c}] before it listened on port {port}: {}", tail(&job))));
+        }
+        let up = listening(port).await;
+        if up && start.elapsed() >= Duration::from_secs(3) {
+            return Ok(format!("\nlistening on port {port}"));
+        }
+        if start.elapsed() >= patience {
+            job.kill.notify_one();
+            return Err(ToolError::new(
+                ErrorKind::Other,
+                format!("nothing is listening on port {port} {}s after the start (it was stopped): {}", patience.as_secs(), tail(&job)),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -776,19 +1009,151 @@ mod tests {
 mod job_tests {
     use super::*;
 
+    fn test_policy() -> PolicyEngine {
+        PolicyEngine::new(crate::policy::PolicyConfig::default(), std::env::temp_dir().join("dfae-job-tests"))
+    }
+
     #[tokio::test]
     async fn a_background_command_that_dies_at_once_is_a_failure_with_its_output() {
         let dir = std::env::temp_dir();
-        let id = spawn_job("echo 'Address already in use' >&2; exit 3", &dir).unwrap();
+        let id = spawn_job(&test_policy(), "echo 'Address already in use' >&2; exit 3", &dir).unwrap();
         let err = settle_job(id, Duration::from_secs(3)).await.unwrap_err().to_string();
         assert!(err.contains("exit code 3") && err.contains("Address already in use"), "{err}");
     }
 
+    #[test]
+    fn the_port_a_command_names() {
+        assert_eq!(port_in("uvicorn main:app --host 0.0.0.0 --port 8002"), Some(8002));
+        assert_eq!(port_in("npm run dev -- -p 8001 -H 0.0.0.0"), Some(8001));
+        assert_eq!(port_in("python3 -m http.server 8003 --bind 0.0.0.0"), Some(8003));
+        assert_eq!(port_in("PORT=8004 node server.js"), Some(8004));
+        assert_eq!(port_in("flask run --host 0.0.0.0 -p 5000"), Some(5000));
+        assert_eq!(port_in("python3 app.py"), None);
+        assert_eq!(port_in("pip install x -p 22"), None, "a privileged port is no dev server");
+    }
+
+    #[tokio::test]
+    async fn a_port_somebody_holds_is_refused_before_anything_starts() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let e = refuse_taken_port(port).await.unwrap_err().message;
+        assert!(e.contains("already in use") && e.contains("free in 8000-8010"), "{e}");
+        drop(held);
+        assert!(refuse_taken_port(port).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_server_is_up_only_when_its_port_answers_and_it_stays_alive() {
+        let policy = test_policy();
+        // listens (python is what the tests already rely on) and stays
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let id = spawn_job(&policy, &format!("python3 -m http.server {port} --bind 127.0.0.1"), &std::env::temp_dir()).unwrap();
+        assert!(await_listening(id, port, Duration::from_secs(15)).await.unwrap().contains("listening"));
+        job(&json!({"job_id": id})).unwrap().1.kill.notify_one();
+        // a program that says it started and dies is not a server, even when something else holds the port
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let id = spawn_job(&policy, "echo started; sleep 1; echo 'address already in use' >&2; exit 1", &std::env::temp_dir()).unwrap();
+        let err = await_listening(id, busy, Duration::from_secs(15)).await.unwrap_err().message;
+        assert!(err.contains("exited") && err.contains("already in use"), "{err}");
+    }
+
     #[tokio::test]
     async fn a_running_background_command_is_started() {
-        let id = spawn_job("echo ready; sleep 5", &std::env::temp_dir()).unwrap();
+        let id = spawn_job(&test_policy(), "echo ready; sleep 5", &std::env::temp_dir()).unwrap();
         let first = settle_job(id, Duration::from_millis(400)).await.unwrap();
         assert!(first.contains("ready"), "{first}");
         job(&json!({"job_id": id})).unwrap().1.kill.notify_one();
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+    use crate::policy::PolicyConfig;
+    use tokio_util::sync::CancellationToken;
+
+    fn rig() -> (tempfile::TempDir, PolicyEngine, ToolContext) {
+        let ws = tempfile::tempdir().unwrap();
+        let policy = PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf());
+        let ctx = ToolContext { task_id: "t".into(), step_id: "s".into(), workspace: ws.path().to_path_buf(), cancel: CancellationToken::new() };
+        (ws, policy, ctx)
+    }
+
+    async fn sh(script: &str, secs: u64) -> ToolOutput {
+        let (ws, policy, ctx) = rig();
+        run_script(&policy, script, ws.path(), Duration::from_secs(secs), 4096, &ctx).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn stderr_comes_in_order_with_stdout_and_a_failure_says_its_code() {
+        let o = sh("echo one; echo two >&2; echo three; exit 3", 10).await;
+        assert_eq!(o.content, "one\ntwo\nthree\n[exit code 3]");
+        assert!(!o.ok);
+        assert_eq!(sh("echo fine", 10).await.content, "fine");
+    }
+
+    #[tokio::test]
+    async fn the_toolbox_is_there_and_nothing_waits_for_a_human() {
+        let o = sh("echo $DFAE_TOOLS; echo $PYTHONUSERBASE; echo $DEBIAN_FRONTEND; command -v dfae-apt; read -r x; echo [$x]", 10).await;
+        assert!(o.content.contains("/.tools") && o.content.contains("/.tools/py") && o.content.contains("noninteractive"), "{}", o.content);
+        assert!(o.content.contains("/.tools/bin/dfae-apt") && o.content.ends_with("[]"), "stdin is closed: {}", o.content);
+    }
+
+    #[tokio::test]
+    async fn a_command_that_times_out_is_killed_with_everything_it_started_and_keeps_what_it_printed() {
+        let (ws, policy, ctx) = rig();
+        let marker = ws.path().join("child-survived");
+        let script = format!("echo started; (sleep 2; touch {}) & sleep 30", marker.display());
+        let t0 = std::time::Instant::now();
+        let o = run_script(&policy, &script, ws.path(), Duration::from_secs(1), 4096, &ctx).await.unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(5));
+        assert!(o.content.starts_with("started") && o.content.contains("timed out after 1s and was killed"), "{}", o.content);
+        assert!(!o.ok);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!marker.exists(), "the background child of the command was killed with it");
+    }
+
+    #[tokio::test]
+    async fn a_long_log_keeps_its_start_and_its_end() {
+        let o = sh("echo START; seq 1 5000; echo THE-ERROR-AT-THE-END; exit 1", 10).await;
+        assert!(
+            o.content.starts_with("START") && o.content.contains("bytes omitted") && o.content.contains("THE-ERROR-AT-THE-END\n[exit code 1]"),
+            "{}",
+            &o.content[..200.min(o.content.len())]
+        );
+        assert!(o.content.len() < 6000);
+    }
+
+    #[test]
+    fn progress_bars_and_colours_are_what_a_terminal_would_show() {
+        assert_eq!(clean_output("\x1b[32mok\x1b[0m\n  10%\r  50%\r 100%\ndone"), "ok\n 100%\ndone");
+    }
+
+    #[tokio::test]
+    async fn a_missing_tool_comes_with_the_permission_to_install_it() {
+        let o = sh("definitely-not-installed --version", 10).await;
+        assert!(
+            o.content.contains("[exit code 127]") && o.content.contains("[hint] `definitely-not-installed` is not installed. You are allowed to install it"),
+            "{}",
+            o.content
+        );
+        let o = sh("python3 -c 'import definitely_missing_module'", 10).await;
+        assert!(
+            o.content.contains("[hint] the Python module `definitely_missing_module` is missing: `pip install definitely_missing_module`"),
+            "{}",
+            o.content
+        );
+    }
+
+    #[test]
+    fn installs_and_builds_get_the_longer_timeout() {
+        let (_ws, policy, _ctx) = rig();
+        assert_eq!(default_timeout(&policy, "ls -la"), Duration::from_secs(120));
+        assert_eq!(default_timeout(&policy, "python3 -m pip install requests && python3 x.py"), Duration::from_secs(600));
+        assert_eq!(default_timeout(&policy, "cd app && npm ci && npm run build"), Duration::from_secs(600));
+        assert_eq!(default_timeout(&policy, "git clone https://example.com/x.git"), Duration::from_secs(600));
     }
 }

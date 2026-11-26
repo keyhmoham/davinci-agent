@@ -73,7 +73,7 @@ async fn a_conversation_is_one_model_call_per_turn_with_the_history_attached() {
     assert_eq!(t2.status, TaskStatus::Completed, "{:?}", t2.error);
     assert_eq!(r.worker.calls(), 2);
     let req = r.worker.requests.lock()[1].clone();
-    assert_eq!(req.system, dfae_runtime::prompts::CHAT_SYSTEM);
+    assert!(req.system.starts_with(dfae_runtime::prompts::CHAT_SYSTEM), "the chat prompt, with what the shell is");
     assert_eq!(req.messages.len(), 3, "previous question, previous answer, new message");
     assert!(req.messages[0].content.contains("mutex") && req.messages[1].content.contains("critical section"));
     assert!(req.messages[2].content.contains("semaphore"));

@@ -198,6 +198,13 @@ pub enum Check {
         path: String,
         value: String,
     },
+    /// Something the step started answers on this local address (and, when `value` is given, its page says that): what a served
+    /// page or an API leaves behind. Checked by asking it, after the step, waiting for it to come up.
+    UrlServes {
+        url: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
 }
 
 impl Check {
@@ -229,6 +236,8 @@ impl Check {
             Check::ExitOk => "tool reported success".into(),
             Check::FileExists { path } => format!("file exists: {path}"),
             Check::FileContains { path, value } => format!("{path} contains '{value}'"),
+            Check::UrlServes { url, value: Some(v) } => format!("{url} serves a page that says '{v}'"),
+            Check::UrlServes { url, value: None } => format!("{url} answers"),
         }
     }
 }
@@ -434,6 +443,10 @@ pub struct Routing {
     /// The answer depends on information that changes (a price, the weather, news): it has to be looked up, never answered from memory.
     #[serde(default)]
     pub fresh_data: bool,
+    /// The request is about a specific outside service or system (GitHub, Slack, Notion, a database, a map, a calendar...) that files,
+    /// shell, calculator and plain web tools cannot serve: an MCP server may.
+    #[serde(default)]
+    pub external: bool,
     /// What the message says about the previous reply: `negative` ("that's wrong", "try again") or `positive`.
     #[serde(default)]
     pub feedback: Option<String>,
@@ -452,6 +465,7 @@ impl Routing {
             smalltalk: None,
             role: None,
             fresh_data: false,
+            external: false,
             feedback: None,
         }
     }

@@ -250,6 +250,15 @@ fn smalltalk_kind(req: &str) -> &'static str {
 static FRESH_DATA: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:price|prices|exchange rate|weather|forecast|temperature|news|headlines|scores?|stocks?|latest|currently|right now|live|trending|who won|how much is|how much does)\b|\bcurrent\s+(?:price|rate|weather|version|status|time|value)\b|\bfor now\b").unwrap()
 });
+/// Does the request plainly name an outside service (or an MCP)? Not a judgement of whether the request needs it: that is the
+/// decision model's, or the caller's (a service named in a request that needs tools).
+pub fn names_external_service(request: &str) -> bool {
+    EXTERNAL_SERVICE.is_match(request)
+}
+
+static EXTERNAL_SERVICE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bmcp\b|\b(?:github|gitlab|slack|notion|jira|linear|trello|asana|stripe|shopify|salesforce|hubspot|figma|sentry|datadog|google (?:drive|calendar|sheets|docs)|gmail|discord|airtable|supabase|postgres|mongodb)\b").unwrap()
+});
 static FEEDBACK_NEG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:that(?:'s| is| was)? (?:wrong|not right|incorrect|not what)|not what i (?:asked|meant|wanted)|try again|do it again|doesn'?t work|does not work|didn'?t work|still (?:fails|broken|wrong|not working)|you (?:got it wrong|missed)|it(?:'s| is) (?:broken|wrong))\b").unwrap()
 });
@@ -413,6 +422,7 @@ impl LocalDecider {
                 };
                 out.insert("risk".into(), Answer::choice(key, rc, &[(key, rc)]));
                 out.insert("fresh_data".into(), Answer::noul(if FRESH_DATA.is_match(&s.request) { 0.85 } else { 0.1 }));
+                out.insert("external_service".into(), Answer::noul(if EXTERNAL_SERVICE.is_match(&s.request) { 0.85 } else { 0.05 }));
                 out.insert("changes_state".into(), Answer::noul(if CHANGE_VERBS.is_match(&s.request) { 0.85 } else { 0.1 }));
                 out.insert("conditional_change".into(), Answer::noul(if CONDITIONAL.is_match(&s.request) { 0.85 } else { 0.1 }));
                 let kind = smalltalk_kind(&s.request);

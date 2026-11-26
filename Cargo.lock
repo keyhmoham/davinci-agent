@@ -613,6 +613,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dfae-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "dfae-core",
+ "dfae-tools",
+ "futures-util",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "dfae-memory"
 version = "0.1.0"
 dependencies = [
@@ -655,10 +676,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "dfae-core",
  "dfae-decision",
  "dfae-extract",
+ "dfae-mcp",
  "dfae-memory",
  "dfae-models",
  "dfae-tools",
@@ -666,6 +689,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -685,6 +709,7 @@ dependencies = [
  "axum",
  "chrono",
  "dfae-core",
+ "dfae-mcp",
  "dfae-memory",
  "dfae-runtime",
  "futures-util",
@@ -709,6 +734,7 @@ dependencies = [
  "dfae-memory",
  "futures-util",
  "hex",
+ "libc",
  "parking_lot",
  "regex",
  "reqwest",

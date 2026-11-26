@@ -38,7 +38,7 @@ static SPLIT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static REASONING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(explain|why|summari[sz]e|analy[sz]e|compare|describe|recommend|fix|improve|review|translate|rewrite|interpret|decide|should|suggest|tell\s+me\s+(?:what|why|how|about|whether|if|which|who|when)|investigate|diagnose|debug|optimi[sz]e|plan|which|identify|extract|count|determine|whether|figure|find out|how many|what's wrong)\b").unwrap()
+    Regex::new(r"(?i)\b(explain|why|summari[sz]e|analy[sz]e|compare|describe|recommend|fix|improve|review|translate|rewrite|interpret|decide|should|suggest|tell\s+me\s+(?:what|why|how|about|whether|if|which|who|when)|state|report|provide|confirm|answer|respond|present|investigate|diagnose|debug|optimi[sz]e|plan|which|identify|extract|count|determine|whether|figure|find out|how many|what's wrong)\b").unwrap()
 });
 
 fn split_clauses(req: &str) -> Vec<(String, bool)> {
@@ -93,6 +93,10 @@ fn bind_clause(metas: &[ToolMetadata], clause: &str, entities: &[Entity]) -> Opt
         for (idx, pat) in m.direct_patterns.iter().enumerate() {
             let Some(re) = regex(pat) else { continue };
             let Some(caps) = re.captures(clause) else { continue };
+            // "run `a.py` using `.venv/bin/python a.py`": two commands in one sentence, and the first is not the one to run
+            if m.name == "shell" && clause.matches('`').count() >= 4 {
+                continue;
+            }
             let mut args = Map::new();
             let (mut explicit, mut defaulted, mut ok) = (0u32, 0u32, true);
             // texts already bound to a parameter are not offered to another one (a quoted file name is not the content)
@@ -166,6 +170,18 @@ pub fn bind_direct(metas: &[ToolMetadata], request: &str, entities: &[Entity]) -
         let (tool, args, score) = bind_clause(metas, &clause, entities)?;
         calls.push(DirectCall { tool, args, clause, after_prev, score });
     }
+    // A request that names a place, a person or a company that no call took up asks for more than the tool does ("what time is it in
+    // Tokyo and in New York" is not `time_now`): a model gets it.
+    let used: String = calls.iter().map(|c| c.args.to_string().to_lowercase()).collect::<Vec<_>>().join(" ");
+    let unmet = entities.iter().any(|e| {
+        matches!(e.label.as_str(), "location" | "city" | "person" | "organization" | "company" | "product" | "event")
+            && e.score >= 0.5
+            && req.to_lowercase().contains(&e.text.to_lowercase())
+            && !used.contains(&e.text.to_lowercase())
+    });
+    if unmet {
+        return None;
+    }
     Some(calls)
 }
 
@@ -195,6 +211,25 @@ mod tests {
 
     fn ent(label: &str, text: &str) -> Entity {
         Entity { label: label.into(), text: text.into(), start: None, end: None, score: 1.0, source: "t".into() }
+    }
+
+    #[test]
+    fn writing_up_a_result_is_not_fetching_an_address() {
+        assert!(bind("state that the API is available at https://example.com/api and provide an example curl command").is_none());
+        assert!(bind("fetch https://example.com/api").is_some());
+    }
+
+    #[test]
+    fn a_request_that_names_what_the_tool_cannot_take_is_not_bound() {
+        let near = [ent("location", "Tokyo"), ent("location", "New York")];
+        assert!(bind_direct(&metas(), "what time is it in Tokyo and in New York?", &near).is_none(), "time_now has no place to take");
+        assert!(bind_direct(&metas(), "what time is it", &[]).is_some());
+    }
+
+    #[test]
+    fn a_sentence_with_two_commands_is_not_bound_to_the_first() {
+        assert!(bind("run `fetch.py` using `.venv/bin/python fetch.py`").is_none(), "which one is the command is for a model to say");
+        assert_eq!(one("run `cargo test`").1, json!({"command": "cargo test"}));
     }
 
     #[test]

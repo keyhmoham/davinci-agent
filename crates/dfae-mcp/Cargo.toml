@@ -1,0 +1,25 @@
+[package]
+name = "dfae-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dfae-core = { workspace = true }
+dfae-tools = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+futures-util = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = "3"

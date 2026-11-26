@@ -93,7 +93,11 @@ impl Inner {
         // ---- 3. route -------------------------------------------------------
         let mut state = self.decision_state(&goal, &entities);
         state.recent = ctx.base_ctx.lock().turns.iter().map(|(q, a)| format!("user: {q} → assistant: {a}")).collect();
-        let routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
+        let mut routing = self.note(ctx, self.decider.route_task(state.clone()).await).await;
+        // a request about an outside service may be served by an MCP server: attach the ones that fit (finding them if need be)
+        if ctx.depth == 0 && !is_member && self.stage_mcp(ctx, &goal, &routing).await {
+            routing.needs_tools = true;
+        }
         ctx.rec.lock().await.route = Some(routing.clone());
         if self.cfg.economy_shadow_on() && !is_member && crate::shadow::sampled(&ctx.id, self.cfg.shadow_eval) {
             self.shadow_evaluate(ctx, &state, &routing).await;
@@ -237,6 +241,9 @@ impl Inner {
         let is_chat = ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false);
         if exec_err.is_none()
             && !is_chat
+            // the decision model's doubt alone is not a reason to run a planner round and more steps (a small model doubts a result in JSON):
+            // something must also be unproven — a failed check, a step that was not verified
+            && verification.status != VerificationStatus::Verified
             && verification.completion_confidence.map(|p| p < 0.35).unwrap_or(false)
             && let Ok(true) = self.continue_plan(ctx, goal).await
         {
@@ -833,7 +840,20 @@ impl Inner {
             return String::new();
         }
         let s = crate::workspace::snapshot(self.policy.workspace(), 24);
-        if s.is_empty() { s } else { format!("\n{s}") }
+        let ports = self.ports_line().await;
+        if s.is_empty() { ports } else { format!("\n{s}{ports}") }
+    }
+
+    /// Which of the ports a server may take (8000–8010) are already in use on this machine: a plan that starts a server on a taken one
+    /// fails, and the answer is a plan that uses another.
+    pub(crate) async fn ports_line(&self) -> String {
+        let probes = (8000u16..=8010).map(|p| async move {
+            let up =
+                tokio::time::timeout(std::time::Duration::from_millis(200), tokio::net::TcpStream::connect(("127.0.0.1", p))).await.is_ok_and(|r| r.is_ok());
+            up.then_some(p)
+        });
+        let taken: Vec<String> = futures_util::future::join_all(probes).await.into_iter().flatten().map(|p| p.to_string()).collect();
+        if taken.is_empty() { String::new() } else { format!("\nPORTS IN USE (8000-8010): {}", taken.join(", ")) }
     }
 
     /// Everything stable about planning (rules, the whole tool catalogue, examples) is the system prompt, byte-identical from
@@ -854,7 +874,7 @@ impl Inner {
         // the whole catalogue is always in the system prompt; with a provider that caches prompts and traffic that keeps the cache
         // warm, the worked examples ride along too and the prompt is marked cacheable
         let cached = self.prefix_enabled();
-        let system = prompts::brief_system(eco.plan_report, &self.tools.catalog_lines(&names), cached);
+        let system = prompts::brief_system(eco.plan_report, self.shell_environment(false), &self.tools.catalog_lines(&names), cached);
         let user = match replan {
             None => prompts::plan_request(ctx_text, max_steps),
             Some((state, problem, prefix)) => prompts::patch_request(ctx_text, state, problem, prefix, max_steps),

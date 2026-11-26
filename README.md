@@ -179,6 +179,7 @@ that against splits justified only by parallelism. The TUI **Team** view shows a
 | `dfae-models` | OpenAI-compatible and Anthropic providers, tier gateway, JSON extraction + one repair retry |
 | `dfae-memory` | hash embedder · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
 | `dfae-tools` | registry · **policy engine** · 11 native tools · direct binder · calculator |
+| `dfae-mcp` | MCP client (Streamable HTTP and stdio) · the hub that turns servers' tools into engine tools · **Glama directory** search and on-demand connection |
 | `dfae-runtime` | pipeline, planner/validator, DAG executor, approvals, recovery/replan, verification, skills, resume · **team: decomposer, roles, dispatcher, subagent supervision** |
 | `dfae-server` | REST + SSE API, bearer auth, Prometheus metrics |
 | `dfae-tui` | the `dfae` terminal client (also `dfae --ask "…"`) |
@@ -273,9 +274,74 @@ messages say how to fix the call, and tools that belong together are offered tog
 | `shell_output` · `shell_kill` | read new output of / stop a background job |
 | `http_get` · `web_search` | the web (see above) |
 
+#### The shell is a sandbox the agent may install into
+
+In sandbox mode (`shell.mode = "sandbox"`, what the container image ships) every model that decides what to run is told, in so many words, that it
+is in a sandbox it fully controls and **may install whatever a task needs — and must, rather than refuse or ask the user to**. As an
+unprivileged user in a read-only container, "install" means user-space installs into a *toolbox* (`{workspace}/.tools`, so it survives restarts)
+that is on `PATH` in every command:
+
+| Need | How |
+|---|---|
+| Python packages | `pip install x` (user installs; `python3 -m venv .venv` for a project) |
+| Node | `npm install -g x`, `npx -y x` |
+| Rust · Go | `cargo install x` · `go install x@latest` (a toolchain itself: `curl` the official installer into the toolbox) |
+| System packages | `dfae-apt <debian-package>` (apt downloads, `dpkg -x` unpacks into the toolbox; no root; `update-alternatives` links are made) |
+| Anything else | a release binary fetched with `curl` into `$DFAE_TOOLS/bin` |
+
+Commands run the way an agent needs them to: no terminal (nothing prompts; `DEBIAN_FRONTEND`, `GIT_TERMINAL_PROMPT`, `npm_config_yes` are set),
+git has an identity and `main` as its default branch, proxies and certificate bundles are passed through (`env_passthrough`; the engine's keys
+never are), stderr is merged into the output in the order it was written, colour codes and progress bars are cleaned up, a long log keeps its
+start and its end, and a command that installs or builds gets 10 minutes instead of 2. A command that times out is killed *with everything it
+started* and what it printed is kept. A failure explains itself: `command not found`, a missing Python or Node module, or a read-only system path
+comes with a one-line hint that says what to install. A step that names a directory ("… in proj") runs in it. Without sandbox mode the models are
+told the truth instead: one allowlisted read-only command at a time, nothing installable.
+
+#### Work that is checked, not assumed
+
+What the agent starts or builds is verified by asking it, not by trusting the step that made it:
+
+- a **server** that names its port is refused up front when the port is taken (with the free ones listed), must be *listening and still alive* a few
+  seconds later, and the planner is told which of 8000–8010 are in use;
+- a **served page** is requested after it starts (`expect: http://localhost:8001 serves "Acme"`): localhost only, it waits for a dev server's first
+  build, and it reads the *visible* text — a scaffold's default page with the project's name in its `<title>` does not pass;
+- **files** are checked as they are written (JSON, TOML, HTML, Python, shell, JS, TypeScript/JSX with the project's own compiler), and a file is written
+  knowing the files of its project written before it (a module's tests see the module);
+- a **failed command** reaches the planner as the end of its output plus the distinct error lines above it (a test run's real cause is in the middle),
+  a **patch** cannot lose work it does not replace, and an **edit** is bound with the file's text in front of the model and checked against it;
+- the **answer** to a question a tool or an MCP server answered with data is written from it, not shown as raw JSON.
+
 Simple phrasings of the file operations bind directly and cost no model tokens (`move a.txt to b/a.txt`, `delete notes/old.txt`,
 `replace "foo()" with "bar()" in src/lib.rs`, `find files matching **/*.rs`, ``run `cargo test` ``). The container image ships git, ripgrep, curl, jq, make, gcc, python3 and friends
 (`DEV_TOOLS=0` builds it without them); its root is read-only, so use a virtualenv or project-local installs in the workspace.
+
+### MCP servers: found and used on demand
+
+Set `GLAMA_API_KEY` (a key from [glama.ai/settings/api-keys](https://glama.ai/settings/api-keys)) and nothing else. When a request is about an
+outside service — GitHub, DeepWiki, Notion, a database, a calendar — the decision model says so (`external_service`; a service named outright
+in a request that has something to do counts too, and so does saying "MCP"). The engine then:
+
+1. looks at the servers it already has (the registry: connected earlier in this run, reopened from the previous one, or configured) and uses the
+   ones whose tools fit the request;
+2. if none does, has the worker model write a **2–5 word search query** (the only thing the directory hears of the request), searches the
+   [Glama MCP directory](https://glama.ai/mcp/reference) for remote servers, and connects the best ones that can be used as they are —
+   streamable HTTP, no login, not deprecated, not reported down. OAuth servers are skipped; one that wants an API key is used when
+   `DFAE_MCP_KEY_<SLUG>` is set;
+3. registers their tools as `mcp__<server>__<tool>` (the JSON Schema becomes typed parameters; objects and arrays are written as JSON text and
+   parsed before the call) and **attaches them to that task only** — the planner's catalogue for an unrelated request never lists them;
+4. the planner plans with them, the worker binds their arguments, and a tool call is a normal step (retried, verified, re-planned).
+
+A dropped connection is reopened once and the call repeated; a server that is down is not retried for a minute; a search that found nothing
+is not repeated for ten. Servers from the directory ask for approval (`DFAE_APPROVALS=ask`) before any tool that is not read-only;
+the output of every MCP tool is scanned for prompt injection like any other. Servers found are remembered in
+`~/.local/share/dfae/mcp.json` (outside the workspace, so the agent cannot add servers by writing a file) and reopened at start.
+
+Your own servers go in a file in the usual shape (`DFAE_MCP_SERVERS=/etc/dfae/mcp.json`):
+`{"mcpServers": {"files": {"command": "npx", "args": ["-y", "…"], "env": {"TOKEN": "${TOKEN}"}}, "docs": {"url": "https://…/mcp", "headers": {"Authorization": "Bearer ${DOCS_KEY}"}, "always": true}}}`.
+Only that file can start a local command (a stdio server gets a bare environment plus its own `env`, not the engine's keys); `always: true` offers
+a server's tools to every task. `GET /v1/mcp/servers` lists what is connected, `GET /v1/mcp/search?q=…` searches the directory,
+`POST /v1/mcp/servers {"name","url","headers"}` adds a public remote server by hand and `DELETE /v1/mcp/servers/{name}` removes one.
+Glama's data licence asks for credit and a link to each server's listing: events and API answers carry both ("MCP data from Glama").
 
 ### Answers
 
@@ -315,6 +381,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `PLANNER_API_KEY` / `PLANNER_MODEL` / `PLANNER_PROVIDER` / `PLANNER_BASE_URL` | the planner model (default `gpt-6-luna`; provider `openai` = any OpenAI-compatible endpoint, default base URL `https://ai-gateway.vercel.sh/v1`; or `anthropic`) |
 | `WORKER_API_KEY` / `WORKER_MODEL` / `WORKER_PROVIDER` / `WORKER_BASE_URL` | the worker model, configured exactly like the planner (default `glm-5.3-flash`; with no key of its own it uses the planner's when they share a base URL) |
 | `PLANNER_MAX_TOKENS` / `WORKER_MAX_TOKENS` / `WORKER_CONTENT_MAX_TOKENS` | output limits: a plan; ordinary worker work (800); a file's content (16000) |
+| `GLAMA_API_KEY` | turns on MCP discovery (see *MCP servers*); `DFAE_MCP_AUTO=off`, `DFAE_MCP_MAX_AUTO`, `DFAE_MCP_TIMEOUT_SECS`, `DFAE_MCP_STATE`, `DFAE_MCP_KEY_<SLUG>`, `DFAE_MCP_SERVERS` tune it |
 | `PLANNER_REASONING` / `WORKER_REASONING` | thinking effort of a hosted model: `off`, `low`, `medium`, `high` (planner default `low`, worker `off`: hidden thinking is billed and eats the output limit; a gateway that rejects the field is asked without it from then on) |
 | `*_TIMEOUT_SECS`, `PLANNER_PROMPT_CACHE` | request timeouts; declare that an OpenAI-compatible endpoint caches repeated prompt prefixes (Anthropic and `api.openai.com` are known to) |
 | `DFAE_API_TOKEN` | bearer token for the API |

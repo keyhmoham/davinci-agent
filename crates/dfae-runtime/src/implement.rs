@@ -68,7 +68,12 @@ pub(crate) fn implies_background(description: &str, command: &str) -> bool {
     static SERVER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)\b(?:http\.server|SimpleHTTPServer|uvicorn|gunicorn|flask\s+run|php\s+-S|npm\s+(?:run\s+)?(?:start|dev|serve)|yarn\s+(?:start|dev)|vite(?:\s|$)|next\s+dev|live-server|http-server|python3?\s+-m\s+(?:http\.server|flask|uvicorn))\b").unwrap()
     });
-    SENTENCE.is_match(description) || SERVER.is_match(command)
+    // `pip install fastapi uvicorn pytest` names a server as a package to install, it does not start one
+    static INSTALLER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)^\s*(?:sudo\s+)?(?:(?:python3?\s+-m\s+)?pip3?|pipx|uv(?:\s+pip)?|poetry|npm|yarn|pnpm|bun|apt(?:-get)?|dfae-apt|cargo|go|gem|brew)\s+(?:install|add|i|get|ci)\b").unwrap()
+    });
+    SENTENCE.is_match(description)
+        || command.split(['&', ';', '|']).filter(|seg| !seg.trim().is_empty() && !INSTALLER.is_match(seg)).any(|seg| SERVER.is_match(seg))
 }
 
 /// Parameters whose values are content (text to write): the one thing allowed to run long.
@@ -98,6 +103,29 @@ fn bind_view(meta: &ToolMetadata, step_text: &str) -> ToolMetadata {
             || p.ty == ParamType::String
     });
     m
+}
+
+/// `command` without its leading `cd <cwd> &&` (or `;`), when that is where it already runs.
+pub(crate) fn strip_redundant_cd(command: &str, cwd: &str) -> Option<String> {
+    let norm = |d: &str| d.trim().trim_matches(['"', '\'', '`']).trim_start_matches("./").trim_end_matches('/').to_string();
+    let rest = command.trim_start().strip_prefix("cd ")?;
+    let (dir, tail) = rest.split_once("&&").or_else(|| rest.split_once(';'))?;
+    (norm(dir) == norm(cwd) && !norm(cwd).is_empty() && !tail.trim().is_empty()).then(|| tail.trim().to_string())
+}
+
+/// The directory of the workspace a shell step says it runs in ("…in proj", "inside the folder site", "cwd app"), unless the command
+/// already goes there itself (`cd`, `-C`, a path through it).
+pub(crate) fn directory_named(step: &str, command: &str, workspace: &std::path::Path) -> Option<String> {
+    static IN_DIR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\b(?:in|inside|within|under|into|from|cwd|directory|folder|dir)\s+(?:the\s+|a\s+|an\s+)?(?:(?:directory|folder|dir|repo|repository|project)\s+)?[`"']?([A-Za-z0-9_][A-Za-z0-9_./-]*)[`"']?"#).unwrap()
+    });
+    if command.trim_start().starts_with("cd ") || command.contains(" cd ") || command.contains("&& cd") {
+        return None;
+    }
+    IN_DIR
+        .captures_iter(step)
+        .map(|c| c[1].trim_end_matches(['.', '/']).to_string())
+        .find(|d| !d.is_empty() && !d.starts_with("..") && workspace.join(d).is_dir() && !command.contains(d.as_str()))
 }
 
 /// Some models end a reply with their own tool-call syntax (`</arg_value><arg_key>path</arg_key>…</tool_call>`): it is never part
@@ -240,11 +268,22 @@ impl Inner {
             .join(" | ");
         // The model is asked for what the step needs, not for every knob of the tool: an optional number nobody mentioned
         // (`timeout_secs`) is a number a small model can run away with ("1200120120…" until the token limit).
-        let asked = bind_view(meta, &step.description);
+        let mut asked = bind_view(meta, &step.description);
+        // content a model already wrote (as plain text, in full) is never asked for again as a JSON string: that is the most expensive
+        // thing a retry can do, and what is wrong with the arguments is not it
+        asked
+            .params
+            .retain(|p| !(CONTENT_PARAMS.contains(&p.name.as_str()) && prebound.get(&p.name).and_then(|v| v.as_str()).is_some_and(|c| !c.trim().is_empty())));
         let meta = &asked;
         // both hosted models are billed by the token: compact signature (the parameter help rides in the schema), trimmed inputs
         let sig = meta.signature();
-        let inputs = Self::inputs_text(deps, if paid { 120 } else { 400 });
+        let mut inputs = Self::inputs_text(deps, if paid { 120 } else { 400 });
+        // an edit replaces text that exists: a model that is not shown the file invents it (or leaves it empty)
+        if meta.name == "fs_edit"
+            && let Some(file) = self.file_to_edit(prebound, entities, &step.description)
+        {
+            inputs.push_str(&format!("\n{}", dfae_core::safety::wrap_untrusted("FILE (copy old_string from it exactly)", &file)));
+        }
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
         let goal = ctx.rec.lock().await.goal.clone();
         let step_text = if step.description.split_whitespace().count() < 9 {
@@ -263,7 +302,16 @@ impl Inner {
             step.description.clone()
         };
         let user = prompts::bind_user(&sig, &step_text, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
-        let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
+        // what binds a shell command is told what the shell is, and that it may install (other tools need no such words)
+        let system = match meta.name.as_str() {
+            "shell" => format!("{}\n{}", prompts::BIND_SYSTEM, self.shell_environment(true)),
+            "fs_edit" => format!(
+                "{}\nold_string is copied exactly from the FILE (indentation included) and long enough to occur once; new_string replaces it.",
+                prompts::BIND_SYSTEM
+            ),
+            _ => prompts::BIND_SYSTEM.to_string(),
+        };
+        let mut req = self.gen_request(tier, &system, user, "bind");
         req.json = true;
         req.temperature = temperature;
         // a self-hosted server can be told the exact shape: wrong parameter names and types become impossible
@@ -288,6 +336,63 @@ impl Inner {
             }
         }
         Ok(args)
+    }
+
+    /// The files this task has written so far (the last three, from the same project), as text for a prompt: what a file written now must
+    /// agree with. Each is cut short; only files, never what is outside the workspace.
+    async fn related_files(&self, ctx: &Arc<TaskCtx>, this_step: &str, target: &str) -> String {
+        let paths: Vec<String> = {
+            let r = ctx.rec.lock().await;
+            let Some(plan) = r.plan.as_ref() else { return String::new() };
+            plan.steps
+                .iter()
+                .filter(|s| s.id != this_step && s.status == StepStatus::Succeeded && s.tool.as_deref() == Some("fs_write"))
+                .filter_map(|s| s.args.get("path").and_then(|p| p.as_str()).map(String::from))
+                .filter(|p| p != target)
+                .collect()
+        };
+        let project = |p: &str| p.split('/').next().filter(|_| p.contains('/')).unwrap_or("").to_string();
+        let mine = project(target);
+        let mut shown: Vec<String> = Vec::new();
+        for p in paths.iter().rev().filter(|p| project(p) == mine).take(3) {
+            if let Ok(full) = self.policy.guard().read_path(p)
+                && let Ok(text) = std::fs::read_to_string(full)
+                && !text.is_empty()
+            {
+                let cut: String = text.chars().take(3500).collect();
+                shown.push(dfae_core::safety::wrap_untrusted(
+                    &format!("file {p}"),
+                    &if cut.len() < text.len() { format!("{cut}\n… [file continues]") } else { cut },
+                ));
+            }
+        }
+        if shown.is_empty() { String::new() } else { format!("RELATED FILES:\n{}", shown.join("\n")) }
+    }
+
+    /// The text of the file an edit step is about (as far as the model needs to see it), found from the arguments or the step.
+    fn file_to_edit(&self, prebound: &Map<String, Value>, entities: &[Entity], step_text: &str) -> Option<String> {
+        let candidates = prebound
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(String::from)
+            .into_iter()
+            .chain(entities.iter().filter(|e| e.label == "file path").map(|e| e.text.clone()))
+            .chain(
+                step_text
+                    .split_whitespace()
+                    .map(|w| w.trim_matches(['`', '"', '\'', ',', '.', ':', ';', '(', ')']).to_string())
+                    .filter(|w| w.contains('/') || w.contains('.')),
+            );
+        for c in candidates {
+            if let Ok(p) = self.policy.guard().read_path(&c)
+                && p.is_file()
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                let shown: String = text.chars().take(8000).collect();
+                return Some(if shown.len() < text.len() { format!("{shown}\n… [file continues]") } else { shown });
+            }
+        }
+        None
     }
 
     /// "write {{prev_code}} to index.html", "save that code": the content is something said earlier, used by name — never
@@ -324,6 +429,11 @@ impl Inner {
         if !inputs.is_empty() {
             user.push_str(&format!("INPUTS:\n{inputs}\n"));
         }
+        // a file that belongs to a project is written knowing the others (the tests of a module see the module; a page sees its styles)
+        let related = self.related_files(ctx, &step.id, path).await;
+        if !related.is_empty() {
+            user.push_str(&format!("{related}\nThis file must fit with the files above (names, imports, paths, interfaces).\n"));
+        }
         if !values.is_empty() {
             user.push_str(&format!("AVAILABLE VALUES (they are only for you to read here): {values}\n"));
         }
@@ -336,8 +446,11 @@ impl Inner {
         req.temperature = 0.2;
         let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
-        let why =
-            if degenerate(&text) { Some("it repeated the same lines".to_string()) } else { crate::syntax::problem(std::path::Path::new(path), &text).await };
+        let why = if degenerate(&text) {
+            Some("it repeated the same lines".to_string())
+        } else {
+            crate::syntax::problem(&self.policy.workspace().join(path), &text).await
+        };
         let Some(why) = why else {
             return (!text.trim().is_empty()).then_some(text);
         };
@@ -457,6 +570,26 @@ impl Inner {
                     Err(_) => return Err(format!("`cwd` '{c}' is outside the workspace: use a directory inside it, relative (`site`), or leave cwd out")),
                 }
             }
+            // an edit replaces text the file has: a model that invented it is told so here, not by a failed step and a re-plan
+            if meta.name == "fs_edit"
+                && let (Some(path), Some(old)) = (a.get("path").and_then(|v| v.as_str()), a.get("old_string").and_then(|v| v.as_str()))
+                && !path.contains("{{")
+            {
+                if old.is_empty() {
+                    return Err("old_string is empty: copy the exact text to replace from the FILE".into());
+                }
+                if let Ok(p) = self.policy.guard().read_path(path)
+                    && let Ok(text) = std::fs::read_to_string(p)
+                {
+                    let n = text.matches(old).count();
+                    if n == 0 {
+                        return Err(format!("old_string is not in {path}: copy a piece of it exactly from the FILE (indentation included)"));
+                    }
+                    if n > 1 && a.get("replace_all").and_then(|v| v.as_bool()) != Some(true) {
+                        return Err(format!("old_string occurs {n} times in {path}: make it longer so it occurs once (or set replace_all)"));
+                    }
+                }
+            }
             // a `{{id}}` template may only name a step this one depends on
             for r in planner::template_refs(&Value::Object(a.clone())) {
                 if !step.depends_on.contains(&r) && !crate::session::ARTIFACT_NAMES.contains(&r.as_str()) {
@@ -484,11 +617,16 @@ impl Inner {
             // ---- the models: the worker model first, the planner model only if the worker model cannot ----
             let mut problem = feedback.map(str::to_string).or_else(|| valid(&args).err());
             let mut ladder: Vec<Tier> = Vec::new();
-            if self.models.has(Tier::Worker) {
-                ladder.extend([Tier::Worker, Tier::Worker]);
-            }
-            if self.models.has(Tier::Planner) {
+            // a step the planner kept for itself (a fix the worker model could not make) is bound by the planner model
+            if step.planner && self.models.has(Tier::Planner) {
                 ladder.push(Tier::Planner);
+            } else {
+                if self.models.has(Tier::Worker) {
+                    ladder.extend([Tier::Worker, Tier::Worker]);
+                }
+                if self.models.has(Tier::Planner) {
+                    ladder.push(Tier::Planner);
+                }
             }
             if ladder.is_empty() {
                 return Err(fail(
@@ -556,6 +694,24 @@ impl Inner {
             }
         }
 
+        // `cd proj && make` with cwd already `proj`: the cd would fail where it is, and the command is right without it
+        if tool == "shell"
+            && let (Some(cwd), Some(command)) = (args.get("cwd").and_then(|c| c.as_str()), args.get("command").and_then(|c| c.as_str()))
+            && let Some(rest) = strip_redundant_cd(command, cwd)
+        {
+            args.insert("command".into(), Value::String(rest));
+            how.push("rules");
+        }
+
+        // "…in proj": a command that does not say where it runs, for a step that names a directory that exists, runs there
+        if tool == "shell" && args.get("cwd").is_none() && meta.params.iter().any(|p| p.name == "cwd") {
+            let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            if let Some(dir) = directory_named(&step.description, command, self.policy.workspace()) {
+                args.insert("cwd".into(), Value::String(dir));
+                how.push("rules");
+            }
+        }
+
         // A server never returns: run in the foreground it holds the step until its timeout. The planner's sentence ("in the background") and
         // the command itself say so; a small model forgets to set the flag.
         if tool == "shell" && args.get("background").is_none() && meta.params.iter().any(|p| p.name == "background") {
@@ -584,6 +740,12 @@ impl Inner {
     fn satisfied_by_arguments(&self, c: &Check, step: &Step) -> bool {
         let Check::FileExists { path } = c else { return false };
         let want = path.trim_start_matches("./").trim_end_matches('/');
+        // "report.md exists" of a step that ran in `proj`: the file is where the step was
+        if let Some(cwd) = step.args.get("cwd").and_then(|v| v.as_str()).filter(|c| !c.is_empty())
+            && self.policy.guard().exists(&format!("{}/{want}", cwd.trim_end_matches('/'))).unwrap_or(false)
+        {
+            return true;
+        }
         let mut texts = Vec::new();
         if let Some(m) = step.args.as_object() {
             texts.extend(m.values().filter_map(|v| v.as_str()));
@@ -602,6 +764,13 @@ impl Inner {
         let (checks, understood) = crate::planner::expect_checks(expect);
         let mut missed: Vec<String> = Vec::new();
         for c in &checks {
+            if let Check::UrlServes { url, value } = c {
+                // a server that was just started builds on its first request: it is given time to come up
+                if let Err(why) = crate::verify::probe_url(url, value.as_deref(), std::time::Duration::from_secs(45)).await {
+                    missed.push(format!("{} ({why})", c.describe()));
+                }
+                continue;
+            }
             let (pass, ev) = self.eval_check(c, output);
             if !pass && !self.satisfied_by_arguments(c, step) {
                 missed.push(format!("{} ({ev})", c.describe()));
@@ -707,6 +876,30 @@ mod content_tests {
     }
 
     #[test]
+    fn a_cd_into_the_directory_the_command_already_runs_in_is_dropped() {
+        use super::strip_redundant_cd as s;
+        assert_eq!(s("cd lumen && npm run build", "lumen").as_deref(), Some("npm run build"));
+        assert_eq!(s("cd ./lumen/ ; npm test", "lumen").as_deref(), Some("npm test"));
+        assert_eq!(s("cd \"app\" && make -j4", "./app").as_deref(), Some("make -j4"));
+        assert_eq!(s("cd lumen/sub && ls", "lumen"), None, "a deeper directory is a real cd");
+        assert_eq!(s("npm run build", "lumen"), None);
+    }
+
+    #[test]
+    fn a_shell_step_that_names_a_directory_runs_in_it() {
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("proj/src")).unwrap();
+        let d = |step: &str, cmd: &str| super::directory_named(step, cmd, ws.path());
+        assert_eq!(d("show the Git log in proj using git log", "git log").as_deref(), Some("proj"));
+        assert_eq!(d("run the tests inside the folder `proj`", "pytest").as_deref(), Some("proj"));
+        assert_eq!(d("compile with cwd proj/src", "make").as_deref(), Some("proj/src"));
+        assert_eq!(d("show the log in proj", "cd proj && git log"), None, "it goes there itself");
+        assert_eq!(d("show the log in proj", "git -C proj log"), None);
+        assert_eq!(d("run in the workspace root", "ls"), None);
+        assert_eq!(d("list files in nowhere", "ls"), None, "a directory that is not there is no cwd");
+    }
+
+    #[test]
     fn a_models_own_tool_call_syntax_never_reaches_a_file_or_an_argument() {
         let page = "<html><body>x</body></html>";
         assert_eq!(strip_tool_markup(&format!("{page}\n</arg_value><arg_key>path</arg_key><arg_value>a.html</arg_value></tool_call>")), page);
@@ -741,6 +934,13 @@ mod content_tests {
 #[cfg(test)]
 mod background_tests {
     use super::implies_background;
+
+    #[test]
+    fn installing_a_server_is_not_starting_one() {
+        assert!(!implies_background("install the dependencies and run the tests", "pip install fastapi uvicorn pytest httpx && python3 -m pytest -q"));
+        assert!(!implies_background("install", "npm install next && npm run build"));
+        assert!(implies_background("serve it", "pip install uvicorn && uvicorn main:app --port 8001"));
+    }
 
     #[test]
     fn servers_and_background_work_do_not_hold_the_step() {

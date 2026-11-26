@@ -1,0 +1,39 @@
+#!/bin/sh
+# dfae-apt <package>...: install Debian packages without root, into $DFAE_TOOLS/root (already on PATH, LD_LIBRARY_PATH and
+# friends in every dfae shell command). Packages are downloaded with apt and unpacked with dpkg -x: nothing outside the tools
+# directory is touched.
+set -eu
+[ "$#" -gt 0 ] || { echo "usage: dfae-apt <package>..." >&2; exit 2; }
+T="${DFAE_TOOLS:-${HOME:-/tmp}/.tools}"
+ROOT="$T/root"; STATE="$T/apt/state"; CACHE="$T/apt/cache"
+mkdir -p "$ROOT" "$STATE/lists/partial" "$CACHE/archives/partial"
+APT="apt-get -o Dir::State=$STATE -o Dir::Cache=$CACHE -o Dir::State::status=/var/lib/dpkg/status -o Debug::NoLocking=1 -o APT::Sandbox::User= -o Acquire::Retries=2"
+# the package lists are refreshed at most once a day
+if [ -z "$(find "$STATE/.updated" -mmin -1440 2>/dev/null)" ]; then
+  # (the container's apt hooks try to clean /var/cache, which an unprivileged user may not: that complaint is noise)
+  if $APT update -qq 2> "$T/apt/err"; then : > "$STATE/.updated"; else grep -v "/var/cache/apt" "$T/apt/err" >&2 || true; exit 1; fi
+  grep -v "/var/cache/apt" "$T/apt/err" >&2 || true
+fi
+rm -f "$CACHE"/archives/*.deb
+# (the container's apt hooks try to clean /var/cache, which an unprivileged user may not: that complaint is noise)
+if ! DEBIAN_FRONTEND=noninteractive $APT install -y -qq --no-install-recommends --download-only "$@" 2> "$T/apt/err"; then
+  grep -v "/var/cache/apt" "$T/apt/err" >&2 || true
+  echo "dfae-apt: could not download $* (is the package name right? try: apt-cache -o Dir::State=$STATE -o Dir::Cache=$CACHE search <word>)" >&2
+  exit 1
+fi
+grep -v "/var/cache/apt" "$T/apt/err" >&2 || true
+n=0
+for deb in "$CACHE"/archives/*.deb; do
+  [ -e "$deb" ] || continue
+  dpkg -x "$deb" "$ROOT"; n=$((n + 1))
+  # dpkg -x runs no maintainer scripts: the links a package makes with update-alternatives (figlet -> figlet-figlet) are made here
+  ctl="$T/apt/control"; rm -rf "$ctl"; mkdir -p "$ctl"
+  if dpkg-deb -e "$deb" "$ctl" 2>/dev/null && [ -f "$ctl/postinst" ]; then
+    # (the command may continue on the next lines with a backslash)
+    sed -e ':a' -e '/\\$/N; s/\\\n//; ta' "$ctl/postinst" | tr '\t' ' ' | tr -s ' ' \
+      | sed -n 's/.*update-alternatives --install \([^ ]*\) [^ ]* \([^ ]*\) [0-9][0-9]*.*/\1 \2/p' | while read -r link target; do
+      if [ -e "$ROOT$target" ] && [ ! -e "$ROOT$link" ]; then mkdir -p "$(dirname "$ROOT$link")"; ln -sf "$ROOT$target" "$ROOT$link"; fi
+    done
+  fi
+done
+echo "dfae-apt: unpacked $n package file(s) into $ROOT ($*): programs are in $ROOT/usr/bin (on PATH), libraries in $ROOT/usr/lib, data in $ROOT/usr/share (a program that looks for its data in /usr/share needs a flag or variable that points there)"

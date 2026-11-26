@@ -113,6 +113,15 @@ pub enum EventKind {
         step_id: String,
         note: String,
     },
+    /// An MCP server's tools became available to this task.
+    McpConnected {
+        server: String,
+        tools: Vec<String>,
+        /// `config`, `registry` (connected earlier) or `glama` (found in the directory for this task).
+        source: String,
+        /// The server's own page in the MCP directory it was found in (the directory's licence asks for the link).
+        listing: Option<String>,
+    },
     Warning {
         message: String,
     },

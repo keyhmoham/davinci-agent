@@ -18,6 +18,7 @@ pub async fn problem(path: &Path, text: &str) -> Option<String> {
             .await
             .map(|e| format!("Python syntax error: {e}")),
         "sh" | "bash" => run_checker("bash", &["-n"], text).await.map(|e| format!("shell syntax error: {e}")),
+        "ts" | "tsx" | "jsx" | "mts" | "cts" => typescript_problem(path, text).await,
         "js" | "mjs" | "cjs" => run_checker("node", &["--check", "--input-type=commonjs", "-"], text).await.map(|e| format!("JavaScript syntax error: {e}")),
         _ => None,
     }
@@ -57,6 +58,29 @@ fn count_tags(lower: &str, open: &str) -> usize {
 
 /// Run an interpreter's syntax-check mode on `text` (stdin). `None` when it passes, or when the interpreter is not here:
 /// a missing checker is no evidence against the file.
+/// Syntax errors of TypeScript / JSX source, found with the project's own `typescript` package (no type checking: only whether it parses).
+/// Without one in a `node_modules` above the file there is nothing to check with, and nothing is claimed.
+async fn typescript_problem(path: &Path, text: &str) -> Option<String> {
+    const SCRIPT: &str = r#"const ts=require(process.argv[1]);const src=require('fs').readFileSync(0,'utf8');
+const r=ts.transpileModule(src,{fileName:process.argv[2],reportDiagnostics:true,compilerOptions:{jsx:ts.JsxEmit.Preserve,target:ts.ScriptTarget.ESNext,module:ts.ModuleKind.ESNext}});
+const d=(r.diagnostics||[]).filter(x=>x.category===ts.DiagnosticCategory.Error).slice(0,3).map(x=>{const p=x.file?x.file.getLineAndCharacterOfPosition(x.start):{line:0};return 'line '+(p.line+1)+': '+ts.flattenDiagnosticMessageText(x.messageText,' ')});
+if(d.length){console.error(d.join(' | '));process.exit(1)}"#;
+    let mut dir = path.parent();
+    let mut found = None;
+    for _ in 0..10 {
+        let d = dir?;
+        let candidate = d.join("node_modules/typescript/lib/typescript.js");
+        if candidate.is_file() {
+            found = Some(candidate);
+            break;
+        }
+        dir = d.parent();
+    }
+    let ts = found?;
+    let name = path.file_name()?.to_string_lossy().into_owned();
+    run_checker("node", &["-e", SCRIPT, &ts.to_string_lossy(), &name], text).await.map(|e| format!("TypeScript syntax error: {e}"))
+}
+
 async fn run_checker(program: &str, args: &[&str], text: &str) -> Option<String> {
     let mut child = Command::new(program)
         .args(args)
@@ -95,6 +119,30 @@ mod tests {
         assert!(problem(Path::new("i.html"), cut).await.unwrap().contains("cut off"));
         assert!(problem(Path::new("i.html"), "<html><body><div><br/></div></body></html>").await.is_none());
         assert!(problem(Path::new("n.txt"), "{{{").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn typescript_is_parsed_with_the_projects_own_compiler() {
+        let ws = std::env::temp_dir().join("dfae-ts-syntax");
+        let Some(real) = [
+            "/usr/lib/node_modules/typescript",
+            "/usr/local/lib/node_modules/typescript",
+            "/opt/node22/lib/node_modules/typescript",
+            "/opt/node-tools/node_modules/typescript",
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_dir()) else {
+            return; // no TypeScript on this machine: nothing to check with, and nothing is claimed
+        };
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(real, ws.join("node_modules/typescript")).unwrap();
+        let file = ws.join("src/page.tsx");
+        let bad = problem(&file, "export default function P() { const a = \"unterminated;\n return <div>{a}</div>; }\n").await;
+        assert!(bad.as_deref().is_some_and(|e| e.starts_with("TypeScript syntax error: line 1")), "{bad:?}");
+        assert!(problem(&file, "export default function P() { const a = 'x'; return <div style={{ width: a }}>{a}</div>; }\n").await.is_none());
+        // no project, no compiler: no claim
+        assert!(problem(Path::new("/nonexistent/x.tsx"), "const a = \"").await.is_none());
     }
 
     #[tokio::test]

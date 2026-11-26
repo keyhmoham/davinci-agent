@@ -11,6 +11,12 @@ use std::sync::LazyLock;
 
 static TEMPLATE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}").unwrap());
 
+/// A name the system resolves in `{{…}}`: a step id (a letter, digits, maybe `_digits`) or a value kept from the conversation.
+pub fn is_reference(name: &str) -> bool {
+    static STEP_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z]\d+(?:_\d+)?$").unwrap());
+    STEP_ID.is_match(name) || crate::session::ARTIFACT_NAMES.contains(&name)
+}
+
 /// Step ids referenced from `{{id}}` templates anywhere in `v`.
 pub fn template_refs(v: &Value) -> Vec<String> {
     let mut out = Vec::new();
@@ -18,7 +24,10 @@ pub fn template_refs(v: &Value) -> Vec<String> {
         match v {
             Value::String(s) => {
                 for c in TEMPLATE.captures_iter(s) {
-                    out.push(c[1].to_string());
+                    // `{{s1}}`, `{{r2_1}}`, `{{prev_code}}` are references; `{{ title }}` of a Jinja template or `{{name}}` of a Vue one is code
+                    if is_reference(&c[1]) {
+                        out.push(c[1].to_string());
+                    }
                 }
             }
             Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
@@ -40,11 +49,14 @@ pub fn malformed_placeholders(v: &Value) -> Vec<String> {
         match v {
             Value::String(s) => {
                 for c in ANY_BRACES.captures_iter(s) {
+                    // an invented variable (`{{ENT.location}}`, `{{}}`), not the template syntax of the file being written: a JSX style
+                    // object (`{{ width: v }}`), a Jinja or Vue variable (`{{ title }}`) is code and stays as it is
                     let inner = c[1].trim();
-                    let ident = !inner.is_empty()
-                        && inner.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-                        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-                    if !ident {
+                    let dotted = inner.contains('.')
+                        && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                        && !inner.starts_with('.')
+                        && !inner.ends_with('.');
+                    if inner.is_empty() || dotted {
                         out.push(c[0].to_string());
                     }
                 }
@@ -61,7 +73,10 @@ pub fn malformed_placeholders(v: &Value) -> Vec<String> {
 /// Substitute `{{id}}` templates using `lookup`.
 pub fn substitute(v: &Value, lookup: &dyn Fn(&str) -> Option<String>) -> Value {
     match v {
-        Value::String(s) => Value::String(TEMPLATE.replace_all(s, |c: &regex::Captures| lookup(&c[1]).unwrap_or_default()).into_owned()),
+        // what is not a reference (or has no value) stays as written: `{{ title }}` in a template file is the file's own syntax
+        Value::String(s) => Value::String(
+            TEMPLATE.replace_all(s, |c: &regex::Captures| if is_reference(&c[1]) { lookup(&c[1]).unwrap_or_default() } else { c[0].to_string() }).into_owned(),
+        ),
         Value::Array(a) => Value::Array(a.iter().map(|x| substitute(x, lookup)).collect()),
         Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), substitute(x, lookup))).collect()),
         other => other.clone(),
@@ -198,9 +213,18 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
     let mut issues: Vec<String> = Vec::new();
     let mut steps: Vec<Step> = current.to_vec();
     let done = |s: &Step| s.status == StepStatus::Succeeded;
+    // what a patch puts in a dropped step's place: the tools of the steps it edits or adds
+    let provided: HashSet<&str> = patch.edit.iter().chain(patch.add.iter()).filter_map(|s| s.tool.as_deref()).collect();
     for id in &patch.drop {
         match steps.iter().position(|s| &s.id == id) {
             Some(i) if done(&steps[i]) => issues.push(format!("{id} is finished and cannot be dropped")),
+            // a step that has not failed is work the request still needs (the build, the server): it goes only when something does it instead
+            Some(i) if steps[i].status != StepStatus::Failed && steps[i].tool.as_deref().is_some_and(|t| !provided.contains(t)) => {
+                issues.push(format!(
+                    "{id} ({}) is still needed: keep it, or replace it with a step that does the same",
+                    tokens::truncate_tokens(&steps[i].description, 14)
+                ));
+            }
             Some(i) => {
                 steps.remove(i);
             }
@@ -248,7 +272,9 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
     // A patch that adds steps and says nothing of the failed one has replaced it: the failed step is not worth a second round
     // with the planner (which tends to answer with a patch that has lost its additions).
     if !patch.add.is_empty() {
-        let failed: HashSet<String> = steps.iter().filter(|s| s.status == StepStatus::Failed).map(|s| s.id.clone()).collect();
+        // (only when something of the same kind is added: a failed build is not "replaced" by a step that reads a file)
+        let failed: HashSet<String> =
+            steps.iter().filter(|s| s.status == StepStatus::Failed && s.tool.as_deref().is_none_or(|t| provided.contains(t))).map(|s| s.id.clone()).collect();
         steps.retain(|s| !failed.contains(&s.id));
         for s in &mut steps {
             s.depends_on.retain(|d| !failed.contains(d));
@@ -270,6 +296,9 @@ static EXPECT_CONTAINS: LazyLock<Regex> = LazyLock::new(|| {
 });
 static EXPECT_OUTPUT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)^(?:the )?(?:output|result|response|listing) (?:also |now )?(?:contains?|shows?|lists?|includes?|mentions?|has) (?:the (?:text|line|word|entries?|string) )?(?:`([^`]+)`|"([^"]+)"|'([^']+)'|(.+))$"#).unwrap()
+});
+static EXPECT_URL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)^(?:the (?:page|app|site|server|service|api) (?:at |on ))?<?(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?[^\s"`'>]*)>? (?:now |then )?(?:serves|shows|displays|contains|returns|responds(?: with)?|says|is (?:up|reachable|serving|answering)|answers)(?: (?:200|http 200|ok))?\s*(?:(?:the )?(?:text|title|heading|word|phrase|page) )?(?:`([^`]+)`|"([^"]+)"|'([^']+)')?$"#).unwrap()
 });
 static EXPECT_OK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:the )?(?:command|step|tool|script|build|tests?|process|server|job)?\s*(?:exits?|exited|returns?|finish(?:es|ed)?)(?: with)?(?: (?:exit )?(?:code|status))? 0$|^(?:the )?(?:command |step |tool |script |build |tests? |process |server |job )?(?:succeeds|succeeded|runs successfully|ran successfully|starts|started|starts successfully|is running|runs)$").unwrap()
@@ -313,6 +342,8 @@ pub fn expect_checks(expect: &str) -> (Vec<Check>, bool) {
             |c: &regex::Captures, from: usize| (from..c.len()).find_map(|i| c.get(i)).map(|m| m.as_str().trim().trim_matches(['"', '`', '\'']).to_string());
         if let Some(c) = EXPECT_EXISTS.captures(clause) {
             checks.push(Check::FileExists { path: c[1].to_string() });
+        } else if let Some(c) = EXPECT_URL.captures(clause) {
+            checks.push(Check::UrlServes { url: c[1].to_string(), value: pick(&c, 2).filter(|v| !v.is_empty()) });
         } else if let Some(c) = EXPECT_CONTAINS.captures(clause)
             && let Some(v) = pick(&c, 2).filter(|v| !v.is_empty())
             && !bare_phrase(&c, 5)
@@ -645,6 +676,68 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_cannot_lose_the_work_it_does_not_replace() {
+        use crate::plandoc::{PatchDoc, StepDoc};
+        let r = registry();
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_mkdir", "do": "make", "args": {"path": "a"}},
+            {"id": "s2", "tool": "shell", "do": "build the project", "args": {"command": "true"}, "after": ["s1"]},
+            {"id": "s3", "tool": "shell", "do": "serve the project", "args": {"command": "true"}, "after": ["s2"]}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
+        steps[0].status = StepStatus::Succeeded;
+        steps[1].status = StepStatus::Failed;
+        steps[2].status = StepStatus::Cancelled;
+        let read =
+            StepDoc { id: "x".into(), tool: Some("fs_read".into()), intent: "read the file".into(), after: vec![], expect: None, planner: false, args: None };
+        // the planner adds a read, forgets the failed build, and drops the server step
+        let patch = PatchDoc { edit: vec![], add: vec![read], drop: vec!["s3".into()] };
+        let issues = apply_patch(&steps, &patch, "r1_", &r).unwrap_err();
+        assert!(issues.iter().any(|i| i.contains("s3") && i.contains("still needed")), "{issues:?}");
+        assert!(issues.iter().any(|i| i.contains("s2 failed") && i.contains("neither edited nor dropped")), "{issues:?}");
+    }
+
+    #[test]
+    fn steps_that_waited_for_the_edited_step_are_kept() {
+        use crate::plandoc::{PatchDoc, StepDoc};
+        let r = registry();
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_mkdir", "do": "make", "args": {"path": "a"}},
+            {"id": "s2", "tool": "shell", "do": "build", "args": {"command": "true"}, "after": ["s1"]},
+            {"id": "s3", "tool": "shell", "do": "serve", "args": {"command": "true"}, "after": ["s2"]}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
+        steps[0].status = StepStatus::Succeeded;
+        steps[1].status = StepStatus::Failed;
+        steps[2].status = StepStatus::Cancelled;
+        let edit = StepDoc {
+            id: "s2".into(),
+            tool: Some("shell".into()),
+            intent: "build again".into(),
+            after: vec!["x".into()],
+            expect: None,
+            planner: false,
+            args: None,
+        };
+        let fix =
+            StepDoc { id: "x".into(), tool: Some("fs_mkdir".into()), intent: "fix".into(), after: vec!["s1".into()], expect: None, planner: false, args: None };
+        let merged = apply_patch(&steps, &PatchDoc { edit: vec![edit], add: vec![fix], drop: vec![] }, "r1_", &r).unwrap();
+        let ids: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["s1", "s2", "s3", "r1_1"], "the serving step is still there, waiting for the build");
+        assert_eq!(merged[2].status, StepStatus::Pending);
+    }
+
+    #[test]
+    fn the_template_syntax_of_the_file_being_written_is_not_ours() {
+        let jsx = json!({"content": "<div style={{ width: v }}>{{ title }} {{name}} {{s1}}</div>"});
+        assert!(malformed_placeholders(&jsx).is_empty(), "JSX and Jinja/Vue variables are code");
+        assert_eq!(template_refs(&jsx), vec!["s1"], "only a step id or a kept value is a reference");
+        let out = substitute(&jsx, &|id| Some(format!("<{id}>")));
+        assert_eq!(out["content"], "<div style={{ width: v }}>{{ title }} {{name}} <s1></div>");
+        assert_eq!(malformed_placeholders(&json!({"a": "{{ENT.location}}"})), vec!["{{ENT.location}}"], "an invented dotted variable still is not a value");
+    }
+
+    #[test]
     fn rejects_bad_plans() {
         let r = registry();
         let bad = |v: Value| {
@@ -798,6 +891,19 @@ mod expect_tests {
         let (c, all) = expect_checks("backup/config.toml exists and the command exits 0");
         assert_eq!(c.len(), 2);
         assert!(all);
+    }
+
+    #[test]
+    fn a_served_address_becomes_a_check_that_asks_it() {
+        let (c, all) = expect_checks("http://localhost:8001 serves \"Acme Analytics\"");
+        assert_eq!((c, all), (vec![Check::UrlServes { url: "http://localhost:8001".into(), value: Some("Acme Analytics".into()) }], true));
+        let (c, all) = expect_checks("the page at http://localhost:8002/docs responds with `Welcome`");
+        assert_eq!((c, all), (vec![Check::UrlServes { url: "http://localhost:8002/docs".into(), value: Some("Welcome".into()) }], true));
+        let (c, all) = expect_checks("http://127.0.0.1:8000 is up");
+        assert_eq!((c, all), (vec![Check::UrlServes { url: "http://127.0.0.1:8000".into(), value: None }], true));
+        // an address that is not this machine's is not asked
+        let (c, all) = expect_checks("https://example.com serves \"Example\"");
+        assert!(c.is_empty() && !all);
     }
 
     #[test]

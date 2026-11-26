@@ -27,6 +27,9 @@ No model owns control flow, permissions, or the claim that a task is done.
    With a planner model the plan is requested through a strict JSON Schema (tools as an enum), read leniently, repaired by
    code, and sent back to the planner with typed issues only when code cannot fix it; the planner sees the whole tool
    catalogue (the decision model's tool choice only serves quick tasks and the worker-plans fallback).
+   **MCP.** After routing, a request about an outside service attaches MCP servers to the task (`dfae-mcp`: connected ones that fit,
+   else the best of what the Glama directory finds for a short worker-written query); their tools are registered as `mcp__<server>__<tool>`
+   and visible to that task only (`TaskCtx::in_scope`).
 7. **Execute** — each brief step is bound just before it runs: rules and the extractor first, then the worker model
    (asked only for the parameters the step needs; file content is written as plain text, not squeezed into JSON), then the
    planner model. A bound `cwd` must exist; a background command that dies within 1.5 s is a failed step with its output.
