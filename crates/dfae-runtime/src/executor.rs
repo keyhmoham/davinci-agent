@@ -539,7 +539,7 @@ impl Inner {
             Ok(t) => t,
             // the planner model cannot be reached: the self-hosted one answers instead of the user getting an error
             Err(e) if paid && self.models.has(Tier::Worker) && e.contains("model request failed") => {
-                self.emit(ctx, EventKind::Warning { message: format!("the planner model is unavailable ({e}); the self-hosted model answers instead") }).await;
+                self.emit(ctx, EventKind::Warning { message: format!("the planner model is unavailable ({e}); the worker model answers instead") }).await;
                 let mut local = self.gen_request(Tier::Worker, prompts::CHAT_SYSTEM, String::new(), "chat");
                 local.messages = req.messages.clone();
                 local.temperature = 0.6;
@@ -547,7 +547,20 @@ impl Inner {
             }
             Err(e) => return Err(StepFailure::new(ErrorKind::Transient, e)),
         };
-        let text = crate::style::compact(&text);
+        let mut text = crate::style::compact(&text);
+        // A reply that is a tool call in disguise means the request needs a tool this plain reply does not have. Once more, told
+        // plainly; if it still is, the task says so instead of showing the user markup.
+        if economy::contracts::pseudo_tool_call(&text) {
+            let mut again = req.clone();
+            again.messages.push(Message::assistant(tokens::truncate_tokens(&text, 60)));
+            again.messages.push(Message::user(
+                "You cannot call tools in this reply. Answer in plain words from what you know, or say in one sentence that you cannot do it from here.",
+            ));
+            text = crate::style::compact(&self.generate_text(ctx, tier, again).await.map_err(|e| StepFailure::new(ErrorKind::Transient, e))?);
+            if economy::contracts::pseudo_tool_call(&text) {
+                return Err(StepFailure::new(ErrorKind::Other, "this request needs a tool (a lookup, a file, a command) and was answered as a plain reply"));
+            }
+        }
         if let Some(issue) = economy::contracts::model_output_issue(&text) {
             return Err(StepFailure::new(ErrorKind::Transient, format!("model output rejected: {issue}")));
         }

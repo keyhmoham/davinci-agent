@@ -123,7 +123,7 @@ impl ModelGateway {
                 cached: false,
                 origin: None,
             },
-            text: resp.text,
+            text: strip_reasoning(&resp.text),
         })
     }
 
@@ -144,6 +144,21 @@ impl ModelGateway {
             None => Err(ModelError::InvalidOutput(format!("no JSON object in output: {}", second.text.chars().take(120).collect::<String>()))),
         }
     }
+}
+
+/// Reasoning models put their thinking in the reply (`<think>…</think>`, sometimes only the closing tag): it is not part of the
+/// answer and must never reach a user, a file or a JSON parser.
+pub fn strip_reasoning(text: &str) -> String {
+    static BLOCK: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<(think|thinking|reasoning|thought)>.*?</(think|thinking|reasoning|thought)>").unwrap());
+    let mut t = BLOCK.replace_all(text, "").to_string();
+    // an opening tag that was cut off (only the end of the thinking is in the reply): the answer is what follows the last closing tag
+    for close in ["</think>", "</thinking>", "</reasoning>", "</thought>"] {
+        if let Some(i) = t.rfind(close) {
+            t = t[i + close.len()..].to_string();
+        }
+    }
+    t.trim().to_string()
 }
 
 /// Extract the first balanced JSON object from model output (tolerates
@@ -198,6 +213,14 @@ pub fn extract_json(text: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::ScriptedModel;
+
+    #[test]
+    fn thinking_is_not_part_of_the_answer() {
+        assert_eq!(strip_reasoning("<think>let me see…</think>\nThe answer is 4."), "The answer is 4.");
+        assert_eq!(strip_reasoning("</think><tool_call>x"), "<tool_call>x");
+        assert_eq!(strip_reasoning("<think>a</think>one<think>b</think> two"), "one two");
+        assert_eq!(strip_reasoning("no thinking here"), "no thinking here");
+    }
 
     #[test]
     fn extracts_json_from_noise() {

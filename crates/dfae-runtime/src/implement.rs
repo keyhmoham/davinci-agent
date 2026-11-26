@@ -187,7 +187,17 @@ impl Inner {
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
         let goal = ctx.rec.lock().await.goal.clone();
         let step_text = if step.description.split_whitespace().count() < 9 {
-            format!("{}\nFULL REQUEST (background only; other steps do the other parts): {}", step.description, tokens::truncate_tokens(&goal, 300))
+            // a short step ("so what is its price ??") leans on the conversation: the last turns say what "its" is
+            let recent: Vec<String> = {
+                let turns = ctx.base_ctx.lock().turns.clone();
+                turns
+                    .iter()
+                    .skip(turns.len().saturating_sub(2))
+                    .map(|(q, a)| format!("user: {} → assistant: {}", tokens::truncate_tokens(q, 40), tokens::truncate_tokens(a, 60)))
+                    .collect()
+            };
+            let recent = if recent.is_empty() { String::new() } else { format!("\nRECENT TURNS: {}", recent.join(" | ")) };
+            format!("{}\nFULL REQUEST (background only; other steps do the other parts): {}{recent}", step.description, tokens::truncate_tokens(&goal, 300))
         } else {
             step.description.clone()
         };

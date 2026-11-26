@@ -123,8 +123,23 @@ impl Inner {
 
         // ---- 4b. conversation: nothing to run, so nothing to plan ----------------------
         if !is_agent && calls.is_none() && skill.is_none() && !routing.needs_tools && req.mode == ModeRequest::Auto {
-            // a reply needs no plan: the local models answer it (planning is what the planner model is for)
-            return self.run_chat(ctx, &goal, false, ExecMode::Assisted).await;
+            // The routing said no tools. A second question, to the same decision model, costs nothing: is any tool plainly relevant
+            // ("the price of bitcoin now" is not a conversation)? Small talk is canned and never asks.
+            let mut tstate = state.clone();
+            tstate.tools = self.scoped_briefs(ctx);
+            // (the built-in rules' tool scores are keyword heuristics: they are not trusted to overrule the routing)
+            let relevant = routing.smalltalk.is_none()
+                && self.decider.provider_name() == "open-model"
+                && self.note(ctx, self.decider.select_tools(tstate).await).await.iter().any(|(_, p)| *p >= self.cfg.thresholds.tool_min_relevance + 0.2);
+            if !relevant {
+                // a reply needs no plan: the worker system answers it (planning is what the planner model is for)
+                return self.run_chat(ctx, &goal, false, ExecMode::Assisted).await;
+            }
+            self.emit(
+                ctx,
+                EventKind::Warning { message: "the routing said no tools were needed, but a tool is plainly relevant: handling it as a task".into() },
+            )
+            .await;
         }
 
         // ---- 5. mode ---------------------------------------------------------
@@ -636,15 +651,22 @@ impl Inner {
         // tool (or none: the local model writes the reply) is the step; the local system binds its arguments just before it
         // runs. If that is not enough, the step fails and the planner model re-plans with the actual result in hand.
         if mode == ExecMode::Assisted && self.models.has(Tier::Planner) && !is_member {
-            let mut step = match top_tool.filter(|t| ctx.in_scope(t)) {
-                Some(t) => Step::tool("s1", &t, goal, json!({})),
+            let tool = top_tool.filter(|t| ctx.in_scope(t));
+            let mut step = match &tool {
+                Some(t) => Step::tool("s1", t, goal, json!({})),
                 None => Step::reasoning("s1", goal),
             };
             step.brief = true;
-            return Ok((
-                Plan { goal: goal.into(), steps: vec![step], source: PlanSource::Quick, revision: 0, estimate: None, report: None },
-                ExecMode::Assisted,
-            ));
+            let mut steps = vec![step];
+            // A lookup returns raw material (search results, a file): the user is owed the answer, written by the worker model from it.
+            // A tool that changes something reports itself in one line.
+            if tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| !m.side_effects) {
+                let mut answer = Step::reasoning("s2", &format!("answer the request from the result of s1: {goal}"));
+                answer.brief = true;
+                answer.depends_on = vec!["s1".into()];
+                steps.push(answer);
+            }
+            return Ok((Plan { goal: goal.into(), steps, source: PlanSource::Quick, revision: 0, estimate: None, report: None }, ExecMode::Assisted));
         }
 
         let budget = ctx.rec.lock().await.budget.clone();
