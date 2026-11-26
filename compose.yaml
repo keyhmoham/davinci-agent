@@ -91,6 +91,9 @@ services:
       DECISION_MODEL: ${DECISION_MODEL:-qwen3:4b-instruct-2507-q4_K_M}
       DECISION_PROVIDER: ${DECISION_PROVIDER:-}
       DECISION_API_KEY: ${DECISION_API_KEY:-}
+      DECISION_TIMEOUT_MS: ${DECISION_TIMEOUT_MS:-}
+      DECISION_PARALLEL: ${DECISION_PARALLEL:-}
+      DECISION_KINDS: ${DECISION_KINDS:-}
       # the planner model writes and revises plans; the worker model carries them out. Both are hosted and configured the same
       # way (provider: openai = any OpenAI-compatible endpoint | anthropic). Defaults: gpt-6-luna and glm-5.3-flash through
       # https://ai-gateway.vercel.sh/v1; an empty value means "use the default".
@@ -101,6 +104,7 @@ services:
       PLANNER_MAX_TOKENS: ${PLANNER_MAX_TOKENS:-}
       PLANNER_TIMEOUT_SECS: ${PLANNER_TIMEOUT_SECS:-}
       PLANNER_PROMPT_CACHE: ${PLANNER_PROMPT_CACHE:-}
+      PLANNER_REASONING: ${PLANNER_REASONING:-}
       WORKER_PROVIDER: ${WORKER_PROVIDER:-}
       WORKER_API_KEY: ${WORKER_API_KEY:-}
       WORKER_MODEL: ${WORKER_MODEL:-}
@@ -108,6 +112,7 @@ services:
       WORKER_MAX_TOKENS: ${WORKER_MAX_TOKENS:-}
       WORKER_CONTENT_MAX_TOKENS: ${WORKER_CONTENT_MAX_TOKENS:-}
       WORKER_TIMEOUT_SECS: ${WORKER_TIMEOUT_SECS:-}
+      WORKER_REASONING: ${WORKER_REASONING:-}
       # web search backends (optional; without them DuckDuckGo's HTML endpoint and Wikipedia are used)
       SEARXNG_URL: ${SEARXNG_URL:-}
       BRAVE_API_KEY: ${BRAVE_API_KEY:-}
@@ -124,6 +129,10 @@ services:
       # complexity (0..1) at which the built-in rules (the fallback when the decision model is down) say a request needs a plan
       DFAE_PLAN_MIN_COMPLEXITY: ${DFAE_PLAN_MIN_COMPLEXITY:-}
       DFAE_MAX_MODEL_CALLS: ${DFAE_MAX_MODEL_CALLS:-}
+      DFAE_MAX_REPLANS: ${DFAE_MAX_REPLANS:-}
+      DFAE_MAX_STEPS: ${DFAE_MAX_STEPS:-}
+      DFAE_MAX_TOOL_CALLS: ${DFAE_MAX_TOOL_CALLS:-}
+      DFAE_MAX_SECONDS: ${DFAE_MAX_SECONDS:-}
       DFAE_MAX_WORKER_CALLS: ${DFAE_MAX_WORKER_CALLS:-}
       DFAE_REPAIR: ${DFAE_REPAIR:-}
       DFAE_LAZY_CONTEXT: ${DFAE_LAZY_CONTEXT:-}
