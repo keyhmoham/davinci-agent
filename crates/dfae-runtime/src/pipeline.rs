@@ -640,6 +640,14 @@ impl Inner {
                 }
             }
         }
+        // an answer that changes over time cannot come from memory: the web tools are available to it whatever the tool ranking said
+        if ctx.rec.lock().await.route.as_ref().is_some_and(|r| r.fresh_data) {
+            for m in self.scoped_metas(ctx).into_iter().filter(|m| m.category == "web") {
+                if !allowed.contains(&m.name) {
+                    allowed.push(m.name);
+                }
+            }
+        }
         // no tool fits: this is a conversation (or a request we have no tool for) — answer it, don't plan it
         let is_member = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).is_some();
         if allowed.is_empty() && !is_member {
@@ -651,7 +659,10 @@ impl Inner {
         // tool (or none: the local model writes the reply) is the step; the local system binds its arguments just before it
         // runs. If that is not enough, the step fails and the planner model re-plans with the actual result in hand.
         if mode == ExecMode::Assisted && self.models.has(Tier::Planner) && !is_member {
-            let tool = top_tool.filter(|t| ctx.in_scope(t));
+            // information that changes over time lives on the web: the decision model said so (`fresh_data`), so a web tool leads
+            let fresh = ctx.rec.lock().await.route.as_ref().is_some_and(|r| r.fresh_data);
+            let web = fresh.then(|| allowed.iter().find(|n| self.tools.meta(n).is_some_and(|m| m.category == "web") && ctx.in_scope(n)).cloned()).flatten();
+            let tool = web.or(top_tool).filter(|t| ctx.in_scope(t));
             let mut step = match &tool {
                 Some(t) => Step::tool("s1", t, goal, json!({})),
                 None => Step::reasoning("s1", goal),

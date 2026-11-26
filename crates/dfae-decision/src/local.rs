@@ -248,6 +248,9 @@ fn smalltalk_kind(req: &str) -> &'static str {
     }
 }
 
+static FRESH_DATA: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:price|prices|exchange rate|weather|forecast|temperature|news|headlines|scores?|stocks?|latest|currently|right now|live|trending|who won|how much is|how much does)\b|\bcurrent\s+(?:price|rate|weather|version|status|time|value)\b|\bfor now\b").unwrap()
+});
 static FEEDBACK_NEG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:that(?:'s| is| was)? (?:wrong|not right|incorrect|not what)|not what i (?:asked|meant|wanted)|try again|do it again|doesn'?t work|does not work|didn'?t work|still (?:fails|broken|wrong|not working)|you (?:got it wrong|missed)|it(?:'s| is) (?:broken|wrong))\b").unwrap()
 });
@@ -410,6 +413,7 @@ impl LocalDecider {
                     Risk::High => "high",
                 };
                 out.insert("risk".into(), Answer::choice(key, rc, &[(key, rc)]));
+                out.insert("fresh_data".into(), Answer::noul(if FRESH_DATA.is_match(&s.request) { 0.85 } else { 0.1 }));
                 out.insert("changes_state".into(), Answer::noul(if CHANGE_VERBS.is_match(&s.request) { 0.85 } else { 0.1 }));
                 out.insert("conditional_change".into(), Answer::noul(if CONDITIONAL.is_match(&s.request) { 0.85 } else { 0.1 }));
                 let kind = smalltalk_kind(&s.request);
