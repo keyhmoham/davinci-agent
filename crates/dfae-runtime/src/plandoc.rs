@@ -281,7 +281,8 @@ fn step_schema(tools: &[String]) -> Value {
 
 /// The JSON Schema of a plan (strict structured output: every property required, none extra).
 pub fn plan_schema(tools: &[String], max_steps: u32, with_report: bool) -> Value {
-    let mut props = json!({"steps": {"type": "array", "minItems": 1, "maxItems": max_steps, "items": step_schema(tools)}});
+    // no minItems/maxItems: strict structured-output modes of several providers reject them; the limit is in the description and validated in code
+    let mut props = json!({"steps": {"type": "array", "items": step_schema(tools), "description": format!("at most {max_steps} steps")}});
     let mut required = vec!["steps"];
     if with_report {
         props["report"] = json!({"anyOf": [{"type": "string"}, {"type": "null"}], "description": "the final reply to the user with {{sN}} where step sN's output belongs, or null"});
@@ -292,7 +293,7 @@ pub fn plan_schema(tools: &[String], max_steps: u32, with_report: bool) -> Value
 
 /// The JSON Schema of a re-planning patch.
 pub fn patch_schema(tools: &[String], max_steps: u32) -> Value {
-    let list = |desc: &str| json!({"type": "array", "maxItems": max_steps, "items": step_schema(tools), "description": desc});
+    let list = |desc: &str| json!({"type": "array", "items": step_schema(tools), "description": format!("{desc} (at most {max_steps})")});
     json!({
         "type": "object",
         "additionalProperties": false,
