@@ -195,7 +195,7 @@ impl Config {
                 base_url: env_or("SLM_BASE_URL", "http://ollama:11434/v1"),
                 model: env_or("SLM_MODEL", "qwen2.5:3b"),
                 api_key: env("SLM_API_KEY"),
-                max_tokens: env_parse("SLM_MAX_TOKENS", 1024),
+                max_tokens: env_parse("SLM_MAX_TOKENS", 4096),
                 timeout_secs: env_parse("SLM_TIMEOUT_SECS", 180),
             },
             strong: ModelConfig {

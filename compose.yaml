@@ -39,11 +39,17 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
+    # loopback only: lets `cargo test --test live_slm -- --ignored` talk to the same models
+    ports:
+      - "127.0.0.1:11434:11434"
     environment:
       # the SLM and the decision model stay loaded; decisions ask a few questions at once
       OLLAMA_KEEP_ALIVE: 24h
       OLLAMA_MAX_LOADED_MODELS: "2"
       OLLAMA_NUM_PARALLEL: "2"
+      # Ollama's default context window (2-4k tokens) silently drops the start of a long prompt — the instructions. The local
+      # prompts are deliberately generous (examples, parameter help, whole observations), so give them room.
+      OLLAMA_CONTEXT_LENGTH: ${OLLAMA_CONTEXT_LENGTH:-16384}
     volumes:
       - ollama:/root/.ollama
     healthcheck:

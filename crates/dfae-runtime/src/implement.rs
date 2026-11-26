@@ -36,6 +36,26 @@ fn majority(candidates: Vec<Map<String, Value>>) -> Option<Map<String, Value>> {
     candidates.into_iter().nth(best)
 }
 
+/// A model that was told to reply with the file alone still wraps it in a code fence, or adds a sentence in front.
+pub(crate) fn strip_fences(text: &str) -> String {
+    let t = text.trim();
+    if let Some(start) = t.find("```") {
+        let after = &t[start + 3..];
+        // skip the language tag on the fence line
+        let body = after.split_once('\n').map(|(_, b)| b).unwrap_or(after);
+        let inner = body.rsplit_once("```").map(|(b, _)| b).unwrap_or(body);
+        return inner.trim_matches('\n').to_string();
+    }
+    // a sentence before a bare HTML document
+    let lower = t.to_ascii_lowercase();
+    if let Some(at) = lower.find("<!doctype").or_else(|| lower.find("<html"))
+        && at > 0
+    {
+        return t[at..].to_string();
+    }
+    t.to_string()
+}
+
 fn object(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
@@ -126,7 +146,9 @@ impl Inner {
         let sig = if paid { meta.signature() } else { meta.signature_detailed() };
         let inputs = Self::inputs_text(deps, if paid { 120 } else { 900 });
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
-        let user = prompts::bind_user(&sig, &step.description, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
+        let goal = ctx.rec.lock().await.goal.clone();
+        let step_text = format!("{}\nFULL REQUEST (for context): {}", step.description, tokens::truncate_tokens(&goal, 300));
+        let user = prompts::bind_user(&sig, &step_text, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
         let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
         req.json = true;
         req.temperature = temperature;
@@ -139,6 +161,52 @@ impl Inner {
         // some models wrap the arguments: {"args": {...}}
         let v = v.get("args").filter(|a| a.is_object()).cloned().unwrap_or(v);
         v.as_object().cloned().ok_or_else(|| "the reply was not a JSON object of arguments".to_string())
+    }
+
+    /// "write {{prev_code}} to index.html", "save that code": the content is something said earlier, used by name — never
+    /// written again.
+    fn names_an_earlier_value(&self, ctx: &Arc<TaskCtx>, step: &Step) -> bool {
+        static EARLIER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)\b(?:that|this|the|above|previous|earlier|last|same)\s+(?:code|page|html|snippet|script|text|reply|answer|content)\b")
+                .unwrap()
+        });
+        let artifacts = ctx.base_ctx.lock().artifacts.clone();
+        !artifacts.is_empty() && (EARLIER.is_match(&step.description) || artifacts.iter().any(|(n, _, _)| step.description.contains(n.as_str())))
+    }
+
+    fn step_tier_for_content(&self, step: &Step) -> Tier {
+        if (step.strong && self.models.has(Tier::Strong)) || !self.models.has(Tier::Slm) { Tier::Strong } else { Tier::Slm }
+    }
+
+    /// The content of the file a step writes, from the request, the step and the earlier results.
+    async fn write_content(&self, ctx: &Arc<TaskCtx>, step: &Step, args: &Map<String, Value>, deps: &[Dep], feedback: Option<&str>) -> Option<String> {
+        let tier = self.step_tier_for_content(step);
+        if !self.models.has(tier) {
+            return None;
+        }
+        let goal = ctx.rec.lock().await.goal.clone();
+        let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
+        let mut user = format!(
+            "FILE: {}\nREQUEST: {}\nSTEP: {}\n",
+            args.get("path").and_then(|p| p.as_str()).unwrap_or(""),
+            tokens::truncate_tokens(&goal, 400),
+            step.description
+        );
+        let inputs = Self::inputs_text(deps, if tier == Tier::Strong { 150 } else { 1500 });
+        if !inputs.is_empty() {
+            user.push_str(&format!("INPUTS:\n{inputs}\n"));
+        }
+        if !values.is_empty() {
+            user.push_str(&format!("AVAILABLE VALUES (they are only for you to read here): {values}\n"));
+        }
+        if let Some(f) = feedback {
+            user.push_str(&format!("YOUR PREVIOUS VERSION WAS REJECTED: {f}\nWrite the whole file again and fix that.\n"));
+        }
+        let mut req = self.gen_request(tier, prompts::CONTENT_SYSTEM, user, "content");
+        req.temperature = 0.2;
+        let text = self.generate_text(ctx, tier, req).await.ok()?;
+        let text = strip_fences(&text);
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Decide what a brief step becomes and bind its arguments. Returns the concrete step.
@@ -231,6 +299,17 @@ impl Inner {
             }
             Ok(())
         };
+        // A file's content is written as plain text by a model, not squeezed into a JSON string (see `CONTENT_SYSTEM`); the
+        // rules have already found the path.
+        if meta.name == "fs_write"
+            && args.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty() && !p.contains("{{"))
+            && args.get("content").and_then(|c| c.as_str()).is_none_or(|c| c.trim().is_empty())
+            && !self.names_an_earlier_value(ctx, step)
+            && let Some(text) = self.write_content(ctx, step, &args, deps, feedback).await
+        {
+            args.insert("content".into(), Value::String(text));
+            how.push(if self.step_tier_for_content(step) == Tier::Strong { "strong" } else { "slm" });
+        }
         if valid(&args).is_ok() {
             if how.is_empty() {
                 how.push(if planned { "plan" } else { "rules" });
@@ -384,5 +463,21 @@ mod tests {
         assert_eq!(majority(vec![a.clone(), b.clone(), b.clone()]), Some(b.clone()));
         assert_eq!(majority(vec![a.clone(), b]), Some(a));
         assert_eq!(majority(vec![]), None);
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::strip_fences;
+
+    #[test]
+    fn a_file_comes_out_of_whatever_a_small_model_wraps_around_it() {
+        let page = "<!doctype html>\n<html><body><h1>Earth</h1></body></html>";
+        assert_eq!(strip_fences(page), page);
+        assert_eq!(strip_fences(&format!("```html\n{page}\n```")), page);
+        assert_eq!(strip_fences(&format!("Sure! Here is the page:\n\n```html\n{page}\n```\nLet me know if you want changes.")), page);
+        assert_eq!(strip_fences(&format!("Here is the page you asked for:\n{page}")), page);
+        assert_eq!(strip_fences("```\nport = 1\n```"), "port = 1");
+        assert_eq!(strip_fences("plain text file"), "plain text file");
     }
 }
