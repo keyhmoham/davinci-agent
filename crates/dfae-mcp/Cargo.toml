@@ -17,6 +17,7 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
+regex = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]

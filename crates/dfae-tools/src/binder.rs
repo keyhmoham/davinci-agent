@@ -170,6 +170,18 @@ pub fn bind_direct(metas: &[ToolMetadata], request: &str, entities: &[Entity]) -
         let (tool, args, score) = bind_clause(metas, &clause, entities)?;
         calls.push(DirectCall { tool, args, clause, after_prev, score });
     }
+    // A request that names a place, a person or a company that no call took up asks for more than the tool does ("what time is it in
+    // Tokyo and in New York" is not `time_now`): a model gets it.
+    let used: String = calls.iter().map(|c| c.args.to_string().to_lowercase()).collect::<Vec<_>>().join(" ");
+    let unmet = entities.iter().any(|e| {
+        matches!(e.label.as_str(), "location" | "city" | "person" | "organization" | "company" | "product" | "event")
+            && e.score >= 0.5
+            && req.to_lowercase().contains(&e.text.to_lowercase())
+            && !used.contains(&e.text.to_lowercase())
+    });
+    if unmet {
+        return None;
+    }
     Some(calls)
 }
 
@@ -199,6 +211,13 @@ mod tests {
 
     fn ent(label: &str, text: &str) -> Entity {
         Entity { label: label.into(), text: text.into(), start: None, end: None, score: 1.0, source: "t".into() }
+    }
+
+    #[test]
+    fn a_request_that_names_what_the_tool_cannot_take_is_not_bound() {
+        let near = [ent("location", "Tokyo"), ent("location", "New York")];
+        assert!(bind_direct(&metas(), "what time is it in Tokyo and in New York?", &near).is_none(), "time_now has no place to take");
+        assert!(bind_direct(&metas(), "what time is it", &[]).is_some());
     }
 
     #[test]

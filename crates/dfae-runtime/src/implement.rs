@@ -272,7 +272,13 @@ impl Inner {
         let meta = &asked;
         // both hosted models are billed by the token: compact signature (the parameter help rides in the schema), trimmed inputs
         let sig = meta.signature();
-        let inputs = Self::inputs_text(deps, if paid { 120 } else { 400 });
+        let mut inputs = Self::inputs_text(deps, if paid { 120 } else { 400 });
+        // an edit replaces text that exists: a model that is not shown the file invents it (or leaves it empty)
+        if meta.name == "fs_edit"
+            && let Some(file) = self.file_to_edit(prebound, entities, &step.description)
+        {
+            inputs.push_str(&format!("\n{}", dfae_core::safety::wrap_untrusted("FILE (copy old_string from it exactly)", &file)));
+        }
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
         let goal = ctx.rec.lock().await.goal.clone();
         let step_text = if step.description.split_whitespace().count() < 9 {
@@ -292,8 +298,14 @@ impl Inner {
         };
         let user = prompts::bind_user(&sig, &step_text, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
         // what binds a shell command is told what the shell is, and that it may install (other tools need no such words)
-        let system =
-            if meta.name == "shell" { format!("{}\n{}", prompts::BIND_SYSTEM, self.shell_environment(true)) } else { prompts::BIND_SYSTEM.to_string() };
+        let system = match meta.name.as_str() {
+            "shell" => format!("{}\n{}", prompts::BIND_SYSTEM, self.shell_environment(true)),
+            "fs_edit" => format!(
+                "{}\nold_string is copied exactly from the FILE (indentation included) and long enough to occur once; new_string replaces it.",
+                prompts::BIND_SYSTEM
+            ),
+            _ => prompts::BIND_SYSTEM.to_string(),
+        };
         let mut req = self.gen_request(tier, &system, user, "bind");
         req.json = true;
         req.temperature = temperature;
@@ -319,6 +331,32 @@ impl Inner {
             }
         }
         Ok(args)
+    }
+
+    /// The text of the file an edit step is about (as far as the model needs to see it), found from the arguments or the step.
+    fn file_to_edit(&self, prebound: &Map<String, Value>, entities: &[Entity], step_text: &str) -> Option<String> {
+        let candidates = prebound
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(String::from)
+            .into_iter()
+            .chain(entities.iter().filter(|e| e.label == "file path").map(|e| e.text.clone()))
+            .chain(
+                step_text
+                    .split_whitespace()
+                    .map(|w| w.trim_matches(['`', '"', '\'', ',', '.', ':', ';', '(', ')']).to_string())
+                    .filter(|w| w.contains('/') || w.contains('.')),
+            );
+        for c in candidates {
+            if let Ok(p) = self.policy.guard().read_path(&c)
+                && p.is_file()
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                let shown: String = text.chars().take(8000).collect();
+                return Some(if shown.len() < text.len() { format!("{shown}\n… [file continues]") } else { shown });
+            }
+        }
+        None
     }
 
     /// "write {{prev_code}} to index.html", "save that code": the content is something said earlier, used by name — never
@@ -491,6 +529,26 @@ impl Inner {
                     Err(_) => return Err(format!("`cwd` '{c}' is outside the workspace: use a directory inside it, relative (`site`), or leave cwd out")),
                 }
             }
+            // an edit replaces text the file has: a model that invented it is told so here, not by a failed step and a re-plan
+            if meta.name == "fs_edit"
+                && let (Some(path), Some(old)) = (a.get("path").and_then(|v| v.as_str()), a.get("old_string").and_then(|v| v.as_str()))
+                && !path.contains("{{")
+            {
+                if old.is_empty() {
+                    return Err("old_string is empty: copy the exact text to replace from the FILE".into());
+                }
+                if let Ok(p) = self.policy.guard().read_path(path)
+                    && let Ok(text) = std::fs::read_to_string(p)
+                {
+                    let n = text.matches(old).count();
+                    if n == 0 {
+                        return Err(format!("old_string is not in {path}: copy a piece of it exactly from the FILE (indentation included)"));
+                    }
+                    if n > 1 && a.get("replace_all").and_then(|v| v.as_bool()) != Some(true) {
+                        return Err(format!("old_string occurs {n} times in {path}: make it longer so it occurs once (or set replace_all)"));
+                    }
+                }
+            }
             // a `{{id}}` template may only name a step this one depends on
             for r in planner::template_refs(&Value::Object(a.clone())) {
                 if !step.depends_on.contains(&r) && !crate::session::ARTIFACT_NAMES.contains(&r.as_str()) {
@@ -636,6 +694,12 @@ impl Inner {
     fn satisfied_by_arguments(&self, c: &Check, step: &Step) -> bool {
         let Check::FileExists { path } = c else { return false };
         let want = path.trim_start_matches("./").trim_end_matches('/');
+        // "report.md exists" of a step that ran in `proj`: the file is where the step was
+        if let Some(cwd) = step.args.get("cwd").and_then(|v| v.as_str()).filter(|c| !c.is_empty())
+            && self.policy.guard().exists(&format!("{}/{want}", cwd.trim_end_matches('/'))).unwrap_or(false)
+        {
+            return true;
+        }
         let mut texts = Vec::new();
         if let Some(m) = step.args.as_object() {
             texts.extend(m.values().filter_map(|v| v.as_str()));

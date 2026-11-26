@@ -41,7 +41,14 @@ async fn mcp(State(w): State<Weather>, Json(m): Json<Value>) -> Response {
             "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}]}),
         "tools/call" => {
             w.calls.fetch_add(1, Ordering::SeqCst);
-            json!({"content": [{"type": "text", "text": format!("Sunny in {}", m["params"]["arguments"]["city"].as_str().unwrap_or("?"))}]})
+            let city = m["params"]["arguments"]["city"].as_str().unwrap_or("?");
+            // one city answers with a data blob, as real services do
+            let text = if city == "Oslo" {
+                json!({"city": city, "temp_c": -3, "sky": "snow", "days": [{"d": 1, "t": -3}, {"d": 2, "t": -5}]}).to_string()
+            } else {
+                format!("Sunny in {city}")
+            };
+            json!({"content": [{"type": "text", "text": text}]})
         }
         _ => return StatusCode::ACCEPTED.into_response(),
     };
@@ -192,4 +199,17 @@ async fn without_a_directory_key_nothing_is_searched_and_the_task_goes_on() {
     let t = run(&r, "what is the weather forecast for Paris").await;
     assert!(r.engine.backlog(&t.task_id).iter().all(|e| !matches!(e.kind, EventKind::McpConnected { .. })));
     assert!(r.worker.requests.lock().iter().all(|q| q.purpose != "mcp_query"));
+}
+
+#[tokio::test]
+async fn data_an_mcp_tool_returns_is_turned_into_an_answer_not_shown_raw() {
+    let r = rig(true).await;
+    r.worker.push("weather forecast");
+    r.planner.push(PLAN);
+    r.worker.push(r#"{"city": "Oslo"}"#);
+    r.worker.push("It is -3 °C with snow in Oslo.");
+    let t = run(&r, "what is the weather forecast for Oslo").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let answer = t.final_answer.unwrap();
+    assert!(answer.contains("snow in Oslo") && !answer.contains("temp_c"), "{answer}");
 }

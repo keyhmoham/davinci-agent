@@ -395,6 +395,7 @@ impl McpHub {
                         format!("{} needs {}", c.name, if c.auth == AuthType::Oauth2 { "OAuth" } else { "a login" })
                     }
                     AuthType::ApiKey if !c.deprecated => format!("{} needs an API key (DFAE_MCP_KEY_{})", c.name, slug(&c.slug).to_uppercase()),
+                    _ if c.paid() => format!("{} is a paid service", c.name),
                     _ => format!("{} is not available", c.name),
                 });
             }

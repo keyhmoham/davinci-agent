@@ -213,9 +213,18 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
     let mut issues: Vec<String> = Vec::new();
     let mut steps: Vec<Step> = current.to_vec();
     let done = |s: &Step| s.status == StepStatus::Succeeded;
+    // what a patch puts in a dropped step's place: the tools of the steps it edits or adds
+    let provided: HashSet<&str> = patch.edit.iter().chain(patch.add.iter()).filter_map(|s| s.tool.as_deref()).collect();
     for id in &patch.drop {
         match steps.iter().position(|s| &s.id == id) {
             Some(i) if done(&steps[i]) => issues.push(format!("{id} is finished and cannot be dropped")),
+            // a step that has not failed is work the request still needs (the build, the server): it goes only when something does it instead
+            Some(i) if steps[i].status != StepStatus::Failed && steps[i].tool.as_deref().is_some_and(|t| !provided.contains(t)) => {
+                issues.push(format!(
+                    "{id} ({}) is still needed: keep it, or replace it with a step that does the same",
+                    tokens::truncate_tokens(&steps[i].description, 14)
+                ));
+            }
             Some(i) => {
                 steps.remove(i);
             }
@@ -263,7 +272,9 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
     // A patch that adds steps and says nothing of the failed one has replaced it: the failed step is not worth a second round
     // with the planner (which tends to answer with a patch that has lost its additions).
     if !patch.add.is_empty() {
-        let failed: HashSet<String> = steps.iter().filter(|s| s.status == StepStatus::Failed).map(|s| s.id.clone()).collect();
+        // (only when something of the same kind is added: a failed build is not "replaced" by a step that reads a file)
+        let failed: HashSet<String> =
+            steps.iter().filter(|s| s.status == StepStatus::Failed && s.tool.as_deref().is_none_or(|t| provided.contains(t))).map(|s| s.id.clone()).collect();
         steps.retain(|s| !failed.contains(&s.id));
         for s in &mut steps {
             s.depends_on.retain(|d| !failed.contains(d));
@@ -662,6 +673,28 @@ mod tests {
         // with nothing added, a failed step that nobody handles is still a problem to hand back to the planner
         let nothing = PatchDoc { edit: vec![], add: vec![], drop: vec![] };
         assert!(apply_patch(&steps, &nothing, "r1_", &r).unwrap_err()[0].contains("neither edited nor dropped"));
+    }
+
+    #[test]
+    fn a_patch_cannot_lose_the_work_it_does_not_replace() {
+        use crate::plandoc::{PatchDoc, StepDoc};
+        let r = registry();
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_mkdir", "do": "make", "args": {"path": "a"}},
+            {"id": "s2", "tool": "shell", "do": "build the project", "args": {"command": "true"}, "after": ["s1"]},
+            {"id": "s3", "tool": "shell", "do": "serve the project", "args": {"command": "true"}, "after": ["s2"]}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
+        steps[0].status = StepStatus::Succeeded;
+        steps[1].status = StepStatus::Failed;
+        steps[2].status = StepStatus::Cancelled;
+        let read =
+            StepDoc { id: "x".into(), tool: Some("fs_read".into()), intent: "read the file".into(), after: vec![], expect: None, planner: false, args: None };
+        // the planner adds a read, forgets the failed build, and drops the server step
+        let patch = PatchDoc { edit: vec![], add: vec![read], drop: vec!["s3".into()] };
+        let issues = apply_patch(&steps, &patch, "r1_", &r).unwrap_err();
+        assert!(issues.iter().any(|i| i.contains("s3") && i.contains("still needed")), "{issues:?}");
+        assert!(issues.iter().any(|i| i.contains("s2 failed") && i.contains("neither edited nor dropped")), "{issues:?}");
     }
 
     #[test]

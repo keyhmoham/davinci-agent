@@ -241,6 +241,9 @@ impl Inner {
         let is_chat = ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false);
         if exec_err.is_none()
             && !is_chat
+            // the decision model's doubt alone is not a reason to run a planner round and more steps (a small model doubts a result in JSON):
+            // something must also be unproven — a failed check, a step that was not verified
+            && verification.status != VerificationStatus::Verified
             && verification.completion_confidence.map(|p| p < 0.35).unwrap_or(false)
             && let Ok(true) = self.continue_plan(ctx, goal).await
         {

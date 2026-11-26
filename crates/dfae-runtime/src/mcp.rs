@@ -10,6 +10,9 @@ use std::sync::{Arc, LazyLock};
 /// "use the github mcp", "add an MCP for Notion": the request itself asks for one.
 static MENTIONS_MCP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmcps?\b").unwrap());
 
+/// Tools of one MCP server a task is shown at most.
+const MAX_TOOLS_SHOWN: usize = 8;
+
 impl Inner {
     /// Attach the MCP servers this request needs to the task. `true` when its tools are now available.
     pub(crate) async fn stage_mcp(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, routing: &Routing) -> bool {
@@ -39,6 +42,18 @@ impl Inner {
         for (name, source) in chosen {
             let Some(view) = hub.server(&name) else { continue };
             ctx.mcp.lock().insert(name.clone());
+            // a server with many tools offers the planner the ones that fit the request (each tool listed costs tokens on every call)
+            if view.tools.len() > MAX_TOOLS_SHOWN {
+                let docs: Vec<String> =
+                    view.tools.iter().map(|t| format!("{} {}", t.name.rsplit("__").next().unwrap_or(&t.name).replace('_', " "), t.description)).collect();
+                let scores = dfae_core::text::bm25_scores(goal, &docs);
+                let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+                let mut hidden = ctx.mcp_hidden.lock();
+                for (i, _) in ranked.into_iter().skip(MAX_TOOLS_SHOWN) {
+                    hidden.insert(view.tools[i].name.clone());
+                }
+            }
             let listing = listings.remove(&name).or(view.listing.clone());
             let source = if view.source == "config" { "config" } else { source };
             self.emit(

@@ -110,9 +110,21 @@ impl Connector {
         }
     }
 
+    /// Does the listing say the service is paid (a per-query price, a marketplace of paid data)? Such a server answers a free call with a
+    /// preview or a payment request, never with the data: it is not worth connecting on a user's behalf.
+    pub fn paid(&self) -> bool {
+        static PAID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(
+                r"(?i)\bx402\b|\busdc\b|\bpay[- ]per\b|\bper[- ](?:query|call|request)\b|\bpaid\b|\bcredits? required\b|\bpremium\b|\bmicropayments?\b",
+            )
+            .unwrap()
+        });
+        PAID.is_match(&self.name) || self.description.as_deref().is_some_and(|d| PAID.is_match(d))
+    }
+
     /// Can this client connect without anything from the user? Streamable HTTP, no credentials, not deprecated, not known to be down.
     pub fn open(&self) -> bool {
-        self.auth == AuthType::None && self.transport == "streamable_http" && !self.deprecated && self.healthy != Some(false)
+        self.auth == AuthType::None && self.transport == "streamable_http" && !self.deprecated && self.healthy != Some(false) && !self.paid()
     }
 }
 
@@ -167,5 +179,14 @@ mod tests {
         assert_eq!((c.auth, c.tool_count, c.promoted), (AuthType::Oauth2, 1, true));
         assert!(!c.open(), "a connector that needs OAuth cannot be used on its own");
         assert_eq!(c.listing, "https://glama.ai/mcp/connectors/dev.sentry.mcp/sentry");
+        let mut paid = c.clone();
+        paid.auth = AuthType::None;
+        paid.name = "Hacker News top stories (x402)".into();
+        assert!(paid.paid() && !paid.open(), "a pay-per-call server is not connected for free");
+        paid.name = "Hacker News".into();
+        paid.description = Some("Live front page. 0.01 USDC per query.".into());
+        assert!(paid.paid());
+        paid.description = Some("Live front page of Hacker News".into());
+        assert!(!paid.paid() && paid.open());
     }
 }

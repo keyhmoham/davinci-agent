@@ -53,6 +53,8 @@ pub(crate) struct TaskCtx {
     pub checkpoints: Mutex<Vec<String>>,
     /// MCP servers attached to this task: only their tools are visible to it.
     pub mcp: Mutex<HashSet<String>>,
+    /// Tools of those servers that this task does not see: a big server shows the planner the few that fit the request, not all of them.
+    pub mcp_hidden: Mutex<HashSet<String>>,
 }
 
 impl TaskCtx {
@@ -72,13 +74,14 @@ impl TaskCtx {
             done: Mutex::new(None),
             checkpoints: Mutex::new(Vec::new()),
             mcp: Mutex::new(HashSet::new()),
+            mcp_hidden: Mutex::new(HashSet::new()),
         })
     }
 
     pub fn in_scope(&self, tool: &str) -> bool {
         // an MCP server's tools belong to the tasks it was attached to
         if let Some(server) = dfae_mcp::server_of(tool)
-            && !self.mcp.lock().contains(server)
+            && (!self.mcp.lock().contains(server) || self.mcp_hidden.lock().contains(tool))
         {
             return false;
         }
