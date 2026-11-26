@@ -103,7 +103,7 @@ pub enum EventKind {
     /// The local system turned a planner's intent into an action.
     StepImplemented {
         step_id: String,
-        /// `rules`, `rules+slm`, `rules+slm+strong`, `reasoning`, `plan` (the planner already gave valid arguments)…
+        /// `rules`, `rules+worker`, `rules+worker+planner`, `reasoning`, `plan` (the planner already gave valid arguments)…
         how: String,
         tool: Option<String>,
         args: String,

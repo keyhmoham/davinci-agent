@@ -60,7 +60,7 @@ pub struct ToolMetadata {
     #[serde(default)]
     pub keywords: Vec<String>,
     /// Regexes with named groups that bind arguments straight from the user's
-    /// text — the basis of the SLM-free Direct mode.
+    /// text — the basis of the worker model-free Direct mode.
     #[serde(default)]
     pub direct_patterns: Vec<String>,
     /// Read-only and deterministic enough that agents of one team may share

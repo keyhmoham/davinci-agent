@@ -58,9 +58,9 @@ impl std::fmt::Display for TaskStatus {
 pub enum ExecMode {
     /// Deterministic: decision model + code + tools. No generative model call.
     Direct,
-    /// Decision model + SLM + tools.
+    /// Decision model + worker model + tools.
     Assisted,
-    /// Decision model + stronger model + verification.
+    /// Decision model + planner model + verification.
     Escalated,
 }
 
@@ -275,16 +275,16 @@ pub struct Step {
     #[serde(default)]
     pub finished_at: Option<DateTime<Utc>>,
     /// An intent from a planner that has not been turned into an action yet: the program (rules, GLiNER, the
-    /// decision model, the SLM) decides the tool and its arguments right before the step runs.
+    /// decision model, the worker model) decides the tool and its arguments right before the step runs.
     #[serde(default)]
     pub brief: bool,
     /// What success looks like, in words (from the planner); the decision model judges the result against it.
     #[serde(default)]
     pub expect: Option<String>,
-    /// The planner wants the external model to do this reasoning step itself.
+    /// The planner wants the planner model to do this reasoning step itself.
     #[serde(default)]
-    pub strong: bool,
-    /// How the local system turned the intent into an action (provenance), e.g. `rules`, `rules+slm`.
+    pub planner: bool,
+    /// How the local system turned the intent into an action (provenance), e.g. `rules`, `rules+worker`.
     #[serde(default)]
     pub how: Option<String>,
 }
@@ -295,9 +295,9 @@ fn default_step_status() -> StepStatus {
 
 impl Step {
     /// Work for the self-hosted models: a brief step (not yet implemented) or one the local system implemented,
-    /// unless the planner asked for the external model.
+    /// unless the planner asked for the planner model.
     pub fn runs_local(&self) -> bool {
-        (self.brief || self.how.is_some()) && !self.strong
+        (self.brief || self.how.is_some()) && !self.planner
     }
 
     pub fn tool(id: &str, tool: &str, description: &str, args: Value) -> Self {
@@ -323,7 +323,7 @@ impl Step {
             finished_at: None,
             brief: false,
             expect: None,
-            strong: false,
+            planner: false,
             how: None,
         }
     }
@@ -341,8 +341,8 @@ impl Step {
 pub enum PlanSource {
     Direct,
     Skill,
-    Slm,
-    Strong,
+    Worker,
+    Planner,
     Replan,
     /// Sub-goals delegated to a team of agents.
     Team,
@@ -374,7 +374,7 @@ pub struct Plan {
 pub struct CostEstimate {
     pub model_calls: u32,
     pub tokens: u64,
-    /// The calls go to the external (paid) model; otherwise they run on a self-hosted one and are free.
+    /// The calls go to the planner model; otherwise they run on a self-hosted one and are free.
     #[serde(default)]
     pub external: bool,
 }
@@ -482,11 +482,11 @@ pub struct Approval {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Budget {
     pub max_steps: u32,
-    /// Calls to the **external** (paid, strong) model. Local models cost nothing, so they are not limited by this.
+    /// Calls to the **external** (paid, planner) model. Local models cost nothing, so they are not limited by this.
     pub max_model_calls: u32,
     /// Calls to the self-hosted small model: only a runaway guard.
-    #[serde(default = "default_max_local_calls")]
-    pub max_local_calls: u32,
+    #[serde(default = "default_max_worker_calls")]
+    pub max_worker_calls: u32,
     pub max_tool_calls: u32,
     pub max_replans: u32,
     pub max_seconds: u64,
@@ -499,13 +499,13 @@ fn default_max_children() -> u32 {
     8
 }
 
-fn default_max_local_calls() -> u32 {
+fn default_max_worker_calls() -> u32 {
     200
 }
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { max_steps: 30, max_model_calls: 10, max_local_calls: 200, max_tool_calls: 25, max_replans: 2, max_seconds: 600, max_children: 8 }
+        Self { max_steps: 30, max_model_calls: 10, max_worker_calls: 200, max_tool_calls: 25, max_replans: 2, max_seconds: 600, max_children: 8 }
     }
 }
 
@@ -515,7 +515,7 @@ pub struct BudgetUsage {
     /// External-model calls.
     pub model_calls: u32,
     /// Self-hosted model calls.
-    pub local_calls: u32,
+    pub worker_calls: u32,
     pub tool_calls: u32,
     pub replans: u32,
     pub children: u32,

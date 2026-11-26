@@ -1,4 +1,4 @@
-//! When is the external planner's long, cacheable prompt prefix worth sending?
+//! When is the planner model's long, cacheable prompt prefix worth sending?
 //!
 //! A provider that caches prompts bills a repeated prefix at a fraction — but only while the cache is warm (minutes),
 //! and writing it costs a little more than sending it plain. So the prefix pays off for a stream of tasks and loses on

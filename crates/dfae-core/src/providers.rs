@@ -47,6 +47,8 @@ pub struct GenerationRequest {
     pub cache: bool,
     /// A JSON schema the output must follow (constrained decoding on servers that support it).
     pub schema: Option<serde_json::Value>,
+    /// The schema is in strict form (every property required, none extra): the server must follow it exactly.
+    pub schema_strict: bool,
 }
 
 #[derive(Debug, Clone, Default)]

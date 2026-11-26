@@ -20,7 +20,7 @@ pub struct OpenAiCompat {
 impl OpenAiCompat {
     pub fn new(base: &str, model: &str, key: Option<String>, timeout: Duration) -> Self {
         let http = reqwest::Client::builder().timeout(timeout).build().expect("http client");
-        // OpenAI's own API caches a repeated prompt prefix by itself; other servers say so with `STRONG_PROMPT_CACHE=on`.
+        // OpenAI's own API caches a repeated prompt prefix by itself; other servers say so with `PLANNER_PROMPT_CACHE=on`.
         // Self-hosted ones are free anyway, and a request that is billed in full is no loss there.
         let caches = base.contains("api.openai.com");
         Self {
@@ -69,7 +69,7 @@ impl LanguageModel for OpenAiCompat {
         }
         let schema = req.schema.as_ref().filter(|_| self.schema_ok.load(std::sync::atomic::Ordering::Relaxed));
         if let Some(schema) = schema {
-            body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "reply", "strict": false, "schema": schema}});
+            body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "reply", "strict": req.schema_strict, "schema": schema}});
         } else if req.json || req.schema.is_some() {
             body["response_format"] = json!({"type": "json_object"});
         }
@@ -117,7 +117,7 @@ impl LanguageModel for OpenAiCompat {
                 let reason = v["choices"][0]["finish_reason"].as_str().unwrap_or("unknown");
                 return Err(ModelError::InvalidOutput(if reason == "length" {
                     format!(
-                        "the model used all {} output tokens before writing any text (a reasoning model spends them thinking): raise STRONG_MAX_TOKENS / SLM_MAX_TOKENS",
+                        "the model used all {} output tokens before writing any text (a reasoning model spends them thinking): raise PLANNER_MAX_TOKENS / WORKER_MAX_TOKENS",
                         req.max_tokens
                     )
                 } else {

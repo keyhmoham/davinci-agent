@@ -1,7 +1,7 @@
-//! Shadow evaluation: how often does the self-hosted decision model decide what the external model would have?
+//! Shadow evaluation: how often does the self-hosted decision model decide what the planner model would have?
 //!
 //! Off by default (`DFAE_SHADOW_EVAL=0`). With a sampling rate above zero, that share of requests is also put to the
-//! external model — the same typed questions, answered in one JSON object — and the two answers are compared. The
+//! planner model — the same typed questions, answered in one JSON object — and the two answers are compared. The
 //! agreement is a measurement of the decision model on *your* traffic, not on a benchmark; every line is also written to
 //! the decision log when one is configured. It spends external tokens, which is why a person has to ask for it.
 
@@ -43,7 +43,7 @@ pub fn render(req: &DecisionRequest) -> String {
     out
 }
 
-/// `(agreeing, compared, differences)` between the decision model's routing and the external model's answers.
+/// `(agreeing, compared, differences)` between the decision model's routing and the planner model's answers.
 pub fn compare(routing: &Routing, theirs: &Value) -> (usize, usize, Vec<String>) {
     let yes = |k: &str| theirs.get(k).and_then(|v| v.as_str()).map(|s| s.eq_ignore_ascii_case("yes"));
     let word = |k: &str| theirs.get(k).and_then(|v| v.as_str()).map(|s| s.to_ascii_lowercase());

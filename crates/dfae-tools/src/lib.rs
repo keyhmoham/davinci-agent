@@ -1,5 +1,5 @@
 //! Tool subsystem: registry, deterministic policy engine, native tools and the
-//! SLM-free argument binder.
+//! worker model-free argument binder.
 //!
 //! The policy engine is the security boundary — neither the decision model nor
 //! the language model can bypass it, and it is evaluated again at execution

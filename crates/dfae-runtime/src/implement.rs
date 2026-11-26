@@ -1,6 +1,6 @@
 //! The acting phase: turning a planner's intent into an action, step by step, right before the step runs.
 //!
-//! A brief plan (written by the external model) says *what* each step should achieve. This module decides
+//! A brief plan (written by the planner model) says *what* each step should achieve. This module decides
 //! *how*, using the self-hosted triple under the program's control — deterministic first, models only where
 //! the rules run out, and always checked against the tool's schema and the policy before anything executes:
 //!
@@ -9,12 +9,12 @@
 //!    the tool's parameters ask for;
 //! 3. the **decision model** judges which tool a step needs when the planner left it open, and later whether
 //!    the result met the planner's expectation;
-//! 4. the **SLM** fills in what is still missing (reading the results of earlier steps), with the validation
+//! 4. the **worker model** fills in what is still missing (reading the results of earlier steps), with the validation
 //!    error fed back if it gets it wrong;
-//! 5. only if the SLM cannot, the **external model** is asked for the arguments, in a lean prompt.
+//! 5. only if the worker model cannot, the **planner model** is asked for the arguments, in a lean prompt.
 //!
 //! A step that none of this can carry out fails with a precise message, and recovery (retry, repair, a
-//! re-plan by the external model) takes over.
+//! re-plan by the planner model) takes over.
 
 use crate::economy::repair;
 use crate::engine::{Inner, TaskCtx};
@@ -54,6 +54,15 @@ pub(crate) fn strip_fences(text: &str) -> String {
         return t[at..].to_string();
     }
     t.to_string()
+}
+
+/// Is this step writing something that is itself the product — a page, code, a document, data — rather than doing ordinary work?
+/// Only then may the worker model write at length.
+pub(crate) fn content_like(description: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:write|compose|draft|generate|create|produce|implement|build|code|script|essay|article|report|document|page|html|css|function|class|module|readme|template|stylesheet|dataset|csv|json|yaml|poem|story|email|letter)\b").unwrap()
+    });
+    RE.is_match(description)
 }
 
 /// A long text whose lines are mostly copies of each other: a small model stuck in a loop.
@@ -164,7 +173,7 @@ impl Inner {
         rejected: bool,
         temperature: f32,
     ) -> Result<Map<String, Value>, String> {
-        let paid = tier == Tier::Strong;
+        let paid = tier == Tier::Planner;
         let ents = entities
             .iter()
             .filter(|e| e.label != "action")
@@ -172,8 +181,9 @@ impl Inner {
             .map(|e| format!("{}={}", e.label.replace(' ', "_"), e.text))
             .collect::<Vec<_>>()
             .join(" | ");
-        let sig = if paid { meta.signature() } else { meta.signature_detailed() };
-        let inputs = Self::inputs_text(deps, if paid { 120 } else { 900 });
+        // both hosted models are billed by the token: compact signature (the parameter help rides in the schema), trimmed inputs
+        let sig = meta.signature();
+        let inputs = Self::inputs_text(deps, if paid { 120 } else { 400 });
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
         let goal = ctx.rec.lock().await.goal.clone();
         let step_text = if step.description.split_whitespace().count() < 9 {
@@ -208,7 +218,7 @@ impl Inner {
     }
 
     fn step_tier_for_content(&self, step: &Step) -> Tier {
-        if (step.strong && self.models.has(Tier::Strong)) || !self.models.has(Tier::Slm) { Tier::Strong } else { Tier::Slm }
+        if (step.planner && self.models.has(Tier::Planner)) || !self.models.has(Tier::Worker) { Tier::Planner } else { Tier::Worker }
     }
 
     /// The content of the file a step writes, from the request, the step and the earlier results.
@@ -226,7 +236,7 @@ impl Inner {
         if step.description.split_whitespace().count() < 9 {
             user.push_str(&format!("BACKGROUND (the whole request; other files in it are written by other steps): {}\n", tokens::truncate_tokens(&goal, 300)));
         }
-        let inputs = Self::inputs_text(deps, if tier == Tier::Strong { 150 } else { 1500 });
+        let inputs = Self::inputs_text(deps, if tier == Tier::Planner { 150 } else { 1500 });
         if !inputs.is_empty() {
             user.push_str(&format!("INPUTS:\n{inputs}\n"));
         }
@@ -239,8 +249,6 @@ impl Inner {
         let mut req = self.gen_request(tier, prompts::CONTENT_SYSTEM, user.clone(), "content");
         req.temperature = 0.2;
         req.frequency_penalty = 0.4;
-        // a file is a few hundred tokens: a model still writing after this is looping or rambling, and every token costs seconds
-        req.max_tokens = req.max_tokens.min(2048);
         let text = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
         let why =
@@ -252,12 +260,11 @@ impl Inner {
         let mut req = self.gen_request(
             tier,
             prompts::CONTENT_SYSTEM,
-            format!("{user}YOUR PREVIOUS VERSION WAS REJECTED: {why}. Write the whole file again, shorter (a web page under 100 lines, one small stylesheet inside it, no external files), complete, with no repetition.\n"),
+            format!("{user}YOUR PREVIOUS VERSION WAS REJECTED: {why}. Write the whole file again, complete, with its styles inside it and no external files, and with no repetition.\n"),
             "content",
         );
         req.temperature = 0.5;
         req.frequency_penalty = 0.8;
-        req.max_tokens = req.max_tokens.min(2048);
         let again = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
         let text = if degenerate(&again) { collapse_repeats(&again) } else { again };
         (!text.trim().is_empty()).then_some(text)
@@ -290,7 +297,7 @@ impl Inner {
         let mut done = step.clone();
         done.brief = false;
         let Some(tool) = tool else {
-            // reasoning: the SLM writes it, unless the planner wants the external model to
+            // reasoning: the worker model writes it, unless the planner wants the planner model to
             done.kind = StepKind::Reasoning;
             done.tool = None;
             done.how = Some("reasoning".into());
@@ -368,21 +375,21 @@ impl Inner {
             && let Some(text) = self.write_content(ctx, step, &args, deps, feedback).await
         {
             args.insert("content".into(), Value::String(text));
-            how.push(if self.step_tier_for_content(step) == Tier::Strong { "strong" } else { "slm" });
+            how.push(if self.step_tier_for_content(step) == Tier::Planner { "planner" } else { "worker" });
         }
         if valid(&args).is_ok() {
             if how.is_empty() {
                 how.push(if planned { "plan" } else { "rules" });
             }
         } else {
-            // ---- the models: the SLM first, the external model only if the SLM cannot ----
+            // ---- the models: the worker model first, the planner model only if the worker model cannot ----
             let mut problem = feedback.map(str::to_string).or_else(|| valid(&args).err());
             let mut ladder: Vec<Tier> = Vec::new();
-            if self.models.has(Tier::Slm) {
-                ladder.extend([Tier::Slm, Tier::Slm]);
+            if self.models.has(Tier::Worker) {
+                ladder.extend([Tier::Worker, Tier::Worker]);
             }
-            if self.models.has(Tier::Strong) {
-                ladder.push(Tier::Strong);
+            if self.models.has(Tier::Planner) {
+                ladder.push(Tier::Planner);
             }
             if ladder.is_empty() {
                 return Err(fail(
@@ -395,7 +402,7 @@ impl Inner {
             for (rung, tier) in ladder.into_iter().enumerate() {
                 // A second self-hosted try is a vote: three samples, and the answer most of the valid ones agree on wins.
                 // Self-hosted tokens are free, and one wrong sample no longer decides the step.
-                let samples = if tier == Tier::Slm && rung == 1 { 3 } else { 1 };
+                let samples = if tier == Tier::Worker && rung == 1 { 3 } else { 1 };
                 let temperature = if samples > 1 { 0.5 } else { 0.1 };
                 let asks = (0..samples).map(|_| self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected, temperature));
                 let mut candidates: Vec<Map<String, Value>> = Vec::new();
@@ -420,12 +427,12 @@ impl Inner {
                 }
                 if let Some(best) = majority(candidates) {
                     args = best;
-                    how.push(if tier == Tier::Strong {
-                        "strong"
+                    how.push(if tier == Tier::Planner {
+                        "planner"
                     } else if samples > 1 {
-                        "slm-vote"
+                        "worker-vote"
                     } else {
-                        "slm"
+                        "worker"
                     });
                     satisfied = true;
                     break;

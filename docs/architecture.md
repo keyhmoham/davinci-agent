@@ -4,7 +4,7 @@
 
 > The model proposes; the engine decides what is authorised, executes, observes and verifies.
 
-The runtime is the agent. The decision model, GLiNER and the SLM are services it calls for *bounded* questions.
+The runtime is the agent. The decision model, GLiNER and the worker model are services it calls for *bounded* questions.
 No model owns control flow, permissions, or the claim that a task is done.
 
 ## Pipeline (`crates/dfae-runtime/src/pipeline.rs`)
@@ -23,7 +23,7 @@ No model owns control flow, permissions, or the claim that a task is done.
 6. **Plan** — Direct: from bindings or the skill. Otherwise `select_tools` narrows the tool set and a model
    writes a JSON plan; it is parsed, **validated** (schema, known tools, only the selected tools, argument
    types, DAG acyclicity, step/tool-call budgets), repaired once with the exact problems listed, and — if the
-   SLM still fails and a stronger model exists — re-planned there.
+   worker model still fails and a planner model exists — re-planned there.
 7. **Execute** — DAG waves with bounded parallelism (`DFAE_MAX_PARALLEL`).
 8. **Verify** — evidence-based; one continuation round if the completion judgment is low.
 9. **Answer** — templated (no model) unless reasoning steps produced material to compose; model-written
@@ -34,48 +34,65 @@ No model owns control flow, permissions, or the claim that a task is done.
 
 Judgement is the decision model's: every question above is a typed question over `DecisionState` (the request, the entities, the recent turns,
 `known` things from the session, mode/plan/step/completion facts and the policy). Code does three things only: it supplies *facts* (a tool
-binds or it does not; an external model is configured or it is not; a step's side effects), it *enforces limits* (policy, budgets, the schema
+binds or it does not; a planner is configured or it is not; a step's side effects), it *enforces limits* (policy, budgets, the schema
 of every answer), and it does *mechanical work* the answer points at (substituting the file a request referred to, canned replies by
 small-talk kind). The sentence is never re-read by the runtime to second-guess an answer. The local fallback decider (`local.rs`) is the only
 place with phrase lists and regexes, and it answers exactly the same questions.
 
-## Planning and acting (`planner.rs`, `implement.rs`, `executor.rs::run_step`)
+## Planning and acting (`plandoc.rs`, `planner.rs`, `implement.rs`, `executor.rs`)
 
-The decision model chooses the handling (`select_mode`): `direct` (binds to tools outright), `assisted` = *quick* (one action or a reply the
-local triple handles alone) or `escalated` = *needs a plan*. Code only enforces limits: `escalated` without an external model falls back to
-the SLM; a low-confidence `assisted` is escalated; a user's explicit mode wins. There is no complexity rule on top (the threshold only
-parameterises the built-in rules that stand in when the decision model is down). With an external model configured **all planning is
-its**: a quick request becomes one brief step (`PlanSource::Quick`: the best-fitting tool the decision model picked, or none for a reply)
-that the acting phase binds and runs; if it fails, the re-plan is the external model's; an unreachable external model fails the task
-unless `DFAE_PLAN_FALLBACK=slm`. Conversation is answered by the local models. `escalated` means *the external model plans, the local system acts*:
+Two hosted models and a worker system. The **planner model** writes and revises plans. The **worker system** carries them out: rules and
+the tools' own patterns, the extractor (GLiNER), the self-hosted decision model, and the **worker model** (hosted, cheaper), under the
+program's control. The decision model chooses the handling (`select_mode`): `direct` (binds to tools outright), `assisted` = *quick* (one
+action or a reply the worker system handles alone) or `escalated` = *needs a plan*. Code only enforces limits: `escalated` without a planner
+falls back to the worker model; a low-confidence `assisted` is escalated; a user's explicit mode wins. There is no complexity rule on top
+(`DFAE_PLAN_MIN_COMPLEXITY` parameterises the built-in rules that stand in when the decision model is down). With a planner configured **all
+planning is its**: a quick request becomes one brief step (`PlanSource::Quick`: the best-fitting tool the decision model picked, or none for a
+reply) that the acting phase binds and runs; if it fails, the re-plan is the planner's; an unreachable planner fails the task unless
+`DFAE_PLAN_FALLBACK=worker`. Conversation is answered by the worker system.
 
-* **Planning phase** (`stage_model_plan`, event `phase: planning`): the brief-plan prompt (see *The cost of planning* below); the reply is
-  parsed by `parse_line_plan` / `parse_brief_plan`: every step is `brief`, `expect`/`strong` are read, arguments the planner did give are kept as hints. Plan
-  validation skips argument checks for brief steps; the paid-call gate counts only reasoning the planner kept for itself (`Step::runs_local`).
+* **The typed plan** (`plandoc.rs`): one JSON object — `{"steps":[{"id","tool","do","after","expect","planner"}], "report"?}` — whose JSON Schema
+  (`plan_schema`, strict: every property required, none extra) lists the tools that exist as an `enum`, so a provider with structured output cannot
+  answer outside it. `PlanDoc::from_value` reads any reply leniently into typed `StepDoc`s and repairs in code what it can — tool spellings
+  (`FS-Write`, `functions.fs_write`, a one-letter slip, only when unambiguous), a list under another key, numeric or duplicate ids, dependencies on
+  steps that do not exist, a step with a tool and arguments but no sentence — recording each repair as a `repaired` event; anything else is a typed
+  issue ("step s2: there is no tool \"teleport\" (tools: …)") that the planner gets in one repair round (`try_plan`). Planner-supplied `args` are
+  kept as hints. `parse_brief_plan` then turns the typed document into `Step`s (every step `brief`), `finish_plan` orders and validates them.
 * **Acting phase** (event `phase: acting`): `run_step` calls `Inner::implement_step` for a brief step, which decides the action just in time:
   entities (GLiNER + rules) from the step sentence → kind (the planner's tool; if none, a tool only when the sentence binds outright via
   `bind_direct`) → arguments: planner hints, `bind_direct` on the sentence, entities that are *unambiguous* for a parameter (two candidate
-  paths are never guessed), then the ladder SLM, SLM, external model with the schema error fed back each time → validation (schema, `{{id}}` only
-  from this step's dependencies). The result is written back into the plan (`tool`, `args`, `how`) and the normal machinery runs it: policy,
-  contracts, repair, retries. A reasoning step is written by the SLM unless `strong`.
-* **Judging**: if the planner gave `expect`, the decision model's completion question is asked of the result; a "no" fails the step
-  (`other`), and the usual recovery decision (retry / repair / replan / skip) follows. Re-plans by the external model use the same system prompt as planning (the re-plan rules are in the message).
+  paths are never guessed) → a file's **content** is written by the worker model as plain text (`write_content`: loops and cut-off files are
+  detected and rewritten) → remaining arguments by the ladder worker model (JSON schema), worker model ×3 as a vote, planner, with the validation
+  error fed back each time → validation (schema, `{{id}}` only from this step's dependencies, never in a path). The result is written back into
+  the plan (`tool`, `args`, `how`) and the normal machinery runs it: policy, contracts, repair, retries. A reasoning step is written by the worker
+  model unless `planner`.
+* **Judging**: if the planner gave `expect`, the parts code can read are checked by code; the decision model judges the rest. A miss is not a
+  failure of the step: it is a *checkpoint* that sends the planner back to the plan with the actual result in front of it.
+* **Patch re-planning** (`patch_plan`): when recovery decides to re-plan, the planner gets the state of the plan (`s1 DONE …`, `s2 FAILED …`,
+  `s3 TODO …`) and the problem, and answers with a typed patch (`patch_schema`): `{"edit":[…],"add":[…],"drop":[…]}`. `PatchDoc::from_value`
+  repairs it like a plan (and reads a whole plan in its place as additions); `planner::apply_patch` applies it: finished steps are never touched, an
+  edited step runs again from a clean state, new steps are numbered `r{n}_{i}`, nothing may wait for a dropped step, and a failed step that is
+  neither edited nor dropped is an issue sent back for one repair round. Without a planner the worker model re-plans in concrete steps as before.
+* **Fault tolerance**: argument problems are repaired in code first; a worker call that fails because the provider is unreachable is made by the
+  planner instead (`generate_text`); a malformed written file, a reasoning step that misses its expectation, and a reply that only asks the user a
+  question are redone locally with the reason; only then does the planner hear of it.
 * **Reviewing** (event `phase: reviewing`): verification and, if the evidence says the request is not accomplished, one continuation plan.
 
 ### The cost of planning (`prompts.rs`, `pipeline.rs::brief_request`, `economy/prefix.rs`)
 
-* **Format**: the external planner writes *plan lines* (`s2 fs_write after=s1: write site/index.html …` with an optional indented `expect:`
-  line) — about a third fewer output tokens than JSON (36 % on the benchmark plans), and no syntax to get wrong. `planner::parse_line_plan` turns them into the same JSON
-  shape; a reply that is JSON anyway is accepted. `DFAE_PLAN_FORMAT=json` restores JSON.
-* **Cacheable prefix**: when the provider caches prompts and traffic keeps the cache warm, the system prompt is rules + the *whole* tool
-  catalogue (sorted, with parameter names) + worked examples — byte-identical from task to task and shared by planning and re-planning
-  (what a re-plan needs is in its user message). The per-task part is a shortlist (`LIKELY TOOLS:`), the context and the workspace line.
-  Otherwise the narrow per-task tool list is sent, as before.
-* **Answers**: a reasoning leaf is the answer; otherwise the *self-hosted* model writes it from the evidence and `ungrounded_claims` checks
-  that every number, path, URL and code span in it occurs in the evidence — only a failed check is escalated to the external model. A plan of
-  tool steps only (no prose in it) gets the same local composition. `DFAE_PLAN_REPORT=on` additionally lets the planner pre-write the reply.
-* **What the planner is told**: a one-line workspace snapshot (two levels, capped), the condensed form of big outputs, a lesson from an
-  earlier similar task, and for a re-plan the step's actual result (`step s1 (…) found: … — this does not meet what was expected`).
+* **Cacheable prefix**: when the provider caches prompts and traffic keeps the cache warm, the planner's system prompt is rules + the *whole* tool
+  catalogue (sorted, with parameter names) + worked examples — byte-identical from task to task and shared by planning and re-planning (what a
+  re-plan needs is in its user message). The per-task part is a shortlist (`LIKELY TOOLS:`), the context and the workspace line. Otherwise the
+  narrow per-task tool list is sent. `PrefixPolicy` decides (a prefixed call in the last 4½ minutes, or three planner calls in ten; never after
+  three prefixed calls in a row without a cache hit).
+* **Answers**: a reasoning leaf is the answer; otherwise the *worker model* writes it from the evidence and `ungrounded_claims` checks that every
+  number, path, URL and code span in it occurs in the evidence — only a failed check is escalated to the planner. A plan of tool steps only is
+  answered deterministically (one line per step that changed something). `DFAE_PLAN_REPORT=on` additionally lets the planner pre-write the reply.
+* **Worker economy**: both hosted models are billed, so the worker's ordinary calls are lean — compact signatures, trimmed inputs, a small output
+  limit (`WORKER_MAX_TOKENS`: binding, short reasoning, answers) — and only writing a file's content (`write_content`, or a reasoning step whose
+  sentence says it writes something) may run long (`WORKER_CONTENT_MAX_TOKENS`).
+* **What the planner is told**: a one-line workspace snapshot (two levels, capped), the condensed form of big outputs, a lesson from an earlier
+  similar task, and for a re-plan the state of the plan and the step's actual result.
 
 ### Checking what was done (`planner::expect_checks`, `syntax.rs`, `implement.rs::judge_step`)
 
@@ -87,13 +104,13 @@ with the reason before the checkpoint goes to the planner.
 
 ### Learning (`pipeline.rs::{learn, apply_feedback, shadow_evaluate}`)
 
-* skills made from an external plan keep intents (`Skill.intent`) and match only the same request shape;
+* skills made from a planner plan keep intents (`Skill.intent`) and match only the same request shape;
 * a task that revised its plan and then succeeded stores `Lesson: for "…": <what went wrong> — what worked: <steps>`;
 * the decision model also answers whether a message judges the previous result (`feedback`: negative / positive); a negative verdict counts
   against the calibration of the decisions behind it and the skill that produced it, and leaves a lesson;
 * `DFAE_DECISION_LOG=path` appends every decision with its eventual outcome (`completed`, `failed`, `rejected_by_user`, `confirmed_by_user`) as
-  JSONL — the data to evaluate or fine-tune the decision model; `DFAE_SHADOW_EVAL=0.05` also puts 5 % of the routing questions to the external
-  model and logs agreement (off by default: it spends external tokens).
+  JSONL — the data to evaluate or fine-tune the decision model; `DFAE_SHADOW_EVAL=0.05` also puts 5 % of the routing questions to the planner
+  model and logs agreement (off by default: it spends planner tokens).
 
 ## Conversation (`session.rs`, `pipeline.rs::run_chat`, `executor.rs::run_chat_reply`)
 
@@ -166,7 +183,7 @@ Delegation is a **plan step kind** (`Agent`); an agent is a child `TaskRecord` r
    narrows its tool scope, and waits for a worker slot (`Dispatcher::acquire_agent`: role pool, then global pool).
 5. **Run** — the agent inherits the entities of its sub-goal (no extractor call), a `Minimal` context profile, a slice of
    the coordinator's budget, and the coordinator's taint / auto-approve; it plans, executes, verifies and learns like any task.
-6. **Supervise** — on failure the decision layer picks retry (fresh agent), escalate (re-run on the stronger model) or fail;
+6. **Supervise** — on failure the decision layer picks retry (fresh agent), escalate (re-run on the planner model) or fail;
    `max_replans` is 0 for agent steps because the agent already replans internally. Siblings are isolated from the failure.
 7. **Join** — usage and ledger entries roll up (`origin` marks them), and the coordinator verifies: an agent step counts as
    evidence only if the agent itself was verified or partial. The answer is the join step's text, or each agent's answer under
@@ -199,8 +216,8 @@ Provider answers are validated against the question (type, and `choice ∈ optio
 **after** the provider — they are the reason a mis-calibrated decision model cannot cause harm:
 
 - `direct` requires a deterministic binding; otherwise → assisted.
-- `escalated` requires a configured stronger model; otherwise → assisted.
-- `assisted` without an SLM → escalated if available, else direct if bound.
+- `escalated` requires a configured planner model; otherwise → assisted.
+- `assisted` without an worker model → escalated if available, else direct if bound.
 - policy denials and cancellations are never retried or "worked around"; retries are capped by attempts; replans by budget.
 
 Calibration (`Calibrator`) blends raw confidence with the observed verified-success rate of that exact
@@ -248,5 +265,5 @@ capped per profile and truncated; observations get a per-step share.
 
 ## Tokens
 
-Every model call (SLM, strong, decision model) is a `LedgerEntry` with provider-reported usage when available (otherwise
+Every model call (worker model, planner, decision model) is a `LedgerEntry` with provider-reported usage when available (otherwise
 estimated), emitted as an event and aggregated per task and globally. See `evaluation.md` for the baseline model.

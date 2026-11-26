@@ -40,8 +40,8 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&cfg.workspace)?;
     tracing::info!(
         decision = if cfg.decision.base_url.is_some() { "open-model" } else { "local" },
-        slm = %cfg.slm.provider,
-        strong = %cfg.strong.provider,
+        worker = %cfg.worker.provider,
+        planner = %cfg.planner.provider,
         gliner = cfg.gliner_url.is_some(),
         database = cfg.database_url.is_some(),
         workspace = %cfg.workspace.display(),

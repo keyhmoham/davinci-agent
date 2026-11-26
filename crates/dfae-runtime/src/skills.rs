@@ -19,7 +19,7 @@ pub struct Skill {
     pub template: Plan,
     pub successes: u32,
     pub failures: u32,
-    /// The template is a plan of *intents* (written by the external model, steps carried out by the local system), not of
+    /// The template is a plan of *intents* (written by the planner model, steps carried out by the local system), not of
     /// concrete calls: replaying it spends no external tokens and produces fresh content for the new request. Because the
     /// intents are phrased for the request they came from, such a skill only matches a request that differs from the
     /// original in its slot values.
@@ -89,9 +89,9 @@ pub fn crystallize(goal: &str, entities: &[Entity], plan: &Plan) -> Option<Skill
     let mut template = plan.clone();
     template.goal = String::new();
     template.report = None;
-    // a plan the external model wrote as intents is kept as intents: what the local system generated while carrying it out
+    // a plan the planner model wrote as intents is kept as intents: what the local system generated while carrying it out
     // (the page it wrote, the code it composed) belongs to that one request and is generated again for the next
-    let intent = plan.source == PlanSource::Strong && plan.steps.iter().all(|s| s.how.is_some());
+    let intent = plan.source == PlanSource::Planner && plan.steps.iter().all(|s| s.how.is_some());
     for s in &mut template.steps {
         if intent {
             s.args = serde_json::json!({});
@@ -143,7 +143,7 @@ mod tests {
     fn done_plan() -> Plan {
         let mut s1 = Step::tool("s1", "fs_read", "read /workspace/a.txt", json!({"path": "/workspace/a.txt"}));
         s1.status = StepStatus::Succeeded;
-        Plan { goal: "g".into(), steps: vec![s1], source: PlanSource::Slm, revision: 0, estimate: None, report: None }
+        Plan { goal: "g".into(), steps: vec![s1], source: PlanSource::Worker, revision: 0, estimate: None, report: None }
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
         let mut p = done_plan();
         p.steps[0].status = StepStatus::Failed;
         assert!(crystallize("g", &[], &p).is_none());
-        let p = Plan { goal: "g".into(), steps: vec![Step::reasoning("s1", "think")], source: PlanSource::Slm, revision: 0, estimate: None, report: None };
+        let p = Plan { goal: "g".into(), steps: vec![Step::reasoning("s1", "think")], source: PlanSource::Worker, revision: 0, estimate: None, report: None };
         assert!(crystallize("g", &[], &p).is_none());
     }
 }

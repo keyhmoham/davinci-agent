@@ -62,7 +62,7 @@ impl Inner {
     /// Teach the cost model what this task's model calls really cost.
     pub(crate) async fn learn_costs(&self, rec: &TaskRecord) {
         let mut any = false;
-        for e in rec.ledger.entries.iter().filter(|e| e.origin.is_none() && !e.cached && matches!(e.component, Component::Slm | Component::Strong)) {
+        for e in rec.ledger.entries.iter().filter(|e| e.origin.is_none() && !e.cached && matches!(e.component, Component::Worker | Component::Planner)) {
             self.cost.observe(&e.purpose, e.prompt_tokens + e.completion_tokens);
             any = true;
         }

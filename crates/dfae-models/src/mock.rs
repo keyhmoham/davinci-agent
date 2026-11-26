@@ -57,7 +57,7 @@ impl LanguageModel for ScriptedModel {
     }
 }
 
-/// A deterministic stand-in for a real SLM so the whole stack can be smoke
+/// A deterministic stand-in for a real worker model so the whole stack can be smoke
 /// tested with no model server. It plans a single reasoning step and answers
 /// by echoing the evidence it is given. It does not reason.
 #[derive(Default)]

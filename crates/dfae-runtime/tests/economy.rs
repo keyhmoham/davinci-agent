@@ -16,7 +16,7 @@ use std::time::Duration;
 
 struct Rig {
     engine: Engine,
-    slm: ScriptedModel,
+    worker: ScriptedModel,
     ws: tempfile::TempDir,
     store: Arc<InMemoryStore>,
 }
@@ -34,8 +34,8 @@ fn rig(with_slm: bool, extra: Vec<Arc<dyn Tool>>, tweak: impl FnOnce(&mut Config
     for t in extra {
         reg.register(t);
     }
-    let slm = ScriptedModel::new("scripted-slm", vec![]);
-    let models = ModelGateway::new(with_slm.then(|| Arc::new(slm.clone()) as Arc<dyn LanguageModel>), None);
+    let worker = ScriptedModel::new("scripted-worker", vec![]);
+    let models = ModelGateway::new(with_slm.then(|| Arc::new(worker.clone()) as Arc<dyn LanguageModel>), None);
     let engine = Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
         extractor: Arc::new(HybridExtractor::new(None)),
@@ -45,7 +45,7 @@ fn rig(with_slm: bool, extra: Vec<Arc<dyn Tool>>, tweak: impl FnOnce(&mut Config
         tools: Arc::new(reg),
         policy,
     });
-    Rig { engine, slm, ws, store }
+    Rig { engine, worker, ws, store }
 }
 
 async fn run(r: &Rig, goal: &str) -> TaskRecord {
@@ -79,7 +79,7 @@ async fn a_misplaced_file_is_found_by_code_not_by_a_model() {
     assert_eq!((s.repairs, s.attempts), (1, 1), "the repair did not consume the retry budget");
     assert_eq!(s.args, json!({"path": "notes/todo.md"}));
     assert_eq!(t.ledger.summary().generative_tokens, 0);
-    assert_eq!(r.slm.calls(), 0);
+    assert_eq!(r.worker.calls(), 0);
     assert!(kinds(&r, &t.task_id).contains(&"repaired".to_string()));
     assert!(!t.decisions.iter().any(|d| d.kind == "assess_recovery"), "no decision was even needed");
 }
@@ -110,11 +110,11 @@ async fn plan_argument_problems_are_fixed_without_a_repair_call() {
     ]));
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&bad_plan);
-    r.slm.push("It holds alpha.");
+    r.worker.push(&bad_plan);
+    r.worker.push("It holds alpha.");
     let t = run(&r, "Read a.txt and tell me what it holds").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!(r.slm.calls(), 2, "plan + step: the model was not asked to repair its own plan");
+    assert_eq!(r.worker.calls(), 2, "plan + step: the model was not asked to repair its own plan");
     assert_eq!(step(&t, "s1").args, json!({"path": "a.txt", "max_bytes": 100}));
     assert_eq!(step(&t, "s1").repairs, 1);
     assert!(kinds(&r, &t.task_id).contains(&"repaired".to_string()));
@@ -122,15 +122,15 @@ async fn plan_argument_problems_are_fixed_without_a_repair_call() {
     // the same plan with repair switched off needs a model round trip
     let r = rig(true, vec![], |c| c.economy.repair = false);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&bad_plan);
-    r.slm.push(&plan(
+    r.worker.push(&bad_plan);
+    r.worker.push(&plan(
         json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "say what it holds", "after": ["s1"]}]),
     ));
-    r.slm.push("It holds alpha.");
+    r.worker.push("It holds alpha.");
     let t = run(&r, "Read a.txt and tell me what it holds").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!(r.slm.calls(), 3);
-    let repair_prompt = r.slm.requests.lock()[1].messages.last().unwrap().content.clone();
+    assert_eq!(r.worker.calls(), 3);
+    let repair_prompt = r.worker.requests.lock()[1].messages.last().unwrap().content.clone();
     assert!(repair_prompt.contains("max_bytes") || repair_prompt.contains("unknown argument"), "{repair_prompt}");
 }
 
@@ -138,24 +138,24 @@ async fn plan_argument_problems_are_fixed_without_a_repair_call() {
 
 #[tokio::test]
 async fn an_unaffordable_plan_is_rejected_before_any_tool_runs() {
-    let r = rig(true, vec![], |c| c.budget.max_local_calls = 4);
+    let r = rig(true, vec![], |c| c.budget.max_worker_calls = 4);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
     // three independent reasoning leaves need 3 steps + an answer call = 4, but only 3 calls remain after planning
-    r.slm.push(&plan(json!([
+    r.worker.push(&plan(json!([
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "angle one", "after": ["s1"]},
         {"id": "s3", "tool": null, "do": "angle two", "after": ["s1"]},
         {"id": "s4", "tool": null, "do": "angle three", "after": ["s1"]}
     ])));
-    r.slm.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
-    r.slm.push("It holds alpha.");
+    r.worker.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
+    r.worker.push("It holds alpha.");
     let t = run(&r, "Read a.txt and explain it from several angles").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    let repair = r.slm.requests.lock()[1].messages.last().unwrap().content.clone();
+    let repair = r.worker.requests.lock()[1].messages.last().unwrap().content.clone();
     assert!(repair.contains("needs about 4 model calls but only 3 remain"), "{repair}");
     assert_eq!(t.usage.tool_calls, 1, "the rejected plan's tool never ran");
     assert_eq!(t.plan.as_ref().unwrap().steps.len(), 2);
-    assert_eq!(t.usage.local_calls, 3);
+    assert_eq!(t.usage.worker_calls, 3);
 }
 
 // ----------------------------------------------------------------- pricing ----
@@ -164,8 +164,8 @@ async fn an_unaffordable_plan_is_rejected_before_any_tool_runs() {
 async fn plans_carry_a_price_and_the_price_is_learned() {
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
-    r.slm.push("It holds alpha.");
+    r.worker.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
+    r.worker.push("It holds alpha.");
     assert_eq!(r.engine.cost()["step"]["samples"].as_u64(), Some(0));
     assert_eq!(r.engine.cost()["step"]["estimate"].as_f64(), Some(150.0), "a prior until something is observed");
     let t = run(&r, "Read a.txt and explain it").await;
@@ -188,10 +188,10 @@ async fn plans_carry_a_price_and_the_price_is_learned() {
 async fn junk_model_output_is_stopped_at_the_step_that_produced_it() {
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
-    r.slm.push("   "); // empty
-    r.slm.push(&"the the the ".repeat(30)); // degenerate
-    r.slm.push("It holds alpha.");
+    r.worker.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
+    r.worker.push("   "); // empty
+    r.worker.push(&"the the the ".repeat(30)); // degenerate
+    r.worker.push("It holds alpha.");
     let t = run(&r, "Read a.txt and explain it").await;
     assert_eq!(t.status, TaskStatus::Failed, "two rejected outputs exhaust the step's attempts: {:?}", t.error);
     assert!(step(&t, "s2").error.as_ref().unwrap().contains("model output rejected"));
@@ -199,9 +199,9 @@ async fn junk_model_output_is_stopped_at_the_step_that_produced_it() {
 
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    r.slm.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
-    r.slm.push("");
-    r.slm.push("It holds alpha.");
+    r.worker.push(&plan(json!([{"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}}, {"id": "s2", "tool": null, "do": "explain it", "after": ["s1"]}])));
+    r.worker.push("");
+    r.worker.push("It holds alpha.");
     let t = run(&r, "Read a.txt and explain it").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert_eq!(step(&t, "s2").attempts, 2, "one bad output is retried");
@@ -212,7 +212,7 @@ async fn junk_model_output_is_stopped_at_the_step_that_produced_it() {
 async fn a_step_does_not_run_on_empty_upstream_input() {
     let r = rig(true, vec![], |_| {});
     std::fs::write(r.ws.path().join("empty.txt"), "").unwrap();
-    r.slm.push(&plan(json!([
+    r.worker.push(&plan(json!([
         {"id": "s1", "tool": "fs_read", "args": {"path": "empty.txt"}},
         {"id": "s2", "tool": "fs_read", "args": {"path": "{{s1}}"}}
     ])));
@@ -278,12 +278,12 @@ async fn lazy_context_sends_short_inputs_and_expands_only_when_asked() {
     // the model asks for more: one extra call, full text on the retry
     let r = rig(true, vec![], |c| c.economy.lazy_context = true);
     long_file(&r);
-    r.slm.push(&two_step_plan());
-    r.slm.push("NEED s1");
-    r.slm.push("The marker is ZZTAIL-MARKER.");
+    r.worker.push(&two_step_plan());
+    r.worker.push("NEED s1");
+    r.worker.push("The marker is ZZTAIL-MARKER.");
     let t = run(&r, "Read long.txt and find the marker").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    let reqs = r.slm.requests.lock().clone();
+    let reqs = r.worker.requests.lock().clone();
     assert_eq!(reqs.len(), 3);
     let (first, second) = (reqs[1].messages.last().unwrap().content.clone(), reqs[2].messages.last().unwrap().content.clone());
     assert!(first.contains("reply with exactly `NEED <id>`") && !first.contains("ZZTAIL-MARKER"), "short inputs first:\n{first}");
@@ -295,22 +295,22 @@ async fn lazy_context_sends_short_inputs_and_expands_only_when_asked() {
     // the model is content with the short summary: no extra call
     let r = rig(true, vec![], |c| c.economy.lazy_context = true);
     long_file(&r);
-    r.slm.push(&two_step_plan());
-    r.slm.push("It is a long document.");
+    r.worker.push(&two_step_plan());
+    r.worker.push("It is a long document.");
     let t = run(&r, "Read long.txt and find the marker").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!(r.slm.calls(), 2);
+    assert_eq!(r.worker.calls(), 2);
 }
 
 #[tokio::test]
 async fn lazy_context_is_off_by_default_and_changes_nothing_then() {
     let r = rig(true, vec![], |_| {});
     long_file(&r);
-    r.slm.push(&two_step_plan());
-    r.slm.push("NEED s1"); // an answer, as far as a non-lazy runtime is concerned
+    r.worker.push(&two_step_plan());
+    r.worker.push("NEED s1"); // an answer, as far as a non-lazy runtime is concerned
     let t = run(&r, "Read long.txt and find the marker").await;
-    assert_eq!(r.slm.calls(), 2, "no expansion round trip");
-    let prompt = r.slm.requests.lock()[1].messages.last().unwrap().content.clone();
+    assert_eq!(r.worker.calls(), 2, "no expansion round trip");
+    let prompt = r.worker.requests.lock()[1].messages.last().unwrap().content.clone();
     assert!(!prompt.contains("NEED <id>"));
     assert_eq!(t.final_answer.as_deref(), Some("NEED s1"));
 }

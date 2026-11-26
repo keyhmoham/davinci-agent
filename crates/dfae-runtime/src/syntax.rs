@@ -1,6 +1,6 @@
 //! Is what a step just wrote well-formed? A self-hosted model writes the files, and what it gets wrong is mostly
 //! mechanical: a JSON object cut off by the token limit, an unclosed tag, a stray quote. Parsers find those for free; the
-//! planner (the external model) then hears one short error line instead of discovering it three steps later.
+//! planner (the planner model) then hears one short error line instead of discovering it three steps later.
 
 use std::path::Path;
 use std::time::Duration;

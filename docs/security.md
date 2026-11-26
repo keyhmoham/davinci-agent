@@ -13,7 +13,7 @@ set if the API is exposed, and use `DFAE_APPROVALS=ask` (and `shell.mode = "allo
 ## Boundary
 
 The **policy engine** (`crates/dfae-tools/src/policy.rs`, configured by `config/policy.toml`) is the only
-component that grants or refuses actions. The decision model, the SLM and GLiNER are *advisors*: a decision of "low risk"
+component that grants or refuses actions. The decision model, the worker model and GLiNER are *advisors*: a decision of "low risk"
 never skips a policy check, and a model-authored plan can only use tools the decision layer selected.
 
 Evaluation points for a tool call: (1) plan validation (tool known + selected, arguments typed); (2) **just
@@ -50,7 +50,7 @@ routing, so a mis-classified state-changing request fails closed (its write tool
   `DECISION_BASE_URL`. By default that is the `ollama` service in the compose network, so nothing leaves the machine;
   point it at a remote server and the request text goes there. With `DECISION_PROVIDER=local` decisions use built-in rules.
 - **Stronger model** (only if configured): plan/answer prompts, including compressed tool outputs, go to that provider.
-- **SLM / GLiNER / Postgres** are local services in the compose network.
+- **worker model / GLiNER / Postgres** are local services in the compose network.
 - `http_get` contacts the domains the policy allows; with `open_web = true` any public host (never private ranges). `web_search` calls fixed third-party backends (SearXNG/Brave if configured, DuckDuckGo, Wikipedia) through the same private-address and size/time guards. What you search for, and any URL you fetch, leaves the machine.
 
 ## Known limits

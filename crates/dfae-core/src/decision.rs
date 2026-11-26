@@ -173,19 +173,19 @@ pub struct ToolBrief {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModeFacts {
-    /// Every needed tool call can be bound deterministically (no SLM needed).
+    /// Every needed tool call can be bound deterministically (no worker model needed).
     pub direct_bindable: bool,
     pub direct_tools: Vec<String>,
     /// Cosine score of the best matching stored skill, if any.
     pub skill_score: Option<f32>,
-    pub strong_available: bool,
-    pub slm_available: bool,
+    pub planner_available: bool,
+    pub worker_available: bool,
     pub complexity: f32,
     pub risk: Option<Risk>,
     pub task_type: String,
-    /// Policy: from this complexity, medium and complex work is planned by the external model (if there is one).
+    /// Policy: from this complexity, medium and complex work is planned by the planner model (if there is one).
     #[serde(default)]
-    pub external_min_complexity: f32,
+    pub plan_min_complexity: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -209,7 +209,7 @@ pub struct StepFacts {
     pub replans_used: u32,
     pub max_replans: u32,
     pub optional: bool,
-    pub strong_available: bool,
+    pub planner_available: bool,
 }
 
 /// Facts about a candidate split of a request into sub-tasks for a team of agents.

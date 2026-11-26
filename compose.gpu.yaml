@@ -1,4 +1,4 @@
-# NVIDIA GPU for the SLM:  docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
+# NVIDIA GPU for the decision model:  docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
 services:
   ollama:
     deploy:

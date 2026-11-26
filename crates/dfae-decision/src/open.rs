@@ -257,19 +257,19 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
     }
     if let Some(m) = &s.mode_facts {
         out.push(format!(
-            "FACTS: deterministic_binding={} skill_match={} complexity={:.2} risk={} task_type={} small_model={} strong_model={}",
+            "FACTS: deterministic_binding={} skill_match={} complexity={:.2} risk={} task_type={} small_model={} planner_model={}",
             m.direct_bindable,
             m.skill_score.map(|x| format!("{x:.2}")).unwrap_or_else(|| "none".into()),
             m.complexity,
             m.risk.map(|r| format!("{r:?}").to_lowercase()).unwrap_or_else(|| "unknown".into()),
             m.task_type,
-            m.slm_available,
-            m.strong_available
+            m.worker_available,
+            m.planner_available
         ));
-        if m.external_min_complexity > 0.0 {
+        if m.plan_min_complexity > 0.0 {
             out.push(format!(
-                "POLICY: planning is always done by the external model (when one exists) and carried out by the local system. Choose escalated for any request that needs a plan (several dependent steps, building or serving something, results that decide the next step; complexity {:.2} or more is a hint). Choose assisted only for one quick action or a reply that needs no plan.",
-                m.external_min_complexity
+                "POLICY: planning is always done by the planner model (when one exists) and carried out by the local system. Choose escalated for any request that needs a plan (several dependent steps, building or serving something, results that decide the next step; complexity {:.2} or more is a hint). Choose assisted only for one quick action or a reply that needs no plan.",
+                m.plan_min_complexity
             ));
         }
     }
@@ -286,7 +286,7 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
     }
     if let Some(f) = &s.step_facts {
         out.push(format!(
-            "FAILED STEP: tool={} error_kind={} error=\"{}\" attempt {}/{} replans {}/{} optional={} strong_model={}",
+            "FAILED STEP: tool={} error_kind={} error=\"{}\" attempt {}/{} replans {}/{} optional={} planner_model={}",
             f.tool.as_deref().unwrap_or("reasoning"),
             f.error_kind,
             clip(&f.error, 1000),
@@ -295,7 +295,7 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
             f.replans_used,
             f.max_replans,
             f.optional,
-            f.strong_available
+            f.planner_available
         ));
     }
     if let Some(c) = &s.completion_facts {

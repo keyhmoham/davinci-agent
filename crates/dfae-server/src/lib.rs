@@ -90,8 +90,8 @@ async fn info(State(s): State<AppState>) -> Json<Value> {
         "config": {
             "decision": if cfg.decision.base_url.is_some() { "open-model" } else { "local" },
             "decision_model": cfg.decision.model,
-            "slm": { "provider": cfg.slm.provider, "model": cfg.slm.model },
-            "strong": { "provider": cfg.strong.provider, "model": cfg.strong.model },
+            "worker": { "provider": cfg.worker.provider, "model": cfg.worker.model },
+            "planner": { "provider": cfg.planner.provider, "model": cfg.planner.model },
             "gliner": cfg.gliner_url.is_some(),
             "database": cfg.database_url.is_some(),
             "budget": cfg.budget,
@@ -290,10 +290,10 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
     let body = format!(
         "# TYPE dfae_tasks gauge\ndfae_tasks {}\ndfae_tasks_completed {}\ndfae_tasks_failed {}\ndfae_tasks_verified {}\n\
          dfae_mode_tasks{{mode=\"direct\"}} {}\ndfae_mode_tasks{{mode=\"assisted\"}} {}\ndfae_mode_tasks{{mode=\"escalated\"}} {}\n\
-         dfae_tokens{{kind=\"slm\"}} {}\ndfae_tokens{{kind=\"strong\"}} {}\ndfae_tokens{{kind=\"decision\"}} {}\n\
+         dfae_tokens{{kind=\"worker\"}} {}\ndfae_tokens{{kind=\"planner\"}} {}\ndfae_tokens{{kind=\"decision\"}} {}\n\
          dfae_teams {}\ndfae_agents {}\ndfae_team_cache_hits {}\n\
          dfae_dispatch_tasks{{state=\"running\"}} {}\ndfae_dispatch_tasks{{state=\"queued\"}} {}\ndfae_dispatch_agents{{state=\"running\"}} {}\ndfae_dispatch_agents_spawned {}\n\
-         dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"slm\"}} {}\ndfae_model_calls{{kind=\"strong\"}} {}\ndfae_model_calls{{kind=\"decision\"}} {}\n",
+         dfae_tokens_baseline {}\ndfae_tokens_saved {}\ndfae_model_calls{{kind=\"worker\"}} {}\ndfae_model_calls{{kind=\"planner\"}} {}\ndfae_model_calls{{kind=\"decision\"}} {}\n",
         st.tasks,
         st.completed,
         st.failed,
@@ -301,8 +301,8 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
         st.direct,
         st.assisted,
         st.escalated,
-        t.slm_tokens,
-        t.strong_tokens,
+        t.worker_tokens,
+        t.planner_tokens,
         t.decision_tokens,
         st.teams,
         st.agents,
@@ -313,8 +313,8 @@ async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
         d.agents_spawned,
         t.baseline_tokens,
         t.saved_tokens,
-        t.slm_calls,
-        t.strong_calls,
+        t.worker_calls,
+        t.planner_calls,
         t.decision_calls
     );
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)

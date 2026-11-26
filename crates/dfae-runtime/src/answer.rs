@@ -57,6 +57,9 @@ pub fn render_report(plan: &Plan) -> Option<String> {
     (!missing && !out.trim().is_empty()).then(|| out.trim().to_string())
 }
 
+/// Tools whose steps change something: their one-line result is what the user needs to read.
+const CHANGES: &[&str] = &["fs_write", "fs_edit", "fs_mkdir", "fs_move", "fs_copy", "fs_delete", "shell_kill", "memory_store"];
+
 /// Deterministic answer built from step outputs (no model involved).
 pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
     let Some(plan) = &rec.plan else {
@@ -74,6 +77,19 @@ pub fn templated_answer(rec: &TaskRecord, exec_error: Option<&str>) -> String {
         out.push_str(&tokens::truncate_tokens(ok[0].summary.as_deref().or(ok[0].output.as_deref()).unwrap_or(""), 700));
     } else {
         for s in &ok {
+            // a step that changed something says what it did in one line ("wrote 2070 bytes to site/index.html"): its arguments
+            // (a whole page, say) are not an answer
+            if s.tool.as_deref().is_some_and(|t| CHANGES.contains(&t)) {
+                let line = tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or("").lines().next().unwrap_or(""), 40);
+                // an edit says what became what: that is the part of its arguments the user wants to see
+                let edit = (s.tool.as_deref() == Some("fs_edit"))
+                    .then(|| (s.args.get("old_string").and_then(|v| v.as_str()), s.args.get("new_string").and_then(|v| v.as_str())))
+                    .and_then(|(o, n)| Some((o?, n?)))
+                    .map(|(o, n)| format!(" (\"{}\" → \"{}\")", tokens::truncate_tokens(o, 12), tokens::truncate_tokens(n, 12)))
+                    .unwrap_or_default();
+                out.push_str(&format!("• {line}{edit}\n"));
+                continue;
+            }
             let body = tokens::truncate_tokens(s.summary.as_deref().or(s.output.as_deref()).unwrap_or(""), 350);
             out.push_str(&format!(
                 "▸ {}{}\n{}\n",
@@ -178,31 +194,7 @@ impl Inner {
         // only tool output is ground truth: a model's own prose must never vouch for itself
         let evidence_full: String = plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
         let mut from_model = false;
-        // A plan of tool steps only has no prose in it; for a task the external model planned, the self-hosted one
-        // writes the reply from the evidence (free), kept only if it states nothing the evidence does not contain.
-        let tools_only_local = exec_err.is_none()
-            && !plan.has_reasoning()
-            && plan.source != PlanSource::Chat
-            && self.cfg.economy.answer_local_first
-            && self.pick_tier(mode) == Some(Tier::Strong)
-            && self.models.has(Tier::Slm)
-            && (plan.steps.len() > 1 || self.did_change(&plan));
-        let composed_locally = if tools_only_local {
-            let user = format!("REQUEST: {goal}\nEVIDENCE:\n{}", evidence_block(&snapshot, 800));
-            match self.generate_text(ctx, Tier::Slm, self.gen_request(Tier::Slm, prompts::ANSWER_SYSTEM, user, "answer_local")).await {
-                Ok(t) => {
-                    let t = crate::style::compact(t.trim());
-                    (!t.is_empty() && ungrounded_claims(&t, &evidence_full, &goal).is_empty()).then_some(t)
-                }
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        let text = if let Some(t) = composed_locally {
-            from_model = true;
-            t
-        } else if exec_err.is_some() || !plan.has_reasoning() {
+        let text = if exec_err.is_some() || !plan.has_reasoning() {
             templated_answer(&snapshot, exec_err)
         } else if let Some(t) = single_leaf {
             from_model = true;
@@ -210,9 +202,9 @@ impl Inner {
         } else if let Some(tier) = self.pick_tier(mode) {
             // The self-hosted model writes the answer first (it is free, and gets the full evidence); the external one
             // is asked only when the draft states a number, path or address that the evidence does not contain.
-            let local = if tier == Tier::Strong && self.cfg.economy.answer_local_first && self.models.has(Tier::Slm) {
+            let local = if tier == Tier::Planner && self.cfg.economy.answer_local_first && self.models.has(Tier::Worker) {
                 let user = format!("REQUEST: {goal}\nEVIDENCE:\n{}", evidence_block(&snapshot, 800));
-                match self.generate_text(ctx, Tier::Slm, self.gen_request(Tier::Slm, prompts::ANSWER_SYSTEM, user, "answer_local")).await {
+                match self.generate_text(ctx, Tier::Worker, self.gen_request(Tier::Worker, prompts::ANSWER_SYSTEM, user, "answer_local")).await {
                     Ok(t) => {
                         let t = crate::style::compact(t.trim());
                         (!t.is_empty() && ungrounded_claims(&t, &evidence_full, &goal).is_empty()).then_some(t)
@@ -227,7 +219,7 @@ impl Inner {
                 t
             } else {
                 // the paid model gets tight evidence; a self-hosted one gets what the steps produced
-                let ev = evidence_block(&snapshot, if tier == Tier::Strong { 220 } else { 800 });
+                let ev = evidence_block(&snapshot, if tier == Tier::Planner { 220 } else { 300 });
                 let user = format!("REQUEST: {goal}\nEVIDENCE:\n{ev}");
                 match self.generate_text(ctx, tier, self.gen_request(tier, prompts::ANSWER_SYSTEM, user, "answer")).await {
                     Ok(t) => {
