@@ -551,7 +551,7 @@ impl Tool for Shell {
         let mut m = if sandbox {
             meta(
                 "shell",
-                "run a bash command in the workspace (or `cwd`) in a sandbox you fully control: pipes, &&, redirects, git, build and test tools all work; stderr is merged into the output, which ends with [exit code N] on failure. You may INSTALL anything a task needs, as an unprivileged user, into a toolbox that is already on PATH and survives restarts: `pip install x`, `python3 -m venv .venv`, `npm install -g x` / `npx -y x`, `cargo install x`, `go install x@latest`, `dfae-apt <debian-package>` (ffmpeg, imagemagick, sqlite3 …), or a release binary fetched with curl into $DFAE_TOOLS/bin. Never use sudo or apt-get, never ask the user to install something. Nothing prompts: pass -y/--yes. Each call is a fresh bash (cd and exports do not carry over: use `cwd` or `cd x && …`). timeout_secs: default 120, 600 for installs and builds (a timed-out command is killed, its output so far is kept); background=true for servers and long jobs, then shell_output / shell_kill. To serve something the user can open (a page, an app) start it with background=true listening on 0.0.0.0 on a port from 8000 to 8010, e.g. `python3 -m http.server 8000 --bind 0.0.0.0`; it is then at http://localhost:<port> on the user's machine. For file work prefer fs_* tools",
+                "run a bash command in the workspace (or `cwd`) in a sandbox you fully control: pipes, &&, redirects, git, build and test tools all work; stderr is merged into the output, which ends with [exit code N] on failure. You may INSTALL anything a task needs, as an unprivileged user, into a toolbox that is already on PATH and survives restarts: `pip install x`, `python3 -m venv .venv`, `npm install -g x` / `npx -y x`, `cargo install x`, `go install x@latest`, `dfae-apt <debian-package>` (ffmpeg, imagemagick, sqlite3 …), or a release binary fetched with curl into $DFAE_TOOLS/bin. Never use sudo or apt-get, never ask the user to install something. Nothing prompts: give an installer that would ask its yes flag (npx -y, npm init -y); pip never asks and takes no -y. Each call is a fresh bash (cd and exports do not carry over: use `cwd` or `cd x && …`). timeout_secs: default 120, 600 for installs and builds (a timed-out command is killed, its output so far is kept); background=true for servers and long jobs, then shell_output / shell_kill. To serve something the user can open (a page, an app) start it with background=true listening on 0.0.0.0 on a port from 8000 to 8010, e.g. `python3 -m http.server 8000 --bind 0.0.0.0`; it is then at http://localhost:<port> on the user's machine. For file work prefer fs_* tools",
                 "system",
                 vec![
                     ParamSpec::new("command", ParamType::String, true, "bash command line"),
@@ -595,8 +595,16 @@ impl Tool for Shell {
         if crate::coding::sandboxed(&self.policy) {
             let cwd = crate::coding::resolve_cwd(&self.policy, &input)?;
             if input.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+                // a port that something already answers on is not ours to take: said before anything starts (and with the ones that are free)
+                if let Some(port) = crate::coding::port_in(cmd) {
+                    crate::coding::refuse_taken_port(port).await?;
+                }
                 let id = crate::coding::spawn_job(&self.policy, cmd, &cwd)?;
-                let first = crate::coding::settle_job(id, Duration::from_millis(1500)).await?;
+                let mut first = crate::coding::settle_job(id, Duration::from_millis(1500)).await?;
+                // a server that names its port must be listening on it, and still be alive, a few seconds later
+                if let Some(port) = crate::coding::port_in(cmd) {
+                    first.push_str(&crate::coding::await_listening(id, port, Duration::from_secs(40)).await?);
+                }
                 return Ok(ToolOutput::ok(format!(
                     "started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it{first}"
                 )));

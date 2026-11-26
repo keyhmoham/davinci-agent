@@ -990,7 +990,7 @@ impl Inner {
     /// plan as it stands. Only what changes is written, and only what changes runs again.
     async fn patch_plan(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, problem: &str, replans: u32, budget: &Budget) -> Result<bool, String> {
         let prefix = format!("r{replans}_");
-        let ctx_text = self.context_text(ctx, false, Tier::Planner).await;
+        let ctx_text = format!("{}{}", self.context_text(ctx, false, Tier::Planner).await, self.ports_line().await);
         let (current, state) = {
             let r = ctx.rec.lock().await;
             let plan = r.plan.as_ref().ok_or("no plan")?;
@@ -1087,7 +1087,10 @@ fn clip_error(msg: &str, max_tokens: usize) -> String {
 /// when the end holds no complaint, the last lines that do. The first line of a log is its banner.
 pub(crate) fn failure_digest(output: &str) -> String {
     static COMPLAINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)\b(?:error|failed|failure|exception|traceback|cannot|can't|not found|denied|fatal|panic|unable|invalid|missing)\b").unwrap()
+        regex::Regex::new(
+            r"(?i)\b(?:error|failed|failure|exception|traceback|cannot|can't|not found|denied|fatal|panic|unable|invalid|missing)\b|^E {2,}|^\s*assert ",
+        )
+        .unwrap()
     });
     let lines: Vec<&str> = output
         .lines()
@@ -1099,13 +1102,14 @@ pub(crate) fn failure_digest(output: &str) -> String {
     }
     let tail_start = lines.len().saturating_sub(14);
     let tail = &lines[tail_start..];
+    // The complaints before the tail, each said once: a test runner ends with a one-line summary per failure (cut with "…") and says what
+    // actually went wrong ("E   no such table: bookmarks") further up.
     let mut out: Vec<&str> = Vec::new();
-    if !tail.iter().any(|l| COMPLAINT.is_match(l)) {
-        let earlier: Vec<&str> = lines[..tail_start].iter().copied().filter(|l| COMPLAINT.is_match(l)).collect();
-        out.extend(earlier.iter().rev().take(6).rev());
-        if !out.is_empty() {
-            out.push("[…]");
-        }
+    let mut seen = std::collections::HashSet::new();
+    let earlier: Vec<&str> = lines[..tail_start].iter().copied().filter(|l| COMPLAINT.is_match(l) && seen.insert(l.trim())).collect();
+    out.extend(earlier.iter().rev().take(6).rev());
+    if !out.is_empty() {
+        out.push("[…]");
     }
     out.extend(tail);
     let text = out.join("\n");
@@ -1138,5 +1142,16 @@ mod digest_tests {
         }
         let d = failure_digest(&log);
         assert!(d.contains("fatal: repository not found") && d.contains("[…]") && d.contains("cleanup step 29"), "{d}");
+        // a test run: the cause is in the middle, each failure's summary is cut at the end
+        let mut run = String::from("============ FAILURES ============\n");
+        for _ in 0..4 {
+            run.push_str("    def test_x():\n>       db.execute(sql)\nE       sqlite3.OperationalError: no such table: bookmarks\n");
+        }
+        for i in 0..20 {
+            run.push_str(&format!("warning line {i}\n"));
+        }
+        run.push_str("FAILED test_main.py::test_add - sqlite3.OperationalError: table bo...\n4 failed in 1.2s");
+        let d = failure_digest(&run);
+        assert!(d.contains("no such table: bookmarks") && d.matches("no such table").count() == 1 && d.contains("4 failed"), "{d}");
     }
 }

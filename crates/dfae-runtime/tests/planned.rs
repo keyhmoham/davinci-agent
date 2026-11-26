@@ -202,6 +202,27 @@ async fn a_directory_the_worker_made_up_is_corrected_while_binding_not_discovere
 }
 
 #[tokio::test]
+async fn a_file_is_written_knowing_the_files_of_its_project_that_were_written_before() {
+    let r = rig(false, |_| {});
+    r.planner.push(
+        &json!({"steps": [
+            {"id": "s1", "do": "write calc/mathlib.py with a function add(a, b)", "tool": "fs_write"},
+            {"id": "s2", "do": "write calc/test_mathlib.py with pytest tests of mathlib.add", "tool": "fs_write", "after": ["s1"]}
+        ]})
+        .to_string(),
+    );
+    r.worker.push("def add(a, b):\n    return a + b\n");
+    r.worker.push("from mathlib import add\n\ndef test_add():\n    assert add(1, 2) == 3\n");
+    let t = run(&r, "create calc/mathlib.py with an add function and calc/test_mathlib.py with tests for it").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} {:?}", t.error, t.final_answer);
+    let contents: Vec<GenerationRequest> = r.worker.requests.lock().iter().filter(|q| q.purpose == "content").cloned().collect();
+    assert_eq!(contents.len(), 2);
+    assert!(!contents[0].messages[0].content.contains("RELATED FILES"));
+    let second = &contents[1].messages[0].content;
+    assert!(second.contains("RELATED FILES") && second.contains("def add(a, b)") && second.contains("calc/mathlib.py"), "{second}");
+}
+
+#[tokio::test]
 async fn the_decision_model_and_rules_turn_a_thinking_step_into_a_tool_call_when_it_binds_outright() {
     let r = rig(false, |_| {});
     r.planner.push(&json!({"steps": [{"id": "s1", "do": "run `echo planned`", "tool": null}]}).to_string());

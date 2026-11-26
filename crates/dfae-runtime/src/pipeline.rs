@@ -840,7 +840,20 @@ impl Inner {
             return String::new();
         }
         let s = crate::workspace::snapshot(self.policy.workspace(), 24);
-        if s.is_empty() { s } else { format!("\n{s}") }
+        let ports = self.ports_line().await;
+        if s.is_empty() { ports } else { format!("\n{s}{ports}") }
+    }
+
+    /// Which of the ports a server may take (8000–8010) are already in use on this machine: a plan that starts a server on a taken one
+    /// fails, and the answer is a plan that uses another.
+    pub(crate) async fn ports_line(&self) -> String {
+        let probes = (8000u16..=8010).map(|p| async move {
+            let up =
+                tokio::time::timeout(std::time::Duration::from_millis(200), tokio::net::TcpStream::connect(("127.0.0.1", p))).await.is_ok_and(|r| r.is_ok());
+            up.then_some(p)
+        });
+        let taken: Vec<String> = futures_util::future::join_all(probes).await.into_iter().flatten().map(|p| p.to_string()).collect();
+        if taken.is_empty() { String::new() } else { format!("\nPORTS IN USE (8000-8010): {}", taken.join(", ")) }
     }
 
     /// Everything stable about planning (rules, the whole tool catalogue, examples) is the system prompt, byte-identical from

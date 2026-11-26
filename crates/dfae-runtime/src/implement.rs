@@ -68,7 +68,12 @@ pub(crate) fn implies_background(description: &str, command: &str) -> bool {
     static SERVER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)\b(?:http\.server|SimpleHTTPServer|uvicorn|gunicorn|flask\s+run|php\s+-S|npm\s+(?:run\s+)?(?:start|dev|serve)|yarn\s+(?:start|dev)|vite(?:\s|$)|next\s+dev|live-server|http-server|python3?\s+-m\s+(?:http\.server|flask|uvicorn))\b").unwrap()
     });
-    SENTENCE.is_match(description) || SERVER.is_match(command)
+    // `pip install fastapi uvicorn pytest` names a server as a package to install, it does not start one
+    static INSTALLER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)^\s*(?:sudo\s+)?(?:(?:python3?\s+-m\s+)?pip3?|pipx|uv(?:\s+pip)?|poetry|npm|yarn|pnpm|bun|apt(?:-get)?|dfae-apt|cargo|go|gem|brew)\s+(?:install|add|i|get|ci)\b").unwrap()
+    });
+    SENTENCE.is_match(description)
+        || command.split(['&', ';', '|']).filter(|seg| !seg.trim().is_empty() && !INSTALLER.is_match(seg)).any(|seg| SERVER.is_match(seg))
 }
 
 /// Parameters whose values are content (text to write): the one thing allowed to run long.
@@ -333,6 +338,37 @@ impl Inner {
         Ok(args)
     }
 
+    /// The files this task has written so far (the last three, from the same project), as text for a prompt: what a file written now must
+    /// agree with. Each is cut short; only files, never what is outside the workspace.
+    async fn related_files(&self, ctx: &Arc<TaskCtx>, this_step: &str, target: &str) -> String {
+        let paths: Vec<String> = {
+            let r = ctx.rec.lock().await;
+            let Some(plan) = r.plan.as_ref() else { return String::new() };
+            plan.steps
+                .iter()
+                .filter(|s| s.id != this_step && s.status == StepStatus::Succeeded && s.tool.as_deref() == Some("fs_write"))
+                .filter_map(|s| s.args.get("path").and_then(|p| p.as_str()).map(String::from))
+                .filter(|p| p != target)
+                .collect()
+        };
+        let project = |p: &str| p.split('/').next().filter(|_| p.contains('/')).unwrap_or("").to_string();
+        let mine = project(target);
+        let mut shown: Vec<String> = Vec::new();
+        for p in paths.iter().rev().filter(|p| project(p) == mine).take(3) {
+            if let Ok(full) = self.policy.guard().read_path(p)
+                && let Ok(text) = std::fs::read_to_string(full)
+                && !text.is_empty()
+            {
+                let cut: String = text.chars().take(3500).collect();
+                shown.push(dfae_core::safety::wrap_untrusted(
+                    &format!("file {p}"),
+                    &if cut.len() < text.len() { format!("{cut}\n… [file continues]") } else { cut },
+                ));
+            }
+        }
+        if shown.is_empty() { String::new() } else { format!("RELATED FILES:\n{}", shown.join("\n")) }
+    }
+
     /// The text of the file an edit step is about (as far as the model needs to see it), found from the arguments or the step.
     fn file_to_edit(&self, prebound: &Map<String, Value>, entities: &[Entity], step_text: &str) -> Option<String> {
         let candidates = prebound
@@ -392,6 +428,11 @@ impl Inner {
         let inputs = Self::inputs_text(deps, if tier == Tier::Planner { 150 } else { 1500 });
         if !inputs.is_empty() {
             user.push_str(&format!("INPUTS:\n{inputs}\n"));
+        }
+        // a file that belongs to a project is written knowing the others (the tests of a module see the module; a page sees its styles)
+        let related = self.related_files(ctx, &step.id, path).await;
+        if !related.is_empty() {
+            user.push_str(&format!("{related}\nThis file must fit with the files above (names, imports, paths, interfaces).\n"));
         }
         if !values.is_empty() {
             user.push_str(&format!("AVAILABLE VALUES (they are only for you to read here): {values}\n"));
@@ -576,11 +617,16 @@ impl Inner {
             // ---- the models: the worker model first, the planner model only if the worker model cannot ----
             let mut problem = feedback.map(str::to_string).or_else(|| valid(&args).err());
             let mut ladder: Vec<Tier> = Vec::new();
-            if self.models.has(Tier::Worker) {
-                ladder.extend([Tier::Worker, Tier::Worker]);
-            }
-            if self.models.has(Tier::Planner) {
+            // a step the planner kept for itself (a fix the worker model could not make) is bound by the planner model
+            if step.planner && self.models.has(Tier::Planner) {
                 ladder.push(Tier::Planner);
+            } else {
+                if self.models.has(Tier::Worker) {
+                    ladder.extend([Tier::Worker, Tier::Worker]);
+                }
+                if self.models.has(Tier::Planner) {
+                    ladder.push(Tier::Planner);
+                }
             }
             if ladder.is_empty() {
                 return Err(fail(
@@ -888,6 +934,13 @@ mod content_tests {
 #[cfg(test)]
 mod background_tests {
     use super::implies_background;
+
+    #[test]
+    fn installing_a_server_is_not_starting_one() {
+        assert!(!implies_background("install the dependencies and run the tests", "pip install fastapi uvicorn pytest httpx && python3 -m pytest -q"));
+        assert!(!implies_background("install", "npm install next && npm run build"));
+        assert!(implies_background("serve it", "pip install uvicorn && uvicorn main:app --port 8001"));
+    }
 
     #[test]
     fn servers_and_background_work_do_not_hold_the_step() {

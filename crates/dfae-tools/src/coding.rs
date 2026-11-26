@@ -664,6 +664,9 @@ fn hint(script: &str, output: &str) -> Option<String> {
     {
         return Some(format!("the Node module `{}` is missing: `npm install {}` in the project directory, then run the command again.", &c[1], &c[1]));
     }
+    if output.contains("no such option: -y") || output.contains("no such option: --yes") {
+        return Some("pip does not take -y (it never asks): run the command again without it.".into());
+    }
     if (output.contains("Permission denied") || output.contains("Read-only file system") || output.contains("EACCES"))
         && (output.contains("/usr") || output.contains("/etc") || output.contains("/var") || script.contains("sudo") || script.contains("apt"))
     {
@@ -791,6 +794,68 @@ pub(crate) async fn settle_job(id: u32, grace: Duration) -> Result<String, ToolE
         Some(c) => Err(ToolError::new(ErrorKind::Other, format!("the background command exited at once [exit code {c}]: {tail}"))),
         None if tail.is_empty() => Ok(String::new()),
         None => Ok(format!("\nfirst output: {tail}")),
+    }
+}
+
+/// The port a command says it listens on (`--port 8001`, `-p 8001`, `http.server 8001`, `PORT=8001`), if it says one.
+pub(crate) fn port_in(command: &str) -> Option<u16> {
+    static PORT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:--port|--listen|-p|-P|-l|PORT)[ =]+(?:[\w.]*:)?(\d{4,5})\b|http\.server\s+(\d{4,5})\b|--bind\s+[\w.]*:(\d{4,5})\b|\s(?:0\.0\.0\.0|127\.0\.0\.1|localhost):(\d{4,5})\b").unwrap()
+    });
+    let c = PORT.captures(command)?;
+    (1..=4).find_map(|i| c.get(i)).and_then(|m| m.as_str().parse::<u16>().ok()).filter(|p| *p >= 1024)
+}
+
+async fn listening(port: u16) -> bool {
+    tokio::time::timeout(Duration::from_millis(250), tokio::net::TcpStream::connect(("127.0.0.1", port))).await.is_ok_and(|r| r.is_ok())
+}
+
+/// Err when something already answers on `port`, naming the ports of 8000–8010 that are free.
+pub(crate) async fn refuse_taken_port(port: u16) -> Result<(), ToolError> {
+    if !listening(port).await {
+        return Ok(());
+    }
+    let mut free = Vec::new();
+    for p in 8000u16..=8010 {
+        if !listening(p).await {
+            free.push(p.to_string());
+        }
+    }
+    Err(ToolError::new(
+        ErrorKind::Other,
+        format!(
+            "port {port} is already in use by another process: start it on a free port instead (free in 8000-8010: {})",
+            if free.is_empty() { "none".into() } else { free.join(", ") }
+        ),
+    ))
+}
+
+/// A server that is started is checked to be *listening*, not merely not dead yet: a port already taken makes some servers print that they
+/// started and exit a moment later. The job must stay alive for a few seconds with the port answering; until then, an exit is a failure
+/// with what it printed.
+pub(crate) async fn await_listening(id: u32, port: u16, patience: Duration) -> Result<String, ToolError> {
+    let job = JOBS.lock().get(&id).cloned().ok_or_else(|| ToolError::new(ErrorKind::NotFound, format!("no background job {id}")))?;
+    let start = tokio::time::Instant::now();
+    let tail = |job: &Job| {
+        let out = job.out.lock().trim().to_string();
+        out.chars().rev().take(600).collect::<Vec<_>>().into_iter().rev().collect::<String>()
+    };
+    loop {
+        if let Some(c) = *job.exit.lock() {
+            return Err(ToolError::new(ErrorKind::Other, format!("the server exited [exit code {c}] before it listened on port {port}: {}", tail(&job))));
+        }
+        let up = listening(port).await;
+        if up && start.elapsed() >= Duration::from_secs(3) {
+            return Ok(format!("\nlistening on port {port}"));
+        }
+        if start.elapsed() >= patience {
+            job.kill.notify_one();
+            return Err(ToolError::new(
+                ErrorKind::Other,
+                format!("nothing is listening on port {port} {}s after the start (it was stopped): {}", patience.as_secs(), tail(&job)),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -954,6 +1019,45 @@ mod job_tests {
         let id = spawn_job(&test_policy(), "echo 'Address already in use' >&2; exit 3", &dir).unwrap();
         let err = settle_job(id, Duration::from_secs(3)).await.unwrap_err().to_string();
         assert!(err.contains("exit code 3") && err.contains("Address already in use"), "{err}");
+    }
+
+    #[test]
+    fn the_port_a_command_names() {
+        assert_eq!(port_in("uvicorn main:app --host 0.0.0.0 --port 8002"), Some(8002));
+        assert_eq!(port_in("npm run dev -- -p 8001 -H 0.0.0.0"), Some(8001));
+        assert_eq!(port_in("python3 -m http.server 8003 --bind 0.0.0.0"), Some(8003));
+        assert_eq!(port_in("PORT=8004 node server.js"), Some(8004));
+        assert_eq!(port_in("flask run --host 0.0.0.0 -p 5000"), Some(5000));
+        assert_eq!(port_in("python3 app.py"), None);
+        assert_eq!(port_in("pip install x -p 22"), None, "a privileged port is no dev server");
+    }
+
+    #[tokio::test]
+    async fn a_port_somebody_holds_is_refused_before_anything_starts() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let e = refuse_taken_port(port).await.unwrap_err().message;
+        assert!(e.contains("already in use") && e.contains("free in 8000-8010"), "{e}");
+        drop(held);
+        assert!(refuse_taken_port(port).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_server_is_up_only_when_its_port_answers_and_it_stays_alive() {
+        let policy = test_policy();
+        // listens (python is what the tests already rely on) and stays
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let id = spawn_job(&policy, &format!("python3 -m http.server {port} --bind 127.0.0.1"), &std::env::temp_dir()).unwrap();
+        assert!(await_listening(id, port, Duration::from_secs(15)).await.unwrap().contains("listening"));
+        job(&json!({"job_id": id})).unwrap().1.kill.notify_one();
+        // a program that says it started and dies is not a server, even when something else holds the port
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let id = spawn_job(&policy, "echo started; sleep 1; echo 'address already in use' >&2; exit 1", &std::env::temp_dir()).unwrap();
+        let err = await_listening(id, busy, Duration::from_secs(15)).await.unwrap_err().message;
+        assert!(err.contains("exited") && err.contains("already in use"), "{err}");
     }
 
     #[tokio::test]

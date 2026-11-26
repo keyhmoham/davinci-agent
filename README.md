@@ -297,6 +297,20 @@ started* and what it printed is kept. A failure explains itself: `command not fo
 comes with a one-line hint that says what to install. A step that names a directory ("… in proj") runs in it. Without sandbox mode the models are
 told the truth instead: one allowlisted read-only command at a time, nothing installable.
 
+#### Work that is checked, not assumed
+
+What the agent starts or builds is verified by asking it, not by trusting the step that made it:
+
+- a **server** that names its port is refused up front when the port is taken (with the free ones listed), must be *listening and still alive* a few
+  seconds later, and the planner is told which of 8000–8010 are in use;
+- a **served page** is requested after it starts (`expect: http://localhost:8001 serves "Acme"`): localhost only, it waits for a dev server's first
+  build, and it reads the *visible* text — a scaffold's default page with the project's name in its `<title>` does not pass;
+- **files** are checked as they are written (JSON, TOML, HTML, Python, shell, JS, TypeScript/JSX with the project's own compiler), and a file is written
+  knowing the files of its project written before it (a module's tests see the module);
+- a **failed command** reaches the planner as the end of its output plus the distinct error lines above it (a test run's real cause is in the middle),
+  a **patch** cannot lose work it does not replace, and an **edit** is bound with the file's text in front of the model and checked against it;
+- the **answer** to a question a tool or an MCP server answered with data is written from it, not shown as raw JSON.
+
 Simple phrasings of the file operations bind directly and cost no model tokens (`move a.txt to b/a.txt`, `delete notes/old.txt`,
 `replace "foo()" with "bar()" in src/lib.rs`, `find files matching **/*.rs`, ``run `cargo test` ``). The container image ships git, ripgrep, curl, jq, make, gcc, python3 and friends
 (`DEV_TOOLS=0` builds it without them); its root is read-only, so use a virtualenv or project-local installs in the workspace.

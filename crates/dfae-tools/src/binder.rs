@@ -38,7 +38,7 @@ static SPLIT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 static REASONING: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(explain|why|summari[sz]e|analy[sz]e|compare|describe|recommend|fix|improve|review|translate|rewrite|interpret|decide|should|suggest|tell\s+me\s+(?:what|why|how|about|whether|if|which|who|when)|investigate|diagnose|debug|optimi[sz]e|plan|which|identify|extract|count|determine|whether|figure|find out|how many|what's wrong)\b").unwrap()
+    Regex::new(r"(?i)\b(explain|why|summari[sz]e|analy[sz]e|compare|describe|recommend|fix|improve|review|translate|rewrite|interpret|decide|should|suggest|tell\s+me\s+(?:what|why|how|about|whether|if|which|who|when)|state|report|provide|confirm|answer|respond|present|investigate|diagnose|debug|optimi[sz]e|plan|which|identify|extract|count|determine|whether|figure|find out|how many|what's wrong)\b").unwrap()
 });
 
 fn split_clauses(req: &str) -> Vec<(String, bool)> {
@@ -211,6 +211,12 @@ mod tests {
 
     fn ent(label: &str, text: &str) -> Entity {
         Entity { label: label.into(), text: text.into(), start: None, end: None, score: 1.0, source: "t".into() }
+    }
+
+    #[test]
+    fn writing_up_a_result_is_not_fetching_an_address() {
+        assert!(bind("state that the API is available at https://example.com/api and provide an example curl command").is_none());
+        assert!(bind("fetch https://example.com/api").is_some());
     }
 
     #[test]
