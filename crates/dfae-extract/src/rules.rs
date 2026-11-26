@@ -24,7 +24,7 @@ static RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
         r("ip address", r"\b(?:\d{1,3}\.){3}\d{1,3}\b", 0, 1.0),
         r(
             "file path",
-            r#"(?:^|[\s"'`(=])((?:\.{1,2}/|/)?(?:[\w.\-]+/)+[\w.\-]*[\w\-]|/[\w.\-]+|[\w\-]+\.(?:txt|md|json|toml|ya?ml|rs|py|js|ts|csv|log|conf|cfg|ini|sh|sql|html|xml|lock|env))"#,
+            r#"(?:^|[\s"'`(=])((?:\.{1,2}/|/)?(?:[\w.\-]+/)+[\w.\-]*[\w\-]|/[\w.\-]+|[\w\-]+\.(?:txt|md|json|toml|ya?ml|rs|py|js|ts|csv|log|conf|cfg|ini|sh|sql|html|css|xml|lock|env|java|go|rb|php)\b|\.(?:gitignore|gitattributes|dockerignore|editorconfig|npmrc|bashrc|zshrc|prettierrc|eslintrc|babelrc|htaccess|env(?:\.[\w\-]+)?)\b|(?:Dockerfile|Makefile|Procfile)\b)"#,
             1,
             1.0,
         ),
@@ -174,6 +174,16 @@ mod tests {
         assert!(l.contains(&("url".into(), "https://example.com/docs".into())));
         assert!(l.iter().any(|(k, _)| k == "expression"), "{l:?}");
         assert!(!l.iter().any(|(k, v)| k == "file path" && v.contains("example.com")));
+    }
+
+    #[test]
+    fn dotfiles_and_well_known_extensionless_files_are_file_paths() {
+        let es = RuleExtractor::new().run("write .gitignore for a Python project and a Dockerfile, then edit site/style.css and .env.local");
+        let l = labels(&es);
+        for p in [".gitignore", "Dockerfile", "site/style.css", ".env.local"] {
+            assert!(l.contains(&("file path".into(), p.into())), "{p}: {l:?}");
+        }
+        assert!(!l.iter().any(|(k, v)| k == "file path" && v == "Python"), "{l:?}");
     }
 
     #[test]

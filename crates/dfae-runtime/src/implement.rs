@@ -239,19 +239,25 @@ impl Inner {
         let mut req = self.gen_request(tier, prompts::CONTENT_SYSTEM, user.clone(), "content");
         req.temperature = 0.2;
         req.frequency_penalty = 0.4;
+        // a file is a few hundred tokens: a model still writing after this is looping or rambling, and every token costs seconds
+        req.max_tokens = req.max_tokens.min(2048);
         let text = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
-        if !degenerate(&text) {
+        // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
+        let why =
+            if degenerate(&text) { Some("it repeated the same lines".to_string()) } else { crate::syntax::problem(std::path::Path::new(path), &text).await };
+        let Some(why) = why else {
             return (!text.trim().is_empty()).then_some(text);
-        }
-        // a loop ("*.egg-info" a hundred times): once more, hotter and with a heavier penalty, told what went wrong
+        };
+        // once more, hotter and with a heavier penalty, told what went wrong and to keep it short
         let mut req = self.gen_request(
             tier,
             prompts::CONTENT_SYSTEM,
-            format!("{user}YOUR PREVIOUS VERSION REPEATED THE SAME LINES. Write the file once, short and complete, with no repetition.\n"),
+            format!("{user}YOUR PREVIOUS VERSION WAS REJECTED: {why}. Write the whole file again, shorter (a web page under 100 lines, one small stylesheet inside it, no external files), complete, with no repetition.\n"),
             "content",
         );
-        req.temperature = 0.6;
+        req.temperature = 0.5;
         req.frequency_penalty = 0.8;
+        req.max_tokens = req.max_tokens.min(2048);
         let again = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
         let text = if degenerate(&again) { collapse_repeats(&again) } else { again };
         (!text.trim().is_empty()).then_some(text)
@@ -338,6 +344,12 @@ impl Inner {
                     "{} is not a value: write the real text, or {{{{<step id>}}}} / {{{{prev_code}}}} to use an earlier result",
                     bad.join(", ")
                 ));
+            }
+            // what a step prints is never a path: a small model told it may use {{s1}} puts it everywhere, a file name included
+            for k in ["path", "cwd", "from", "to", "dir", "directory"] {
+                if a.get(k).and_then(|v| v.as_str()).is_some_and(|p| p.contains("{{")) {
+                    return Err(format!("`{k}` must be written out as a path, not taken from a step's output ({{{{…}}}})"));
+                }
             }
             // a `{{id}}` template may only name a step this one depends on
             for r in planner::template_refs(&Value::Object(a.clone())) {
