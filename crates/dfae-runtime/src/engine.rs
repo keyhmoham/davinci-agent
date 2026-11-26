@@ -677,6 +677,7 @@ impl Inner {
             messages: vec![Message::user(user)],
             max_tokens: max,
             temperature: 0.1,
+            frequency_penalty: 0.0,
             json: false,
             purpose: purpose.into(),
             cache: false,

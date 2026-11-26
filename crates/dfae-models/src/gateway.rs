@@ -213,6 +213,7 @@ mod tests {
             messages: vec![Message::user("u")],
             max_tokens: 100,
             temperature: 0.0,
+            frequency_penalty: 0.0,
             json: true,
             purpose: "plan".into(),
             cache: false,

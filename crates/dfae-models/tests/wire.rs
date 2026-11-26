@@ -24,6 +24,7 @@ fn req(json_mode: bool) -> GenerationRequest {
         messages: vec![Message::user("hello")],
         max_tokens: 50,
         temperature: 0.0,
+        frequency_penalty: 0.0,
         json: json_mode,
         purpose: "t".into(),
         cache: false,

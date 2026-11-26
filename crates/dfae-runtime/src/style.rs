@@ -18,7 +18,9 @@ static BOUNDARY: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[.!?]\s+").unwr
 /// Drop a leading "Sure!" and trailing offers/questions ("Let me know if you need anything else.").
 /// Never empties the text.
 pub fn compact(text: &str) -> String {
-    let mut t = text.trim().to_string();
+    // the evidence is shown to the model inside <data> wrappers; a small model sometimes copies them into its answer
+    static DATA_TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"</?data(?:\s[^>]*)?>").unwrap());
+    let mut t = DATA_TAG.replace_all(text.trim(), "").trim().to_string();
     if let Some(m) = OPENER.find(&t)
         && m.end() < t.len()
     {
@@ -70,5 +72,11 @@ mod tests {
         assert_eq!(compact(ok), ok);
         assert_eq!(compact("  hello  "), "hello");
         assert_eq!(compact("Of course"), "Of course");
+    }
+
+    #[test]
+    fn copied_data_wrappers_are_removed() {
+        assert_eq!(compact("Done: <data src=\"s1\">README.md created</data> and .gitignore"), "Done: README.md created and .gitignore");
+        assert_eq!(compact("<data>x</data>"), "x");
     }
 }

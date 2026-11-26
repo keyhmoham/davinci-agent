@@ -36,6 +36,8 @@ pub struct GenerationRequest {
     pub messages: Vec<Message>,
     pub max_tokens: u32,
     pub temperature: f32,
+    /// Discourage repeating what was already written (0 = off). Small models fall into loops writing long files.
+    pub frequency_penalty: f32,
     /// Ask the backend to constrain output to a JSON object.
     pub json: bool,
     /// What the call is for (`plan`, `step`, `answer`, ...); used by the ledger.

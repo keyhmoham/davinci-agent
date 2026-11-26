@@ -296,4 +296,15 @@ mod tests {
         assert!(bind("what is the meaning of life").is_none());
         assert!(bind("read the notes").is_none());
     }
+
+    #[test]
+    fn a_planners_unquoted_search_sentence_binds_without_a_model() {
+        let c = bind("search the workspace for TODO with 2 lines of context").unwrap();
+        assert_eq!((c[0].tool.as_str(), c[0].args["pattern"].as_str(), c[0].args["context"].as_u64()), ("fs_search", Some("TODO"), Some(2)));
+        let c = bind("list the files that mention TODO").unwrap();
+        assert_eq!((c[0].tool.as_str(), c[0].args["pattern"].as_str()), ("fs_search", Some("TODO")));
+        // the web is not the workspace
+        let c = bind("search the web for rust news");
+        assert!(c.map(|c| c[0].tool != "fs_search").unwrap_or(true));
+    }
 }

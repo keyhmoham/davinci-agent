@@ -64,6 +64,9 @@ impl LanguageModel for OpenAiCompat {
             "temperature": req.temperature,
             "stream": false,
         });
+        if req.frequency_penalty > 0.0 {
+            body["frequency_penalty"] = json!(req.frequency_penalty);
+        }
         let schema = req.schema.as_ref().filter(|_| self.schema_ok.load(std::sync::atomic::Ordering::Relaxed));
         if let Some(schema) = schema {
             body["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "reply", "strict": false, "schema": schema}});

@@ -8,6 +8,7 @@
 //! SLM_BASE_URL=http://localhost:11434/v1 SLM_MODEL=qwen2.5:3b \
 //!   cargo test -p dfae-runtime --test live_slm -- --ignored --nocapture --test-threads=1
 //! ```
+//! `LIVE_TRACE=1` also prints every call to the SLM (what it was asked, how long it took, what it said).
 //! Optional: `DECISION_BASE_URL` / `DECISION_MODEL` to use the open decision model as well (otherwise the built-in rules decide).
 
 use dfae_core::*;
@@ -96,6 +97,36 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// `LIVE_TRACE=1` prints every call to the model: what it was asked, how long it took, what it said.
+struct Traced(OpenAiCompat);
+
+#[async_trait::async_trait]
+impl LanguageModel for Traced {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    async fn generate(&self, req: GenerationRequest) -> Result<GenerationResponse, ModelError> {
+        let (purpose, ask) = (req.purpose.clone(), req.messages.last().map(|m| m.content.clone()).unwrap_or_default());
+        let started = std::time::Instant::now();
+        let r = self.0.generate(req).await;
+        if std::env::var("LIVE_TRACE").is_ok() {
+            let tail = |s: &str, n: usize| -> String { s.chars().take(n).collect::<String>().replace('\n', " ⏎ ") };
+            match &r {
+                Ok(g) => eprintln!(
+                    "    [slm {purpose} {:.1}s in={} out={}] ASKED: {} …\n        SAID: {}",
+                    started.elapsed().as_secs_f32(),
+                    g.usage.prompt_tokens,
+                    g.usage.completion_tokens,
+                    tail(&ask, 260),
+                    tail(&g.text, 260)
+                ),
+                Err(e) => eprintln!("    [slm {purpose} {:.1}s] ERROR {e}", started.elapsed().as_secs_f32()),
+            }
+        }
+        r
+    }
+}
+
 fn engine(ws: &std::path::Path, plan: &str) -> (Engine, ScriptedModel) {
     let mut cfg = Config::default();
     cfg.workspace = ws.to_path_buf();
@@ -103,7 +134,7 @@ fn engine(ws: &std::path::Path, plan: &str) -> (Engine, ScriptedModel) {
     cfg.slm.provider = "openai".into();
     cfg.slm.base_url = std::env::var("SLM_BASE_URL").expect("SLM_BASE_URL");
     cfg.slm.model = std::env::var("SLM_MODEL").unwrap_or_else(|_| "qwen2.5:3b".into());
-    let slm = OpenAiCompat::new(&cfg.slm.base_url, &cfg.slm.model, None, Duration::from_secs(600));
+    let slm = Traced(OpenAiCompat::new(&cfg.slm.base_url, &cfg.slm.model, None, Duration::from_secs(600)));
     let strong = ScriptedModel::new("scripted-planner", vec![plan]).caching();
     let store = Arc::new(InMemoryStore::new());
     let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.to_path_buf()));

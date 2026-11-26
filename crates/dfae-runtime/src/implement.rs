@@ -56,6 +56,35 @@ pub(crate) fn strip_fences(text: &str) -> String {
     t.to_string()
 }
 
+/// A long text whose lines are mostly copies of each other: a small model stuck in a loop.
+pub(crate) fn degenerate(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.len() < 30 {
+        return false;
+    }
+    let unique: std::collections::HashSet<&str> = lines.iter().copied().collect();
+    (unique.len() as f64) / (lines.len() as f64) < 0.4
+}
+
+/// Keep each line at most twice in a row (and three times in all): what is left of a loop.
+pub(crate) fn collapse_repeats(text: &str) -> String {
+    let mut seen: std::collections::HashMap<&str, u32> = Default::default();
+    let mut out: Vec<&str> = Vec::new();
+    for l in text.lines() {
+        let key = l.trim();
+        if key.is_empty() {
+            out.push(l);
+            continue;
+        }
+        let n = seen.entry(key).or_insert(0);
+        *n += 1;
+        if *n <= 3 && !(out.len() >= 2 && out[out.len() - 1].trim() == key && out[out.len() - 2].trim() == key) {
+            out.push(l);
+        }
+    }
+    out.join("\n").trim_end().to_string()
+}
+
 fn object(v: &Value) -> Map<String, Value> {
     v.as_object().cloned().unwrap_or_default()
 }
@@ -147,7 +176,11 @@ impl Inner {
         let inputs = Self::inputs_text(deps, if paid { 120 } else { 900 });
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
         let goal = ctx.rec.lock().await.goal.clone();
-        let step_text = format!("{}\nFULL REQUEST (for context): {}", step.description, tokens::truncate_tokens(&goal, 300));
+        let step_text = if step.description.split_whitespace().count() < 9 {
+            format!("{}\nFULL REQUEST (background only; other steps do the other parts): {}", step.description, tokens::truncate_tokens(&goal, 300))
+        } else {
+            step.description.clone()
+        };
         let user = prompts::bind_user(&sig, &step_text, &ents, &Value::Object(prebound.clone()).to_string(), &inputs, &values, problem, rejected);
         let mut req = self.gen_request(tier, prompts::BIND_SYSTEM, user, "bind");
         req.json = true;
@@ -186,12 +219,13 @@ impl Inner {
         }
         let goal = ctx.rec.lock().await.goal.clone();
         let values = ctx.base_ctx.lock().artifacts.iter().map(|(n, _, d)| format!("{{{{{n}}}}} = {d}")).collect::<Vec<_>>().join("; ");
-        let mut user = format!(
-            "FILE: {}\nREQUEST: {}\nSTEP: {}\n",
-            args.get("path").and_then(|p| p.as_str()).unwrap_or(""),
-            tokens::truncate_tokens(&goal, 400),
-            step.description
-        );
+        // The step is the instruction. The whole request is background, and only when the step alone is too thin to go on:
+        // with two files in one request a small model writes the wrong one into the wrong file.
+        let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+        let mut user = format!("FILE TO WRITE (write only this one): {path}\nSTEP: {}\n", step.description);
+        if step.description.split_whitespace().count() < 9 {
+            user.push_str(&format!("BACKGROUND (the whole request; other files in it are written by other steps): {}\n", tokens::truncate_tokens(&goal, 300)));
+        }
         let inputs = Self::inputs_text(deps, if tier == Tier::Strong { 150 } else { 1500 });
         if !inputs.is_empty() {
             user.push_str(&format!("INPUTS:\n{inputs}\n"));
@@ -202,10 +236,24 @@ impl Inner {
         if let Some(f) = feedback {
             user.push_str(&format!("YOUR PREVIOUS VERSION WAS REJECTED: {f}\nWrite the whole file again and fix that.\n"));
         }
-        let mut req = self.gen_request(tier, prompts::CONTENT_SYSTEM, user, "content");
+        let mut req = self.gen_request(tier, prompts::CONTENT_SYSTEM, user.clone(), "content");
         req.temperature = 0.2;
-        let text = self.generate_text(ctx, tier, req).await.ok()?;
-        let text = strip_fences(&text);
+        req.frequency_penalty = 0.4;
+        let text = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
+        if !degenerate(&text) {
+            return (!text.trim().is_empty()).then_some(text);
+        }
+        // a loop ("*.egg-info" a hundred times): once more, hotter and with a heavier penalty, told what went wrong
+        let mut req = self.gen_request(
+            tier,
+            prompts::CONTENT_SYSTEM,
+            format!("{user}YOUR PREVIOUS VERSION REPEATED THE SAME LINES. Write the file once, short and complete, with no repetition.\n"),
+            "content",
+        );
+        req.temperature = 0.6;
+        req.frequency_penalty = 0.8;
+        let again = strip_fences(&self.generate_text(ctx, tier, req).await.ok()?);
+        let text = if degenerate(&again) { collapse_repeats(&again) } else { again };
         (!text.trim().is_empty()).then_some(text)
     }
 
@@ -468,7 +516,7 @@ mod tests {
 
 #[cfg(test)]
 mod content_tests {
-    use super::strip_fences;
+    use super::{collapse_repeats, degenerate, strip_fences};
 
     #[test]
     fn a_file_comes_out_of_whatever_a_small_model_wraps_around_it() {
@@ -479,5 +527,17 @@ mod content_tests {
         assert_eq!(strip_fences(&format!("Here is the page you asked for:\n{page}")), page);
         assert_eq!(strip_fences("```\nport = 1\n```"), "port = 1");
         assert_eq!(strip_fences("plain text file"), "plain text file");
+    }
+
+    #[test]
+    fn a_loop_is_recognised_and_cut_down() {
+        let looped = format!("# ignore\n*.pyc\n{}", "*.egg-info\n".repeat(200));
+        assert!(degenerate(&looped));
+        assert!(!degenerate("a\nb\nc"));
+        let ok: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        assert!(!degenerate(&ok));
+        let cut = collapse_repeats(&looped);
+        assert_eq!(cut.matches("*.egg-info").count(), 2);
+        assert!(cut.starts_with("# ignore\n*.pyc"));
     }
 }
