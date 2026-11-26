@@ -281,7 +281,7 @@ pub struct Step {
     /// What success looks like, in words (from the planner); the decision model judges the result against it.
     #[serde(default)]
     pub expect: Option<String>,
-    /// The planner wants the external model to do this reasoning step itself.
+    /// The planner wants the planner model to do this reasoning step itself.
     #[serde(default)]
     pub planner: bool,
     /// How the local system turned the intent into an action (provenance), e.g. `rules`, `rules+worker`.
@@ -295,7 +295,7 @@ fn default_step_status() -> StepStatus {
 
 impl Step {
     /// Work for the self-hosted models: a brief step (not yet implemented) or one the local system implemented,
-    /// unless the planner asked for the external model.
+    /// unless the planner asked for the planner model.
     pub fn runs_local(&self) -> bool {
         (self.brief || self.how.is_some()) && !self.planner
     }
@@ -374,7 +374,7 @@ pub struct Plan {
 pub struct CostEstimate {
     pub model_calls: u32,
     pub tokens: u64,
-    /// The calls go to the external (paid) model; otherwise they run on a self-hosted one and are free.
+    /// The calls go to the planner model; otherwise they run on a self-hosted one and are free.
     #[serde(default)]
     pub external: bool,
 }

@@ -123,7 +123,7 @@ impl Inner {
 
         // ---- 4b. conversation: nothing to run, so nothing to plan ----------------------
         if !is_agent && calls.is_none() && skill.is_none() && !routing.needs_tools && req.mode == ModeRequest::Auto {
-            // a reply needs no plan: the local models answer it (planning is what the external model is for)
+            // a reply needs no plan: the local models answer it (planning is what the planner model is for)
             return self.run_chat(ctx, &goal, false, ExecMode::Assisted).await;
         }
 
@@ -443,7 +443,7 @@ impl Inner {
     /// A conversational turn: one reply, no planning. `gap` = a tool-shaped request no tool fits.
     async fn run_chat(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, gap: bool, mode: ExecMode) -> Result<(), String> {
         let reason = if mode == ExecMode::Escalated {
-            "conversation of medium or higher complexity: the external model answers".to_string()
+            "conversation of medium or higher complexity: the planner model answers".to_string()
         } else {
             "conversation: no tool needed, so no plan".to_string()
         };
@@ -634,7 +634,7 @@ impl Inner {
 
         // The decision model said this needs no plan: one step, made here without asking anyone to plan it. The best-fitting
         // tool (or none: the local model writes the reply) is the step; the local system binds its arguments just before it
-        // runs. If that is not enough, the step fails and the external model re-plans with the actual result in hand.
+        // runs. If that is not enough, the step fails and the planner model re-plans with the actual result in hand.
         if mode == ExecMode::Assisted && self.models.has(Tier::Planner) && !is_member {
             let mut step = match top_tool.filter(|t| ctx.in_scope(t)) {
                 Some(t) => Step::tool("s1", &t, goal, json!({})),
@@ -656,13 +656,13 @@ impl Inner {
         for attempt in 0..2 {
             let ctx_text = self.context_text(ctx, false, tier).await;
             // a self-hosted model gets parameter help and worked examples; the paid one gets the leanest prompt
-            // planning phase: the external model writes a brief plan of intents (no arguments: the local system
+            // planning phase: the planner model writes a brief plan of intents (no arguments: the local system
             // supplies them step by step); a self-hosted planner writes a concrete plan as before
             let brief = tier == Tier::Planner;
             if brief {
                 self.emit(
                     ctx,
-                    EventKind::Phase { phase: "planning".into(), detail: "the external model writes a brief plan; the local system will carry it out".into() },
+                    EventKind::Phase { phase: "planning".into(), detail: "the planner model writes a brief plan; the local system will carry it out".into() },
                 )
                 .await;
             }
@@ -685,7 +685,7 @@ impl Inner {
                 }
                 Err(e) => {
                     last_err = e;
-                    // the external model cannot be reached (down, rate-limited): the self-hosted one plans instead
+                    // the planner model cannot be reached (down, rate-limited): the worker model plans instead
                     if tier == Tier::Planner
                         && self.models.has(Tier::Worker)
                         && self.cfg.economy.plan_fallback_worker
@@ -693,7 +693,7 @@ impl Inner {
                     {
                         self.emit(
                             ctx,
-                            EventKind::Warning { message: format!("the external model is unavailable ({last_err}); the self-hosted model plans instead") },
+                            EventKind::Warning { message: format!("the planner model is unavailable ({last_err}); the worker model plans instead") },
                         )
                         .await;
                         tier = Tier::Worker;
@@ -716,7 +716,7 @@ impl Inner {
             }
         }
         let hint = if self.models.has(Tier::Planner) && self.models.has(Tier::Worker) && !self.cfg.economy.plan_fallback_worker {
-            " (planning is always the external model's; DFAE_PLAN_FALLBACK=worker lets the local model plan when it cannot be reached)"
+            " (planning is always the planner model's; DFAE_PLAN_FALLBACK=worker lets the local model plan when it cannot be reached)"
         } else {
             ""
         };
@@ -1023,7 +1023,7 @@ impl Inner {
         ))
     }
 
-    /// Put the routing questions to the external model too and record how far the decision model agrees with it.
+    /// Put the routing questions to the planner model too and record how far the decision model agrees with it.
     async fn shadow_evaluate(&self, ctx: &Arc<TaskCtx>, state: &DecisionState, routing: &Routing) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.models.has(Tier::Planner) {

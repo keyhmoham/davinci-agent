@@ -454,7 +454,7 @@ impl LocalDecider {
                 let (choice, conf) = if f.direct_bindable {
                     ("direct", if f.skill_score.unwrap_or(0.0) > 0.0 { 0.92 } else { 0.88 })
                 } else if f.planner_available && f.skill_score.is_none() && f.complexity >= f.plan_min_complexity.max(0.0) && f.plan_min_complexity > 0.0 {
-                    // the policy: medium and complex work is planned by the external model
+                    // the policy: medium and complex work is planned by the planner model
                     ("escalated", 0.9)
                 } else if f.complexity >= 0.85 && f.planner_available {
                     ("escalated", 0.6)

@@ -268,7 +268,7 @@ pub(crate) fn render_state(s: &DecisionState) -> String {
         ));
         if m.plan_min_complexity > 0.0 {
             out.push(format!(
-                "POLICY: planning is always done by the external model (when one exists) and carried out by the local system. Choose escalated for any request that needs a plan (several dependent steps, building or serving something, results that decide the next step; complexity {:.2} or more is a hint). Choose assisted only for one quick action or a reply that needs no plan.",
+                "POLICY: planning is always done by the planner model (when one exists) and carried out by the local system. Choose escalated for any request that needs a plan (several dependent steps, building or serving something, results that decide the next step; complexity {:.2} or more is a hint). Choose assisted only for one quick action or a reply that needs no plan.",
                 m.plan_min_complexity
             ));
         }

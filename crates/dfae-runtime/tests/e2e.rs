@@ -374,10 +374,10 @@ async fn the_paid_budget_meters_the_external_model_and_not_the_local_one() {
     let t = run(&r, "Read a.txt and explain it and summarise it").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     assert_eq!((t.usage.model_calls, t.usage.worker_calls), (0, 4), "plan + 2 steps + answer, all local");
-    // the same plan on the external model is refused up front by the plan gate
+    // the same plan on the planner model is refused up front by the plan gate
     let r = rig(false, true, vec![], |c| c.budget.max_model_calls = 2);
     std::fs::write(r.ws.path().join("a.txt"), "alpha").unwrap();
-    // (reasoning the planner asks the external model to do itself is what the paid budget meters)
+    // (reasoning the planner asks the planner model to do itself is what the paid budget meters)
     r.planner.push(&plan_json(json!({"steps": [
         {"id": "s1", "tool": "fs_read", "args": {"path": "a.txt"}},
         {"id": "s2", "tool": null, "do": "explain", "after": ["s1"], "planner": true},

@@ -49,7 +49,7 @@ fn kind_str(k: ErrorKind) -> String {
     serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "other".into())
 }
 
-/// Outputs shorter than this are summarised mechanically: reading them locally would save the external model nothing.
+/// Outputs shorter than this are summarised mechanically: reading them locally would save the planner model nothing.
 const CONDENSE_MIN_TOKENS: usize = 1500;
 
 /// How much of a step's output is kept in its summary. Roomy: it is trimmed to the tier that reads it.
@@ -322,7 +322,7 @@ impl Inner {
             Ok(mut out) if step.how.is_some() && step.expect.is_some() => {
                 let mut verdict = self.judge_step(ctx, &step, &out.content).await;
                 // a self-hosted model that wrote the step gets one chance to put it right, told what was wrong, before the
-                // external planner hears of it
+                // planner model hears of it
                 if let Some(why) = verdict.clone()
                     && step.kind == StepKind::Reasoning
                     && self.step_tier(&step) == Some(Tier::Worker)
@@ -537,9 +537,9 @@ impl Inner {
         }
         let text = match self.generate_text(ctx, tier, req.clone()).await {
             Ok(t) => t,
-            // the external model cannot be reached: the self-hosted one answers instead of the user getting an error
+            // the planner model cannot be reached: the self-hosted one answers instead of the user getting an error
             Err(e) if paid && self.models.has(Tier::Worker) && e.contains("model request failed") => {
-                self.emit(ctx, EventKind::Warning { message: format!("the external model is unavailable ({e}); the self-hosted model answers instead") }).await;
+                self.emit(ctx, EventKind::Warning { message: format!("the planner model is unavailable ({e}); the self-hosted model answers instead") }).await;
                 let mut local = self.gen_request(Tier::Worker, prompts::CHAT_SYSTEM, String::new(), "chat");
                 local.messages = req.messages.clone();
                 local.temperature = 0.6;
@@ -663,7 +663,7 @@ impl Inner {
         Ok(StepOutput { content, evidence })
     }
 
-    /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the external model
+    /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the planner model
     /// reads this instead of a mechanical cut of the first lines. Kept only if it states nothing the output lacks.
     async fn condense(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> Option<String> {
         if !self.cfg.economy.condense || step.kind != StepKind::Tool || !self.models.has(Tier::Worker) || tokens::estimate_tokens(content) < CONDENSE_MIN_TOKENS

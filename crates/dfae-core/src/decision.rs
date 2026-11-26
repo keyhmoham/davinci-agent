@@ -183,7 +183,7 @@ pub struct ModeFacts {
     pub complexity: f32,
     pub risk: Option<Risk>,
     pub task_type: String,
-    /// Policy: from this complexity, medium and complex work is planned by the external model (if there is one).
+    /// Policy: from this complexity, medium and complex work is planned by the planner model (if there is one).
     #[serde(default)]
     pub plan_min_complexity: f32,
 }

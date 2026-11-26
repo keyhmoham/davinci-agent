@@ -57,6 +57,9 @@ pub struct ModelConfig {
     /// Output limit when the model writes a file's content (a page, code, data): generous, the content is the product.
     pub content_max_tokens: u32,
     pub timeout_secs: u64,
+    /// `<PREFIX>_PROMPT_CACHE=on|off`: whether an OpenAI-compatible endpoint is known to bill a repeated prompt prefix at a
+    /// fraction (Anthropic and api.openai.com are known to; `None` leaves it to the provider's own knowledge).
+    pub prompt_cache: Option<bool>,
 }
 
 /// Where hosted models are reached unless a deployment says otherwise (an OpenAI-compatible gateway).
@@ -70,14 +73,17 @@ impl ModelConfig {
     /// model are configured the same way.
     fn from_env(prefix: &str, default_model: &str, max_tokens: u32, content_max_tokens: u32, timeout_secs: u64) -> Self {
         let var = |k: &str| env(&format!("{prefix}_{k}"));
+        let provider = var("PROVIDER").unwrap_or_else(|| if var("API_KEY").is_some() { "openai".into() } else { "none".into() });
         Self {
-            provider: var("PROVIDER").unwrap_or_else(|| if var("API_KEY").is_some() { "openai".into() } else { "none".into() }),
-            base_url: var("BASE_URL").unwrap_or_else(|| DEFAULT_MODEL_BASE_URL.into()),
+            base_url: var("BASE_URL")
+                .unwrap_or_else(|| if provider == "anthropic" { "https://api.anthropic.com".into() } else { DEFAULT_MODEL_BASE_URL.into() }),
+            provider,
             model: var("MODEL").unwrap_or_else(|| default_model.into()),
             api_key: var("API_KEY"),
             max_tokens: var("MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(max_tokens),
             content_max_tokens: var("CONTENT_MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(content_max_tokens),
             timeout_secs: var("TIMEOUT_SECS").and_then(|v| v.parse().ok()).unwrap_or(timeout_secs),
+            prompt_cache: var("PROMPT_CACHE").map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")),
         }
     }
 }
@@ -106,7 +112,7 @@ pub struct EconomyConfig {
     /// more (`NEED <step>`). Off by default: it trades a possible extra call for
     /// smaller prompts and should be measured on your workload before enabling.
     pub lazy_context: bool,
-    /// The external planner's system prompt carries the whole stable tool catalogue and examples, so a provider
+    /// The planner model's system prompt carries the whole stable tool catalogue and examples, so a provider
     /// with prompt caching bills it at a fraction after the first call (`DFAE_PLAN_PREFIX=narrow` lists only the
     /// tools judged relevant instead).
     pub plan_prefix: bool,
@@ -116,10 +122,10 @@ pub struct EconomyConfig {
     /// Off by default: the planner pays for the reply in (five-times-priced) output tokens even when a local model would
     /// have written an equally good one for free. For deployments whose self-hosted model writes poor answers.
     pub plan_report: bool,
-    /// Planning is always the external model's. When it cannot be reached the task fails with the reason — unless
+    /// Planning is always the planner model's. When it cannot be reached the task fails with the reason — unless
     /// `DFAE_PLAN_FALLBACK=worker`, which lets the self-hosted model plan instead.
     pub plan_fallback_worker: bool,
-    /// The final answer is composed by the self-hosted model and checked against the evidence; the external model
+    /// The final answer is composed by the self-hosted model and checked against the evidence; the planner model
     /// is asked only when that check fails.
     pub answer_local_first: bool,
     /// The plan prompt shows what the workspace contains, so the planner does not spend steps exploring it.
@@ -175,7 +181,7 @@ pub struct Config {
     /// Append every decision and what became of it to this JSONL file (`DFAE_DECISION_LOG`): the training and evaluation
     /// set for the decision model (and for the thresholds around it).
     pub decision_log: Option<PathBuf>,
-    /// Share of requests that the external model also answers the routing questions for, to measure the decision model
+    /// Share of requests that the planner model also answers the routing questions for, to measure the decision model
     /// against it (`DFAE_SHADOW_EVAL`, 0..1; default 0 = off). It spends external tokens.
     pub shadow_eval: f32,
     pub max_parallel: usize,
@@ -194,6 +200,15 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
+        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180);
+        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90);
+        // one gateway, one key: a worker with no key of its own uses the planner's when they share an endpoint
+        if worker.api_key.is_none() && worker.base_url == planner.base_url && planner.api_key.is_some() {
+            worker.api_key = planner.api_key.clone();
+            if env("WORKER_PROVIDER").is_none() {
+                worker.provider = planner.provider.clone();
+            }
+        }
         Self {
             bind: env_or("DFAE_BIND", "0.0.0.0:8080"),
             api_token: env("DFAE_API_TOKEN"),
@@ -213,8 +228,8 @@ impl Config {
                 // the model is self-hosted and free per token, so it makes every decision; narrow it to save latency
                 kinds: env_or("DECISION_KINDS", "all").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             },
-            worker: ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90),
-            planner: ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180),
+            worker,
+            planner,
             budget: Budget {
                 max_steps: env_parse("DFAE_MAX_STEPS", 30),
                 max_model_calls: env_parse("DFAE_MAX_MODEL_CALLS", 12),
@@ -271,5 +286,53 @@ impl Default for Config {
         c.planner.provider = "none".into();
         c.api_token = None;
         c
+    }
+}
+
+#[cfg(test)]
+mod model_config_tests {
+    use super::*;
+
+    // Environment variables are process-wide: this is the only test that touches PLANNER_*/WORKER_*.
+    #[test]
+    fn planner_and_worker_are_configured_the_same_way_with_hosted_defaults() {
+        // SAFETY: single-threaded access to variables no other test reads
+        unsafe {
+            for k in [
+                "PLANNER_API_KEY",
+                "PLANNER_MODEL",
+                "PLANNER_PROVIDER",
+                "PLANNER_BASE_URL",
+                "WORKER_API_KEY",
+                "WORKER_MODEL",
+                "WORKER_PROVIDER",
+                "WORKER_BASE_URL",
+                "WORKER_MAX_TOKENS",
+            ] {
+                std::env::remove_var(k);
+            }
+        }
+        let c = Config::from_env();
+        assert_eq!((c.planner.provider.as_str(), c.worker.provider.as_str()), ("none", "none"), "no key, no hosted model");
+        assert_eq!((c.planner.model.as_str(), c.worker.model.as_str()), ("gpt-6-luna", "glm-5.3-flash"));
+        assert_eq!(c.planner.base_url, c.worker.base_url);
+        assert!(c.worker.max_tokens < c.worker.content_max_tokens, "ordinary work is held to a small limit, file content is not");
+        unsafe {
+            std::env::set_var("PLANNER_API_KEY", "k");
+        }
+        let c = Config::from_env();
+        assert_eq!((c.planner.provider.as_str(), c.worker.provider.as_str()), ("openai", "openai"), "the worker shares the planner's gateway and key");
+        assert_eq!(c.worker.api_key.as_deref(), Some("k"));
+        unsafe {
+            std::env::set_var("WORKER_BASE_URL", "https://other.example/v1");
+            std::env::set_var("WORKER_MAX_TOKENS", "300");
+        }
+        let c = Config::from_env();
+        assert_eq!((c.worker.provider.as_str(), c.worker.api_key.is_none(), c.worker.max_tokens), ("none", true, 300), "another endpoint needs its own key");
+        unsafe {
+            for k in ["PLANNER_API_KEY", "WORKER_BASE_URL", "WORKER_MAX_TOKENS"] {
+                std::env::remove_var(k);
+            }
+        }
     }
 }

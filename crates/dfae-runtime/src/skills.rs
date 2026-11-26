@@ -19,7 +19,7 @@ pub struct Skill {
     pub template: Plan,
     pub successes: u32,
     pub failures: u32,
-    /// The template is a plan of *intents* (written by the external model, steps carried out by the local system), not of
+    /// The template is a plan of *intents* (written by the planner model, steps carried out by the local system), not of
     /// concrete calls: replaying it spends no external tokens and produces fresh content for the new request. Because the
     /// intents are phrased for the request they came from, such a skill only matches a request that differs from the
     /// original in its slot values.
@@ -89,7 +89,7 @@ pub fn crystallize(goal: &str, entities: &[Entity], plan: &Plan) -> Option<Skill
     let mut template = plan.clone();
     template.goal = String::new();
     template.report = None;
-    // a plan the external model wrote as intents is kept as intents: what the local system generated while carrying it out
+    // a plan the planner model wrote as intents is kept as intents: what the local system generated while carrying it out
     // (the page it wrote, the code it composed) belongs to that one request and is generated again for the next
     let intent = plan.source == PlanSource::Planner && plan.steps.iter().all(|s| s.how.is_some());
     for s in &mut template.steps {

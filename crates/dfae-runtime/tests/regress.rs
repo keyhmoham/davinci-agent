@@ -1,6 +1,6 @@
 #![allow(clippy::field_reassign_with_default)]
 //! Regressions from real sessions: a landing page that was written but never served, replans that broke on duplicate ids,
-//! placeholders written into files, and an external model that was down.
+//! placeholders written into files, and an planner model that was down.
 
 use dfae_core::*;
 use dfae_decision::{Calibrator, Decider};
@@ -25,7 +25,7 @@ fn rig(planner: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
-    cfg.thresholds.plan_min_complexity = 2.0; // these are about the self-hosted path unless a test turns the external model on
+    cfg.thresholds.plan_min_complexity = 2.0; // these are about the self-hosted path unless a test turns the planner model on
     tweak(&mut cfg);
     let mut pc = PolicyConfig::from_toml("[shell]\nmode = \"sandbox\"\n").unwrap();
     pc.approvals = ApprovalMode::Never;
@@ -125,7 +125,7 @@ async fn when_the_external_model_is_down_the_self_hosted_one_plans_only_if_the_d
     assert_eq!(std::fs::read_to_string(r.ws.path().join("a.txt")).unwrap(), "hi");
     let warnings: Vec<String> =
         r.engine.backlog(&t.task_id).into_iter().filter_map(|e| if let EventKind::Warning { message } = e.kind { Some(message) } else { None }).collect();
-    assert!(warnings.iter().any(|m| m.contains("self-hosted model plans instead")), "{warnings:?}");
+    assert!(warnings.iter().any(|m| m.contains("worker model plans instead")), "{warnings:?}");
 }
 
 #[tokio::test]

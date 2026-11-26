@@ -216,7 +216,7 @@ impl Decider {
             ExecMode::Direct => format!("deterministic tool binding · decision confidence {conf:.2}"),
             ExecMode::Assisted => format!("quick action or reply: the local models handle it, no plan · decision confidence {conf:.2}"),
             ExecMode::Escalated => format!(
-                "needs a plan (complexity {:.2}): the external model plans it, the local system carries it out · decision confidence {conf:.2}",
+                "needs a plan (complexity {:.2}): the planner model plans it, the local system carries it out · decision confidence {conf:.2}",
                 facts.complexity
             ),
         };
@@ -403,10 +403,10 @@ mod tests {
         };
         let m = mode(0.5, false, true, ModeRequest::Auto).await;
         assert_eq!(m.mode, ExecMode::Escalated);
-        assert!(m.reason.contains("external model plans"), "{}", m.reason);
+        assert!(m.reason.contains("planner model plans"), "{}", m.reason);
         assert_eq!(mode(0.2, false, true, ModeRequest::Auto).await.mode, ExecMode::Assisted, "simple tasks stay local");
         assert_eq!(mode(0.9, true, true, ModeRequest::Auto).await.mode, ExecMode::Direct, "what binds deterministically is never sent out");
-        assert_eq!(mode(0.9, false, false, ModeRequest::Auto).await.mode, ExecMode::Assisted, "no external model, no escalation");
+        assert_eq!(mode(0.9, false, false, ModeRequest::Auto).await.mode, ExecMode::Assisted, "no planner model, no escalation");
         assert_eq!(mode(0.9, false, true, ModeRequest::Assisted).await.mode, ExecMode::Assisted, "an explicit choice wins");
     }
 

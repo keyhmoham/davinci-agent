@@ -788,7 +788,7 @@ fn draw_cognition(f: &mut Frame, area: Rect, app: &App) {
     l.push(Line::from(vec![
         label("budget "),
         Span::raw(format!(
-            "external calls {}/{} · local calls {}/{} · tool calls {}/{} · replans {}/{}",
+            "planner calls {}/{} · worker calls {}/{} · tool calls {}/{} · replans {}/{}",
             d.usage.model_calls,
             d.budget.max_model_calls,
             d.usage.worker_calls,
@@ -1031,11 +1031,11 @@ fn bar(label_s: &str, value: u64, max: u64, width: usize, color: Color) -> Line<
 
 /// What a plan's model work costs: nothing on a self-hosted model.
 fn price_text(e: dfae_core::CostEstimate) -> String {
-    if e.external { format!("≈ {} external tok", fmt_tokens(e.tokens)) } else { "local, free".to_string() }
+    if e.external { format!("≈ {} planner tok", fmt_tokens(e.tokens)) } else { "local, free".to_string() }
 }
 
 fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
-    let [top, mid, bot] = Layout::vertical([Constraint::Length(12), Constraint::Min(4), Constraint::Length(7)]).areas(area);
+    let [top, mid, bot] = Layout::vertical([Constraint::Length(13), Constraint::Min(4), Constraint::Length(7)]).areas(area);
     let s = app.detail.as_ref().map(|d| d.ledger.summary()).unwrap_or_default();
     let est = app.detail.as_ref().and_then(|d| d.plan.as_ref()).and_then(|p| p.estimate);
     let repairs: u32 = app.detail.as_ref().and_then(|d| d.plan.as_ref()).map(|p| p.steps.iter().map(|s| s.repairs).sum()).unwrap_or(0);
@@ -1043,9 +1043,9 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
     let max = s.baseline_tokens.max(s.generative_tokens).max(1);
     let lines = vec![
         bar("naive LLM agent (est.)", s.baseline_tokens, max, w, BAD),
-        bar("external LLM (paid)", s.planner_tokens, max, w, VIOLET),
-        bar("self-hosted worker model (free)", s.worker_tokens, max, w, WARN),
-        bar("self-hosted decision (free)", s.decision_tokens, max, w, ACCENT),
+        bar("planner model (hosted)", s.planner_tokens, max, w, VIOLET),
+        bar("worker model (hosted)", s.worker_tokens, max, w, WARN),
+        bar("decision model (self-hosted, free)", s.decision_tokens, max, w, ACCENT),
         Line::from(vec![
             label(" calls   "),
             Span::raw(format!(
@@ -1054,14 +1054,26 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
             )),
         ]),
         Line::from(vec![
-            label(" external "),
+            label(" planner  "),
             Span::raw({
                 let by: Vec<String> = s.planner_by_purpose.iter().map(|(k, v)| format!("{k} {v}")).collect();
                 format!(
-                    "{} tokens · {} from the provider's cache · {} effective · {}",
+                    "{} tokens · {} cached · {} effective · {}",
                     s.planner_tokens,
                     s.planner_cached_tokens,
                     s.planner_effective_tokens,
+                    if by.is_empty() { "—".to_string() } else { by.join(" · ") }
+                )
+            }),
+        ]),
+        Line::from(vec![
+            label(" worker   "),
+            Span::raw({
+                let by: Vec<String> = s.worker_by_purpose.iter().map(|(k, v)| format!("{k} {v}")).collect();
+                format!(
+                    "{} tokens · {} effective · {}",
+                    s.worker_tokens,
+                    s.worker_effective_tokens,
                     if by.is_empty() { "—".to_string() } else { by.join(" · ") }
                 )
             }),
@@ -1083,7 +1095,7 @@ fn draw_tokens(f: &mut Frame, area: Rect, app: &App) {
             .block(Block::new().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM).border_type(BorderType::Rounded).border_style(Style::new().fg(DIM)))
             .gauge_style(Style::new().fg(OK).bg(Color::Rgb(40, 44, 52)))
             .ratio((s.saved_pct as f64 / 100.0).clamp(0.0, 1.0))
-            .label(format!("{:.0}% external-LLM tokens saved vs a naive agent (estimate)", s.saved_pct)),
+            .label(format!("{:.0}% of hosted-model tokens saved vs a naive agent (estimate)", s.saved_pct)),
         gauge,
     );
 
@@ -1281,7 +1293,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         .filter(|(_, _, b)| *b > 0)
         .map(|(p, e, b)| {
             format!(
-                "Σ external {} vs ~{} naive ({p:.0}% saved){} ",
+                "Σ hosted {} vs ~{} naive ({p:.0}% saved){} ",
                 fmt_tokens(e),
                 fmt_tokens(b),
                 per_task.map(|t| format!(" · ~{t:.0}/task")).unwrap_or_default()

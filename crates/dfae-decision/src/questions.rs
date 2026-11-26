@@ -110,11 +110,11 @@ pub fn mode_request(state: DecisionState) -> DecisionRequest {
     q.insert(
         "mode".into(),
         Question::choice(
-            "How should the request be handled? All planning is done by the external model, so decide whether the request needs a plan at all. direct when it binds to tools outright; escalated when it needs planning (see POLICY); assisted when it is one quick action or a reply that the local models can do alone.",
+            "How should the request be handled? All planning is done by the planner model, so decide whether the request needs a plan at all. direct when it binds to tools outright; escalated when it needs planning (see POLICY); assisted when it is one quick action or a reply that the local models can do alone.",
             [
                 ("direct", "deterministic tools only; arguments bind straight from the text; no language model"),
                 ("assisted", "quick: a single action or a reply the local models (small language model, extractor, decision model) handle alone, with no plan"),
-                ("escalated", "needs a plan: several dependent steps, something to build, write and run or serve, work whose next step depends on what earlier steps find, anything open-ended or high-stakes; the external model plans it and the local system carries it out"),
+                ("escalated", "needs a plan: several dependent steps, something to build, write and run or serve, work whose next step depends on what earlier steps find, anything open-ended or high-stakes; the planner model plans it and the local system carries it out"),
             ],
         ),
     );

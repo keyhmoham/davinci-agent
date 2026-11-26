@@ -76,10 +76,10 @@ impl Inner {
         let dec = team::decompose(goal, entities, &|fragment| bind_direct(&metas, fragment, entities).is_some())?;
         let direct: Vec<bool> = dec.subgoals.iter().map(|s| bind_direct(&metas, &s.text, entities).is_some()).collect();
         let models_available = self.models.has(Tier::Worker) || self.models.has(Tier::Planner);
-        // agents of a medium or complex request are planned by the external model, each paying for its own plan
+        // agents of a medium or complex request are planned by the planner model, each paying for its own plan
         let complexity = ctx.rec.lock().await.route.as_ref().map(|r| r.complexity).unwrap_or(0.0);
         let external_work = self.uses_planner(ExecMode::Assisted) || (self.models.has(Tier::Planner) && complexity >= self.cfg.thresholds.plan_min_complexity);
-        // A team of agents that need a model would each pay the external model for a plan of their own. One brief plan
+        // A team of agents that need a model would each pay the planner model for a plan of their own. One brief plan
         // with parallel steps covers the same work for one planner call, and the local system runs its steps in
         // parallel anyway: teams are for work no model has to plan (every sub-goal binds to a tool outright).
         if external_work && !force && direct.iter().any(|d| !d) {

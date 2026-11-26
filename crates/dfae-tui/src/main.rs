@@ -108,7 +108,7 @@ fn describe(e: &Event) -> Option<String> {
             plan.source,
             plan.estimate
                 .map(|e| if e.external {
-                    format!(" · est. {} model calls ≈ {} external tok", e.model_calls, e.tokens)
+                    format!(" · est. {} model calls ≈ {} planner tok", e.model_calls, e.tokens)
                 } else {
                     format!(" · est. {} local model calls (free)", e.model_calls)
                 })

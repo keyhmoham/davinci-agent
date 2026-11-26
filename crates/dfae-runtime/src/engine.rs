@@ -143,7 +143,7 @@ pub struct StatsReport {
     pub totals: LedgerSummary,
     pub memory: MemoryStats,
     pub decision_provider: String,
-    /// Shadow evaluation (off unless `DFAE_SHADOW_EVAL` > 0): requests the external model also decided, and how often
+    /// Shadow evaluation (off unless `DFAE_SHADOW_EVAL` > 0): requests the planner model also decided, and how often
     /// the decision model gave the same answer.
     pub shadow_requests: u64,
     pub shadow_agree: u64,
@@ -346,7 +346,7 @@ impl Engine {
     /// `(tier, reason)` for every configured language model that cannot be used right now.
     pub async fn model_problems(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        for (name, tier) in [("worker", Tier::Worker), ("external model", Tier::Planner)] {
+        for (name, tier) in [("worker", Tier::Worker), ("planner model", Tier::Planner)] {
             if let Some(why) = self.inner.models.diagnose(tier).await {
                 out.push((name.to_string(), why));
             }
@@ -605,12 +605,24 @@ impl Inner {
         Ok(())
     }
 
-    /// Generate text on a tier with budget + ledger accounting.
+    /// Generate text on a tier with budget + ledger accounting. A worker model that cannot be reached (after the provider layer's
+    /// own retries) does not stop the task: the planner model does the work instead, and the log says so.
     pub(crate) async fn generate_text(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<String, String> {
         self.take_model_call(ctx, tier, 1).await?;
-        let g: Generated = self.models.generate(tier, req).await.map_err(|e| e.to_string())?;
-        self.add_ledger(ctx, g.entry.clone()).await;
-        Ok(g.text)
+        match self.models.generate(tier, req.clone()).await {
+            Ok(g) => {
+                self.add_ledger(ctx, g.entry.clone()).await;
+                Ok(g.text)
+            }
+            Err(e) if tier == Tier::Worker && self.models.has(Tier::Planner) && e.to_string().contains("model request failed") => {
+                self.emit(ctx, EventKind::Warning { message: format!("the worker model is unavailable ({e}); the planner model does this call") }).await;
+                self.take_model_call(ctx, Tier::Planner, 1).await?;
+                let g: Generated = self.models.generate(Tier::Planner, req).await.map_err(|e| e.to_string())?;
+                self.add_ledger(ctx, g.entry.clone()).await;
+                Ok(g.text)
+            }
+            Err(e) => Err(e.to_string()),
+        }
     }
 
     pub(crate) async fn gen_json(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<Value, String> {
@@ -640,12 +652,12 @@ impl Inner {
         }
     }
 
-    /// Who writes and revises plans: the external model whenever there is one; the self-hosted one only when there is no other.
+    /// Who writes and revises plans: the planner model whenever there is one; the self-hosted one only when there is no other.
     pub(crate) fn planner_tier(&self, mode: ExecMode) -> Option<Tier> {
         if self.models.has(Tier::Planner) { Some(Tier::Planner) } else { self.pick_tier(mode) }
     }
 
-    /// Would reasoning in this mode go to the external (paid) model? Self-hosted models are free.
+    /// Would reasoning in this mode go to the planner model? Self-hosted models are free.
     pub(crate) fn uses_planner(&self, mode: ExecMode) -> bool {
         self.pick_tier(mode) == Some(Tier::Planner)
     }

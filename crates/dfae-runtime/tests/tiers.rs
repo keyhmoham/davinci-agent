@@ -23,7 +23,7 @@ fn rig() -> Rig {
     rig_full(false, true)
 }
 
-/// No external model: the self-hosted one plans as well.
+/// No planner model: the self-hosted one plans as well.
 fn rig_local() -> Rig {
     rig_full(false, false)
 }
@@ -66,7 +66,7 @@ fn plan(read: &str) -> String {
         .to_string()
 }
 
-/// What the external model writes: intents, the reasoning step done by itself (`planner`) so its prompt can be compared.
+/// What the planner model writes: intents, the reasoning step done by itself (`planner`) so its prompt can be compared.
 fn brief(read: &str) -> String {
     json!({"steps": [{"id": "s1", "do": format!("read {read}"), "tool": "fs_read"}, {"id": "s2", "do": "summarise the file", "tool": null, "after": ["s1"], "planner": true}]}).to_string()
 }

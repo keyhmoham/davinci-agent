@@ -29,8 +29,8 @@ pub fn build_model(cfg: &ModelConfig) -> Option<Arc<dyn LanguageModel>> {
     match cfg.provider.as_str() {
         "openai" => {
             let mut m = OpenAiCompat::new(&cfg.base_url, &cfg.model, cfg.api_key.clone(), timeout);
-            if let Ok(v) = std::env::var("PLANNER_PROMPT_CACHE") {
-                m = m.with_prompt_cache(matches!(v.as_str(), "on" | "true" | "1"));
+            if let Some(on) = cfg.prompt_cache {
+                m = m.with_prompt_cache(on);
             }
             Some(Arc::new(m))
         }

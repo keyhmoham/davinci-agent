@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-//! Planning and acting are separate phases: the external model writes a brief plan, and the local system
+//! Planning and acting are separate phases: the planner model writes a brief plan, and the local system
 //! (rules + GLiNER, the decision model, the worker model) implements each step, escalating only when it has to.
 
 use async_trait::async_trait;
@@ -45,7 +45,7 @@ fn rig(picky: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
     rig_with(picky, true, tweak)
 }
 
-/// A deployment with no external model: the self-hosted one has to plan as well.
+/// A deployment with no planner model: the self-hosted one has to plan as well.
 fn rig_local(picky: bool, tweak: impl FnOnce(&mut Config)) -> Rig {
     rig_with(picky, false, tweak)
 }
@@ -108,12 +108,12 @@ async fn medium_tasks_are_planned_by_the_external_model_and_carried_out_by_the_l
     // acting phase: the worker model writes the reasoning step and fills in the one argument rules cannot (the content)
     r.worker.push("8080");
     r.worker.push("8080");
-    // the answer is written locally and checked against the evidence; the external model is not asked for it
+    // the answer is written locally and checked against the evidence; the planner model is not asked for it
     r.worker.push("Wrote 8080 to ports.txt.");
     let t = run(&r, GOAL).await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(t.final_answer.as_deref(), Some("Wrote 8080 to ports.txt."));
-    assert_eq!(t.mode, Some(ExecMode::Escalated), "a medium task goes to the external model by default: {:?}", t.mode_reason);
+    assert_eq!(t.mode, Some(ExecMode::Escalated), "a medium task goes to the planner model by default: {:?}", t.mode_reason);
     assert_eq!(std::fs::read_to_string(r.ws.path().join("ports.txt")).unwrap(), "8080");
 
     // the planner saw a lean brief-plan prompt: one line per tool, no signatures, no arguments requested
@@ -134,7 +134,7 @@ async fn medium_tasks_are_planned_by_the_external_model_and_carried_out_by_the_l
     assert_eq!(s("s2").how.as_deref(), Some("reasoning"));
     assert_eq!(s("s3").how.as_deref(), Some("rules+worker"), "path by rules, content by the worker model");
     assert!(s("s1").expect.is_some() && !s("s1").brief);
-    // the external model was used for the plan only; every step and the answer were done locally
+    // the planner model was used for the plan only; every step and the answer were done locally
     assert_eq!(t.usage.model_calls, 1);
     assert_eq!(r.worker.calls(), 3);
     let kinds: Vec<String> =
@@ -160,7 +160,7 @@ async fn when_the_slm_cannot_bind_a_step_the_external_model_is_asked_for_the_arg
     );
     r.worker.push("sorry, I cannot do that"); // the worker model's two attempts are not JSON arguments
     r.worker.push("{}");
-    r.planner.push(&json!({"path": "ports.txt", "content": "8080"}).to_string()); // the external model fills in the arguments (two paths in the sentence: which is which is not guessed)
+    r.planner.push(&json!({"path": "ports.txt", "content": "8080"}).to_string()); // the planner model fills in the arguments (two paths in the sentence: which is which is not guessed)
     r.planner.push("Done.");
     let t = run(&r, GOAL).await;
     assert_eq!(
@@ -235,7 +235,7 @@ async fn a_reply_needs_no_plan_so_the_local_models_answer_it_whatever_its_comple
     )
     .await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
-    assert_eq!((r.planner.calls(), r.worker.calls()), (0, 1), "planning is the external model's job; a reply is not planned");
+    assert_eq!((r.planner.calls(), r.worker.calls()), (0, 1), "planning is the planner model's job; a reply is not planned");
     assert!(t.final_answer.as_deref().unwrap().contains("semaphore admits N"));
 }
 
@@ -248,7 +248,7 @@ async fn a_quick_action_is_one_step_the_local_models_carry_out_without_a_plan_fr
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Quick);
     assert_eq!(t.plan.as_ref().unwrap().steps.len(), 1);
-    assert_eq!(r.planner.calls(), 0, "no plan was asked of the external model");
+    assert_eq!(r.planner.calls(), 0, "no plan was asked of the planner model");
     assert!(t.final_answer.as_deref().unwrap().contains("first line"), "{:?}", t.final_answer);
 }
 
@@ -377,7 +377,7 @@ fn oracle_rig(answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>) 
     r
 }
 
-/// The oracle rig, with an external model configured.
+/// The oracle rig, with an planner model configured.
 fn oracle_rig_with_strong(answers: Vec<(DecisionKind, &'static str, Answer, &'static str)>) -> Rig {
     let r = oracle_rig(answers.clone());
     let local = LocalDecider::new(Config::default().thresholds);
@@ -483,7 +483,7 @@ async fn a_file_cut_off_by_the_token_limit_is_caught_by_a_parser_and_rewritten_l
     let t = run(&r, "Write the settings into data.json").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(std::fs::read_to_string(r.ws.path().join("data.json")).unwrap(), "{\"settings\": {\"port\": 80}}");
-    // the second bind request carried the complaint; the external model was asked for the plan only
+    // the second bind request carried the complaint; the planner model was asked for the plan only
     let binds: Vec<String> = r.worker.requests.lock().iter().filter(|q| q.purpose == "content").map(|q| q.messages[0].content.clone()).collect();
     assert!(binds.len() == 2 && binds[1].contains("REJECTED") && binds[1].contains("invalid JSON"), "{binds:?}");
     assert_eq!(r.planner.calls(), 1, "no re-plan: a parser error is the local model's to fix");
@@ -640,7 +640,7 @@ async fn shadow_evaluation_measures_the_decision_model_against_the_external_one_
     assert_eq!(s.shadow_requests, 1);
     assert!(s.shadow_compared >= 6 && s.shadow_agree >= 5, "agreed on {} of {}", s.shadow_agree, s.shadow_compared);
     assert!(t.ledger.summary().planner_by_purpose.get("shadow_eval").copied().unwrap_or(0) > 0, "the evaluation is visible as what it is");
-    // off by default: the same request costs the external model nothing for it
+    // off by default: the same request costs the planner model nothing for it
     let r2 = rig(false, |_| {});
     std::fs::write(r2.ws.path().join("config.toml"), "port = 8080\n").unwrap();
     r2.planner.push(
@@ -712,4 +712,85 @@ async fn a_page_the_model_cuts_off_is_written_again_shorter() {
     let asks: Vec<String> = r.worker.requests.lock().iter().filter(|q| q.purpose == "content").map(|q| q.messages[0].content.clone()).collect();
     assert_eq!(asks.len(), 2);
     assert!(asks[1].contains("REJECTED") && asks[1].contains("cut off"), "{}", asks[1]);
+}
+
+#[tokio::test]
+async fn a_step_the_worker_cannot_carry_out_is_edited_by_the_planner_and_only_that_step_runs_again() {
+    let r = rig(false, |_| {});
+    std::fs::write(r.ws.path().join("config.toml"), "port = 8080\n").unwrap();
+    r.planner.push(
+        &json!({"steps": [
+            {"id": "s1", "tool": "fs_write", "do": "write notes.txt with the single line: checked", "after": [], "expect": null, "planner": false},
+            {"id": "s2", "tool": "fs_read", "do": "read settings.toml", "after": [], "expect": null, "planner": false},
+            {"id": "s3", "tool": null, "do": "say which port the file sets", "after": ["s2"], "expect": null, "planner": false}
+        ]})
+        .to_string(),
+    );
+    // the patch: only step s2 changes (a different file); s1 is done and s3 is untouched
+    r.planner.push(
+        &json!({"edit": [{"id": "s2", "tool": "fs_read", "do": "read config.toml", "after": [], "expect": null, "planner": false}], "add": [], "drop": []})
+            .to_string(),
+    );
+    r.worker.push("checked");
+    r.worker.push("The file sets port 8080.");
+    let t = run_as(&r, ModeRequest::Escalated, "Write checked into notes.txt, then read settings.toml and tell me which port it sets").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let plan = t.plan.as_ref().unwrap();
+    assert_eq!(plan.steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["s1", "s2", "s3"], "no step was replaced, one was edited");
+    assert_eq!(plan.step("s2").unwrap().description, "read config.toml");
+    assert_eq!(plan.revision, 1);
+    assert!(plan.steps.iter().all(|s| s.status == StepStatus::Succeeded));
+    // s1 ran once; the planner was asked twice (plan, patch) and only for the patch's problem
+    assert_eq!(r.worker.requests.lock().iter().filter(|q| q.purpose == "content").count(), 1);
+    let patch_req = r.planner.requests.lock().iter().find(|q| q.purpose == "replan").cloned().unwrap();
+    let ask = &patch_req.messages[0].content;
+    assert!(ask.contains("s1 DONE") && ask.contains("s2 FAILED") && ask.contains("s3 TODO") && ask.contains("settings.toml"), "{ask}");
+    assert_eq!(patch_req.schema.as_ref().unwrap()["required"], json!(["edit", "add", "drop"]));
+}
+
+#[tokio::test]
+async fn a_plan_with_slips_a_model_makes_is_repaired_by_code_before_anyone_is_asked_again() {
+    let r = rig(false, |_| {});
+    std::fs::write(r.ws.path().join("a.txt"), "hello").unwrap();
+    // a misspelt tool, a numeric id, a dependency on a step that does not exist, the same id twice
+    r.planner.push(
+        &json!({"plan": [
+            {"id": 1, "tool": "FS-Read", "do": "read a.txt", "after": ["7"]},
+            {"id": 2, "tool": "none", "intent": "say what the file says", "depends_on": "1"},
+            {"id": 2, "tool": "none", "do": "say it again, shorter", "after": ["2"]}
+        ]})
+        .to_string(),
+    );
+    r.worker.push("It says hello.");
+    r.worker.push("hello");
+    let t = run_as(&r, ModeRequest::Escalated, "Read a.txt and say what it says, then say it again shorter").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(r.planner.calls(), 1, "no repair round: code repaired it");
+    let notes: Vec<String> =
+        events(&r, &t.task_id).into_iter().filter_map(|e| if let EventKind::Repaired { note, .. } = e { Some(note) } else { None }).collect();
+    assert!(
+        notes.iter().any(|n| n.contains("fs_read")) && notes.iter().any(|n| n.contains("used twice")) && notes.iter().any(|n| n.contains("does not exist")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_model_that_cannot_be_reached_does_not_stop_the_task_the_planner_does_the_call() {
+    let r = rig(false, |_| {});
+    std::fs::write(r.ws.path().join("a.txt"), "hello").unwrap();
+    r.planner.push(
+        &json!({"steps": [
+            {"id": "s1", "tool": "fs_read", "do": "read a.txt", "after": [], "expect": null, "planner": false},
+            {"id": "s2", "tool": null, "do": "say what the file says", "after": ["s1"], "expect": null, "planner": false}
+        ]})
+        .to_string(),
+    );
+    r.worker.push_err("connection refused");
+    r.planner.push("It says hello.");
+    let t = run_as(&r, ModeRequest::Escalated, "Read a.txt and say what it says").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(t.final_answer.as_deref().unwrap().contains("hello"));
+    let warns: Vec<String> =
+        events(&r, &t.task_id).into_iter().filter_map(|e| if let EventKind::Warning { message } = e { Some(message) } else { None }).collect();
+    assert!(warns.iter().any(|m| m.contains("worker model is unavailable")), "{warns:?}");
 }

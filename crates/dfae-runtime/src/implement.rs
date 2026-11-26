@@ -1,6 +1,6 @@
 //! The acting phase: turning a planner's intent into an action, step by step, right before the step runs.
 //!
-//! A brief plan (written by the external model) says *what* each step should achieve. This module decides
+//! A brief plan (written by the planner model) says *what* each step should achieve. This module decides
 //! *how*, using the self-hosted triple under the program's control — deterministic first, models only where
 //! the rules run out, and always checked against the tool's schema and the policy before anything executes:
 //!
@@ -11,10 +11,10 @@
 //!    the result met the planner's expectation;
 //! 4. the **worker model** fills in what is still missing (reading the results of earlier steps), with the validation
 //!    error fed back if it gets it wrong;
-//! 5. only if the worker model cannot, the **external model** is asked for the arguments, in a lean prompt.
+//! 5. only if the worker model cannot, the **planner model** is asked for the arguments, in a lean prompt.
 //!
 //! A step that none of this can carry out fails with a precise message, and recovery (retry, repair, a
-//! re-plan by the external model) takes over.
+//! re-plan by the planner model) takes over.
 
 use crate::economy::repair;
 use crate::engine::{Inner, TaskCtx};
@@ -297,7 +297,7 @@ impl Inner {
         let mut done = step.clone();
         done.brief = false;
         let Some(tool) = tool else {
-            // reasoning: the worker model writes it, unless the planner wants the external model to
+            // reasoning: the worker model writes it, unless the planner wants the planner model to
             done.kind = StepKind::Reasoning;
             done.tool = None;
             done.how = Some("reasoning".into());
@@ -382,7 +382,7 @@ impl Inner {
                 how.push(if planned { "plan" } else { "rules" });
             }
         } else {
-            // ---- the models: the worker model first, the external model only if the worker model cannot ----
+            // ---- the models: the worker model first, the planner model only if the worker model cannot ----
             let mut problem = feedback.map(str::to_string).or_else(|| valid(&args).err());
             let mut ladder: Vec<Tier> = Vec::new();
             if self.models.has(Tier::Worker) {

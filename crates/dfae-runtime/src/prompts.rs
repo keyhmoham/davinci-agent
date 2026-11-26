@@ -18,7 +18,7 @@ Rules:
     };
 }
 
-/// The planner prompt for the external (paid) model: rules only, as few tokens as possible.
+/// The planner prompt for the planner model: rules only, as few tokens as possible.
 pub const PLAN_SYSTEM: &str = plan_rules!();
 
 /// The planner prompt for a self-hosted model, which costs nothing: the same rules plus worked examples,
@@ -132,7 +132,7 @@ pub fn replan_user_shortlist(likely: &[String], ctx: &str, state: &str, problem:
     format!("LIKELY TOOLS: {likely}\nMAX_STEPS: {max_steps}\n{ctx}\n{state}\nPROBLEM: {problem}\n{}", replan_rule(prefix))
 }
 
-/// A re-plan request for the external model when its tool list is the narrow one in the message.
+/// A re-plan request for the planner model when its tool list is the narrow one in the message.
 pub fn replan_user_brief(tools: &str, ctx: &str, state: &str, problem: &str, prefix: &str, max_steps: u32) -> String {
     format!("TOOLS:\n{tools}\nMAX_STEPS: {max_steps}\n{ctx}\n{state}\nPROBLEM: {problem}\n{}", replan_rule(prefix))
 }

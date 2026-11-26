@@ -1,12 +1,12 @@
 #![allow(clippy::field_reassign_with_default)]
-//! Token benchmark. The same five tasks run twice through the whole engine, with a scripted "external planner" that
+//! Token benchmark. The same five tasks run twice through the whole engine, with a scripted "planner model" that
 //! makes the *same* decisions in both runs (it answers in whatever format its prompt asks for):
 //!
-//! * baseline: JSON plans, a narrow per-task tool list, the external model writes the final answer;
+//! * baseline: JSON plans, a narrow per-task tool list, the planner model writes the final answer;
 //! * optimised: the whole tool catalogue as a cached prefix, a plan-time reply template,
 //!   local-first answers, a workspace snapshot.
 //!
-//! The external model is metered like a provider with prompt caching. The benchmark measures what the prompts, formats
+//! The planner model is metered like a provider with prompt caching. The benchmark measures what the prompts, formats
 //! and flow cost — not how smart a real model is — and it checks that outcomes (files, answers) are identical.
 
 use dfae_core::*;
@@ -34,7 +34,7 @@ struct Scenario {
     files: &'static [(&'static str, &'static str)],
     plan: Vec<P>,
     report: Option<&'static str>,
-    /// What the external model would write as the final answer when no report was planned.
+    /// What the planner model would write as the final answer when no report was planned.
     answer: &'static str,
     /// What the local model writes for a reasoning step, and for a tool's arguments.
     reasoning: &'static str,
@@ -323,7 +323,7 @@ async fn the_optimised_flow_costs_far_fewer_planner_tokens_for_the_same_outcomes
 }
 
 /// A stream of requests of one shape ("read <file> and tell me how many lines it has"): the first is planned by the
-/// external model, the rest replay the skill it left behind and cost the external model nothing.
+/// planner model, the rest replay the skill it left behind and cost the planner model nothing.
 #[tokio::test]
 async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
     let ws = tempfile::tempdir().unwrap();
@@ -375,7 +375,7 @@ async fn a_repeated_kind_of_request_is_planned_once_and_then_free() {
         per_task.push(t.ledger.summary().planner_tokens);
     }
     eprintln!("\nexternal tokens per task for six requests of one shape: {per_task:?}");
-    assert!(per_task[0] > 0, "the first is planned by the external model");
+    assert!(per_task[0] > 0, "the first is planned by the planner model");
     assert!(per_task[1..].iter().all(|t| *t == 0), "the rest are replayed from the skill: {per_task:?}");
     assert_eq!(planner.calls(), 1);
 }
