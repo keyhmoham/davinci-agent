@@ -481,7 +481,7 @@ async fn a_file_cut_off_by_the_token_limit_is_caught_by_a_parser_and_rewritten_l
     assert_eq!(std::fs::read_to_string(r.ws.path().join("data.json")).unwrap(), "{\"settings\": {\"port\": 80}}");
     // the second bind request carried the complaint; the external model was asked for the plan only
     let binds: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "content").map(|q| q.messages[0].content.clone()).collect();
-    assert!(binds.len() >= 2 && binds[1].contains("malformed") && binds[1].contains("invalid JSON"), "{binds:?}");
+    assert!(binds.len() == 2 && binds[1].contains("REJECTED") && binds[1].contains("invalid JSON"), "{binds:?}");
     assert_eq!(r.strong.calls(), 1, "no re-plan: a parser error is the local model's to fix");
 }
 
@@ -666,4 +666,42 @@ async fn a_step_that_comes_back_as_a_question_for_the_user_is_told_to_decide_and
     assert!(t.final_answer.as_deref().unwrap().contains("home planet"), "{:?}", t.final_answer);
     let second = r.slm.requests.lock().iter().filter(|q| q.purpose == "step").nth(1).unwrap().messages[0].content.clone();
     assert!(second.contains("ASKED THE USER A QUESTION"), "{second}");
+}
+
+#[tokio::test]
+async fn two_files_in_one_plan_each_get_their_own_path_and_content_never_a_step_output_as_a_path() {
+    let r = rig(false, |_| {});
+    r.strong.push(
+        "s1 fs_write: write README.md, a short README for Brewster, a tool that tracks coffee orders: a title and one paragraph\ns2 fs_write: write .gitignore for a Python project (pycache, virtualenvs, build output)",
+    );
+    r.slm.push("# Brewster\n\nBrewster tracks coffee orders.");
+    r.slm.push("__pycache__/\n.venv/\nbuild/\n");
+    let t = run_as(
+        &r,
+        ModeRequest::Escalated,
+        "Create README.md with a short description of Brewster, a tool that tracks coffee orders, and a .gitignore for a Python project",
+    )
+    .await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(std::fs::read_to_string(r.ws.path().join("README.md")).unwrap().contains("Brewster"));
+    assert!(std::fs::read_to_string(r.ws.path().join(".gitignore")).unwrap().contains("__pycache__"));
+    // both contents were written as plain text, from the step's own sentence
+    let asks: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "content").map(|q| q.messages[0].content.clone()).collect();
+    assert_eq!(asks.len(), 2, "{asks:?}");
+    assert!(asks[0].starts_with("FILE TO WRITE (write only this one): README.md") && asks[1].contains(": .gitignore"), "{asks:?}");
+    assert!(!asks[1].contains("BACKGROUND"), "a step with a full sentence needs no help from the whole request");
+}
+
+#[tokio::test]
+async fn a_page_the_model_cuts_off_is_written_again_shorter() {
+    let r = rig(false, |_| {});
+    r.strong.push("s1 fs_write: write index.html, a landing page about Earth with a title and three sections");
+    r.slm.push("<!doctype html><html><head><style>body{margin:0}</style></head><body><div class=\"hero\"><h1>Earth</h1>");
+    r.slm.push("<!doctype html><html><head><style>body{margin:0}</style></head><body><h1>Earth</h1><p>Our home.</p></body></html>");
+    let t = run_as(&r, ModeRequest::Escalated, "Create index.html, a landing page about Earth with a title and three sections").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert!(std::fs::read_to_string(r.ws.path().join("index.html")).unwrap().ends_with("</html>"));
+    let asks: Vec<String> = r.slm.requests.lock().iter().filter(|q| q.purpose == "content").map(|q| q.messages[0].content.clone()).collect();
+    assert_eq!(asks.len(), 2);
+    assert!(asks[1].contains("REJECTED") && asks[1].contains("cut off"), "{}", asks[1]);
 }
