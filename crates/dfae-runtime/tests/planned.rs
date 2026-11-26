@@ -244,10 +244,11 @@ async fn a_quick_action_is_one_step_the_local_models_carry_out_without_a_plan_fr
     let oracle = |a: &str| (DecisionKind::SelectMode, "mode", Answer::choice(a, 0.95, &[(a, 0.95)]), "tell me the first line of notes.txt");
     let r = oracle_rig_with_strong(vec![oracle("assisted")]);
     std::fs::write(r.ws.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
+    r.worker.push("The first line is: first line.");
     let t = say(&r, "q", "tell me the first line of notes.txt").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Quick);
-    assert_eq!(t.plan.as_ref().unwrap().steps.len(), 1);
+    assert_eq!(t.plan.as_ref().unwrap().steps.len(), 2, "the lookup, and the worker model's answer from it");
     assert_eq!(r.planner.calls(), 0, "no plan was asked of the planner model");
     assert!(t.final_answer.as_deref().unwrap().contains("first line"), "{:?}", t.final_answer);
 }
@@ -793,4 +794,31 @@ async fn a_worker_model_that_cannot_be_reached_does_not_stop_the_task_the_planne
     let warns: Vec<String> =
         events(&r, &t.task_id).into_iter().filter_map(|e| if let EventKind::Warning { message } = e { Some(message) } else { None }).collect();
     assert!(warns.iter().any(|m| m.contains("worker model is unavailable")), "{warns:?}");
+}
+
+#[tokio::test]
+async fn a_request_the_routing_calls_a_conversation_but_a_tool_plainly_serves_is_handled_as_a_task() {
+    // the decision model says "no tools needed" for a request about a file's content: the tool-relevance question disagrees
+    let r = oracle_rig_with_strong(vec![
+        (DecisionKind::RouteTask, "needs_tools", Answer::noul(0.05), "show me what is inside notes.txt"),
+        (DecisionKind::SelectMode, "mode", Answer::choice("assisted", 0.95, &[("assisted", 0.95)]), "show me what is inside notes.txt"),
+    ]);
+    std::fs::write(r.ws.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
+    r.worker.push("It starts with: first line.");
+    let t = say(&r, "c", "show me what is inside notes.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Quick, "not a chat reply: {:?}", t.plan.as_ref().map(|p| p.source));
+    assert!(t.plan.as_ref().unwrap().steps[0].tool.is_some(), "a tool step, not a reply");
+}
+
+#[tokio::test]
+async fn a_plain_reply_that_is_a_tool_call_in_disguise_is_never_shown_to_the_user() {
+    let r = rig(false, |_| {});
+    r.worker.push("<think>they want the price</think></think><tool_call>Tool: web.search\n{\"query\": \"bitcoin price\"}");
+    r.worker.push("I can't look that up from here.");
+    let t = say(&r, "tc", "tell me a short fact about the moon").await;
+    let a = t.final_answer.clone().unwrap_or_default();
+    assert!(!a.contains("tool_call") && !a.contains("Tool:") && !a.contains("think"), "{a}");
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {a}", t.error);
+    assert!(a.contains("can't look that up"), "{a}");
 }

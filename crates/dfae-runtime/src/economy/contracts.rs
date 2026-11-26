@@ -33,6 +33,15 @@ pub fn asks_the_user(text: &str) -> bool {
     t.split_whitespace().count() <= 70 && t.ends_with('?') && ASK.is_match(t)
 }
 
+/// A plain reply that is really an attempt to call a tool ("<tool_call>Tool: web.search {…}"): a model that was told tools exist,
+/// in a place where it has none. Showing that to a user is wrong, and acting on it is not this layer's job.
+pub fn pseudo_tool_call(text: &str) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?im)<\s*/?\s*tool_call\s*>|<\s*/?\s*function_call\s*>|^\s*tool\s*:\s*[\w.\-]+\s*$|^\s*\{\s*"(?:tool|tool_name|name)"\s*:\s*"[\w.\-]+"\s*,\s*"(?:arguments|args|parameters|input)""#).unwrap()
+    });
+    RE.is_match(text)
+}
+
 pub fn model_output_issue(text: &str) -> Option<String> {
     let t = text.trim();
     if !t.chars().any(|c| c.is_alphanumeric()) {
@@ -78,6 +87,15 @@ mod tests {
         assert!(!asks_the_user("Earth is the third planet. Why does it matter?"), "a question inside content is not a request for input");
         assert!(!asks_the_user("The port is 8080."));
         assert!(model_output_issue("What would you like the page to say?").is_some());
+    }
+
+    #[test]
+    fn a_reply_that_is_a_tool_call_in_disguise_is_recognised() {
+        assert!(pseudo_tool_call("<tool_call>Tool: web.search\n{\n\"query\": \"bitcoin\"\n}"));
+        assert!(pseudo_tool_call("Tool: web_search\n{\"query\": \"x\"}"));
+        assert!(pseudo_tool_call("{\"name\": \"web_search\", \"arguments\": {\"query\": \"x\"}}"));
+        assert!(!pseudo_tool_call("Bitcoin is at 91,000 USD."));
+        assert!(!pseudo_tool_call("You can call it a tool: a hammer is one."));
     }
 
     #[test]
