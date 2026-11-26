@@ -503,6 +503,10 @@ impl Tool for FsSearch {
             &[
                 r#"(?i)\b(?:search|grep|find|look)\b[^\n]*?\bfor\s+["'`](?P<pattern>[^"'`]+)["'`](?:[^\n]*?\b(?:in|under|inside)\s+(?:the\s+)?(?P<path>[\w./~\-]*[/.][\w./\-]*))?"#.into(),
                 r#"(?i)\bgrep\s+["'`](?P<pattern>[^"'`]+)["'`]\s*(?P<path>[\w./~\-]*[/.][\w./\-]*)?"#.into(),
+                // unquoted, but plainly about files: "search the workspace for TODO with 2 lines of context"
+                r#"(?i)\b(?:search|grep|find|look)\b[^\n]*?\b(?:workspace|files?|director(?:y|ies)|folders?|repo(?:sitory)?|project|codebase|source|code)\b[^\n]*?\bfor\s+(?:the\s+(?:word|text|string|term|marker|pattern)\s+)?(?P<pattern>[A-Za-z0-9_.\-]{2,})(?:[^\n]*?\b(?P<context>[1-5])\s+lines?\s+of\s+context)?"#.into(),
+                // "which files mention TODO"
+                r#"(?i)\b(?:which|what|list|show|find)\b[^\n]*?\bfiles?\b[^\n]*?\b(?:mention|mentions|contain|contains|containing|include|includes|have|has)\s+(?:the\s+(?:word|text|string|term|marker)\s+)?(?P<pattern>[A-Za-z0-9_.\-]{2,})"#.into(),
             ],
         );
         m
