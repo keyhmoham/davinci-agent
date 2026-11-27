@@ -247,6 +247,10 @@ fn smalltalk_kind(req: &str) -> &'static str {
     }
 }
 
+/// A question, or a request for information worked out from what is read ("tell me what changed", "which files", "how many").
+static ASKS_ANSWER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\?\s*$|\b(?:tell me|explain|summari[sz]e|summary|describe|what|which|who|why|how many|how much|how often|is there|are there|does it|do they|compare|list (?:the )?(?:differences|changes|reasons))\b").unwrap()
+});
 static FRESH_DATA: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:price|prices|exchange rate|weather|forecast|temperature|news|headlines|scores?|stocks?|latest|currently|right now|live|trending|who won|how much is|how much does)\b|\bcurrent\s+(?:price|rate|weather|version|status|time|value)\b|\bfor now\b").unwrap()
 });
@@ -422,6 +426,7 @@ impl LocalDecider {
                 };
                 out.insert("risk".into(), Answer::choice(key, rc, &[(key, rc)]));
                 out.insert("fresh_data".into(), Answer::noul(if FRESH_DATA.is_match(&s.request) { 0.85 } else { 0.1 }));
+                out.insert("asks_answer".into(), Answer::noul(if ASKS_ANSWER.is_match(&s.request) { 0.8 } else { 0.15 }));
                 out.insert("external_service".into(), Answer::noul(if EXTERNAL_SERVICE.is_match(&s.request) { 0.85 } else { 0.05 }));
                 out.insert("changes_state".into(), Answer::noul(if CHANGE_VERBS.is_match(&s.request) { 0.85 } else { 0.1 }));
                 out.insert("conditional_change".into(), Answer::noul(if CONDITIONAL.is_match(&s.request) { 0.85 } else { 0.1 }));

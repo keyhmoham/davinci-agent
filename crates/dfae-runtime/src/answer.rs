@@ -222,7 +222,10 @@ impl Inner {
         // only tool output is ground truth: a model's own prose must never vouch for itself
         let evidence_full: String = plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
         let mut from_model = false;
-        let text = if exec_err.is_some() || (!plan.has_reasoning() && !self.data_needs_composing(&plan)) {
+        // a question answered by tool steps alone (the planner left out the step that states the answer) still needs its answer written
+        let asks = snapshot.route.as_ref().is_some_and(|r| r.asks && !r.changes)
+            && matches!(plan.source, PlanSource::Planner | PlanSource::Worker | PlanSource::Replan);
+        let text = if exec_err.is_some() || (!plan.has_reasoning() && !self.data_needs_composing(&plan) && !asks) {
             templated_answer(&snapshot, exec_err)
         } else if let Some(t) = single_leaf {
             from_model = true;

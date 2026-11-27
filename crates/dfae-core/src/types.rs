@@ -443,6 +443,10 @@ pub struct Routing {
     /// The answer depends on information that changes (a price, the weather, news): it has to be looked up, never answered from memory.
     #[serde(default)]
     pub fresh_data: bool,
+    /// The request asks for an answer that has to be worked out from what the tools return (what changed, which files, how
+    /// many, why...), not only for a file or listing shown as it is: a plan of tool steps alone has not answered it yet.
+    #[serde(default)]
+    pub asks: bool,
     /// The request is about a specific outside service or system (GitHub, Slack, Notion, a database, a map, a calendar...) that files,
     /// shell, calculator and plain web tools cannot serve: an MCP server may.
     #[serde(default)]
@@ -465,6 +469,7 @@ impl Routing {
             smalltalk: None,
             role: None,
             fresh_data: false,
+            asks: false,
             external: false,
             feedback: None,
         }

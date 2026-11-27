@@ -39,12 +39,26 @@ fn majority(candidates: Vec<Map<String, Value>>) -> Option<Map<String, Value>> {
 /// A model that was told to reply with the file alone still wraps it in a code fence, or adds a sentence in front.
 pub(crate) fn strip_fences(text: &str) -> String {
     let t = text.trim();
-    if let Some(start) = t.find("```") {
-        let after = &t[start + 3..];
-        // skip the language tag on the fence line
-        let body = after.split_once('\n').map(|(_, b)| b).unwrap_or(after);
-        let inner = body.rsplit_once("```").map(|(b, _)| b).unwrap_or(body);
-        return inner.trim_matches('\n').to_string();
+    // Only a reply that IS one fenced block (optionally after a one-line "here is the file:" and before a one-line sign-off) is
+    // unwrapped. Fences inside the content — a README's code samples, a doc's examples — are the content, and are kept.
+    let lines: Vec<&str> = t.lines().collect();
+    let fences: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.trim_start().starts_with("```")).map(|(i, _)| i).collect();
+    if let (Some(&first), Some(&last)) = (fences.first(), fences.last())
+        && last > first
+    {
+        let before: Vec<&str> = lines[..first].iter().copied().filter(|l| !l.trim().is_empty()).collect();
+        let after: Vec<&str> = lines[last + 1..].iter().copied().filter(|l| !l.trim().is_empty()).collect();
+        let is_preamble = |l: &str| {
+            let l = l.trim();
+            let w = l.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+            !l.starts_with('#') && l.len() <= 160 && (l.ends_with(':') || matches!(w.as_str(), "here" | "sure" | "certainly" | "below" | "okay" | "ok"))
+        };
+        let wrapped_start = before.is_empty() || (before.len() <= 2 && before.iter().all(|l| is_preamble(l)));
+        let wrapped_end = after.is_empty() || (after.len() <= 2 && after.iter().all(|l| l.len() <= 160 && !l.trim_start().starts_with('#')));
+        if wrapped_start && wrapped_end {
+            return lines[first + 1..last].join("\n").trim_matches('\n').to_string();
+        }
+        return t.to_string();
     }
     // a sentence before a bare HTML document
     let lower = t.to_ascii_lowercase();
@@ -139,6 +153,75 @@ pub(crate) fn strip_tool_markup(text: &str) -> String {
 /// A long text stuck in a loop: one substantial line over and over (`*.egg-info` a hundred times), or a text that is mostly copies of
 /// its own lines. Structural lines every real page and program repeats (`}`, `</div>`, `end`) are not evidence: only lines of 12
 /// characters or more count (8 for a run of identical lines).
+/// The names a step gives (a product, a person, a place, a quoted title) that a prose or page file about them must mention: a README
+/// for "a tool called Brewster" that never says Brewster was written about something else, or is an empty shell. Only for prose and
+/// pages; code and config files name things in their own ways.
+pub(crate) fn missing_names(step: &str, path: &str, text: &str) -> Vec<String> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "md" | "markdown" | "html" | "htm" | "txt" | "rst") || path.ends_with(".gitignore") {
+        return vec![];
+    }
+    const COMMON: &[&str] = &[
+        "README",
+        "Markdown",
+        "HTML",
+        "CSS",
+        "JSON",
+        "YAML",
+        "TOML",
+        "URL",
+        "API",
+        "UI",
+        "UX",
+        "SEO",
+        "FAQ",
+        "I",
+        "A",
+        "An",
+        "The",
+        "It",
+        "Write",
+        "Create",
+        "Add",
+        "Make",
+        "Use",
+        "Include",
+        "Python",
+        "JavaScript",
+        "TypeScript",
+        "Rust",
+        "Go",
+        "Node",
+        "React",
+        "Next",
+        "Tailwind",
+    ];
+    let lower = text.to_lowercase();
+    let mut names: Vec<String> = Vec::new();
+    // quoted titles
+    for part in step.split('"').skip(1).step_by(2) {
+        let p = part.trim();
+        if !p.is_empty() && p.len() <= 60 && !p.contains('/') && !p.contains('.') {
+            names.push(p.to_string());
+        }
+    }
+    // proper nouns: capitalised words that do not start a sentence
+    let unquoted: String = step.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+    let mut sentence_start = true;
+    for raw in unquoted.split_whitespace() {
+        let w = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        let starts = sentence_start;
+        sentence_start = raw.ends_with(['.', ':', '!', '?']);
+        if starts || w.len() < 3 || w.contains(['/', '.', '_']) || COMMON.contains(&w) {
+            continue;
+        }
+        if w.chars().next().is_some_and(|c| c.is_uppercase()) && w.chars().skip(1).any(|c| c.is_lowercase()) && !names.iter().any(|n| n == w) {
+            names.push(w.to_string());
+        }
+    }
+    names.into_iter().filter(|n| !lower.contains(&n.to_lowercase())).take(3).collect()
+}
+
 pub(crate) fn degenerate(text: &str) -> bool {
     // the same line (of 8 characters or more) forty times in a row: a starfield of 30 `<div class="star"></div>` is a page, a
     // loop goes on until the token limit
@@ -215,6 +298,9 @@ impl Inner {
                         latency_ms: res.latency_ms,
                         cached: res.cached,
                         origin: None,
+                        reasoning_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: None,
                     },
                 )
                 .await;
@@ -459,8 +545,11 @@ impl Inner {
         req.temperature = 0.2;
         let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
+        let missing = missing_names(&step.description, path, &text);
         let why = if degenerate(&text) {
             Some("it repeated the same lines".to_string())
+        } else if !missing.is_empty() {
+            Some(format!("it does not mention {}, which the step names: the file is about that", missing.join(", ")))
         } else {
             crate::syntax::problem(&self.policy.workspace().join(path), &text).await
         };
@@ -820,6 +909,17 @@ mod tests {
     }
 
     #[test]
+    fn a_page_about_a_named_thing_must_name_it() {
+        let step = "Create README.md at the workspace root with a concise project description for Brewster, a tool that tracks coffee orders.";
+        assert_eq!(missing_names(step, "README.md", "git clone <repository-url>\ncd repo"), vec!["Brewster".to_string()]);
+        assert!(missing_names(step, "README.md", "# Brewster\nTracks coffee orders.").is_empty());
+        assert!(missing_names("write .gitignore for a Python project", ".gitignore", "__pycache__/").is_empty(), "config files are not checked");
+        assert!(missing_names("write src/main.rs that prints Hello", "src/main.rs", "fn main(){}").is_empty(), "code is not checked");
+        assert!(missing_names("Write site/index.html, a landing page about planet Earth", "site/index.html", "<html>earth</html>").is_empty());
+        assert_eq!(missing_names("write about.html titled \"Our Story\"", "about.html", "<h1>About</h1>"), vec!["Our Story".to_string()]);
+    }
+
+    #[test]
     fn the_answer_most_samples_agree_on_wins_and_ties_go_to_the_first() {
         let a = m(json!({"path": "a.txt"}));
         let b = m(json!({"path": "b.txt"}));
@@ -842,6 +942,14 @@ mod content_tests {
         assert_eq!(strip_fences(&format!("Here is the page you asked for:\n{page}")), page);
         assert_eq!(strip_fences("```\nport = 1\n```"), "port = 1");
         assert_eq!(strip_fences("plain text file"), "plain text file");
+        // a README's own code samples are content, not a wrapper
+        let readme = "# Brewster\n\nTracks coffee orders.\n\n## Usage\n\n```bash\ngit clone https://example.com/brewster.git\ncd brewster\n```\n\nThen run it.";
+        assert_eq!(strip_fences(readme), readme);
+        let short = "# Brewster\nTracks orders.\n```bash\npip install brewster\n```";
+        assert_eq!(strip_fences(short), short, "a heading is content, never a preamble");
+        // a markdown file sent inside a fence keeps its own inner fences
+        assert_eq!(strip_fences(&format!("```markdown\n{readme}\n```")), readme);
+        assert_eq!(strip_fences(&format!("Here is README.md:\n```markdown\n{readme}\n```")), readme);
     }
 
     #[test]

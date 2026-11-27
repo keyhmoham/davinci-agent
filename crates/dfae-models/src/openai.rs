@@ -151,6 +151,11 @@ impl LanguageModel for OpenAiCompat {
                 prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
                 cached_tokens: v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+                cached_reported: v["usage"]["prompt_tokens_details"]["cached_tokens"].is_u64(),
+                // Vercel AI Gateway reports cache writes, reasoning and the call's cost in USD; OpenAI reports reasoning
+                cache_write_tokens: v["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                reasoning_tokens: v["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+                cost_usd: v["usage"]["cost"].as_f64(),
             };
             return Ok(GenerationResponse { text, usage, model: v["model"].as_str().unwrap_or(&self.model).to_string() });
         }

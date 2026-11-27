@@ -60,6 +60,14 @@ pub struct Usage {
     pub completion_tokens: u64,
     /// Part of `prompt_tokens` the provider served from its prompt cache (billed at a fraction).
     pub cached_tokens: u64,
+    /// Whether the provider reported `cached_tokens` at all (a missing field is not a cache miss).
+    pub cached_reported: bool,
+    /// Part of `prompt_tokens` written to the provider's prompt cache (billed at a premium by some providers).
+    pub cache_write_tokens: u64,
+    /// Part of `completion_tokens` the model spent thinking (billed as output, never shown).
+    pub reasoning_tokens: u64,
+    /// What the call cost in USD, when the provider or gateway says so.
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone)]

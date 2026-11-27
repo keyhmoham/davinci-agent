@@ -81,7 +81,7 @@ impl LanguageModel for OfflineStub {
         let usage = Usage {
             prompt_tokens: tokens::estimate_tokens(&req.system) as u64 + tokens::estimate_tokens(&user) as u64,
             completion_tokens: tokens::estimate_tokens(&text) as u64,
-            cached_tokens: 0,
+            ..Default::default()
         };
         Ok(GenerationResponse { text, usage, model: "offline-stub".into() })
     }
@@ -135,7 +135,7 @@ impl LanguageModel for MeteredModel {
         self.requests.lock().push(req);
         Ok(GenerationResponse {
             text: text.clone(),
-            usage: Usage { prompt_tokens: prompt, completion_tokens: tokens::estimate_tokens(&text) as u64, cached_tokens: cached },
+            usage: Usage { prompt_tokens: prompt, completion_tokens: tokens::estimate_tokens(&text) as u64, cached_tokens: cached, ..Default::default() },
             model: self.name.clone(),
         })
     }

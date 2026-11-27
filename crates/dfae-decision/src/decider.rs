@@ -138,6 +138,9 @@ impl Decider {
             latency_ms: resp.latency_ms,
             cached: from_cache,
             origin: None,
+            reasoning_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: None,
         });
         (resp, record, entry)
     }
@@ -166,6 +169,7 @@ impl Decider {
         routing.conditional = yes("conditional_change");
         // an answer that depends on what the world looks like now has to be looked up: that is a task, not a conversation
         routing.fresh_data = yes("fresh_data");
+        routing.asks = yes("asks_answer");
         routing.needs_tools |= routing.fresh_data;
         // the model's judgement, or a service named outright in a request that has something to do (not "what is GitHub?")
         routing.external = yes("external_service") || (routing.needs_tools && crate::local::names_external_service(&request));

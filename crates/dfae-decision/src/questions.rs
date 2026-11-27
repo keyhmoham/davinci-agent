@@ -46,6 +46,10 @@ pub fn route_request(state: DecisionState) -> DecisionRequest {
         Question::noul("Does a correct answer depend on information that changes over time or happened recently — a price, a rate, the weather, news, a score, the latest version of something — which the assistant cannot know without looking it up on the web or in a system?"),
     );
     q.insert(
+        "asks_answer".into(),
+        Question::noul("Does the request ask a question, or for information that has to be worked out or stated from what is read or found (what changed, which files, how many, why, what it is about, a summary or explanation), rather than only to show a file or listing as it is or to make a change?"),
+    );
+    q.insert(
         "external_service".into(),
         Question::noul("Does the request name, or clearly depend on, a particular outside service, website, app or system — for example GitHub, DeepWiki, Slack, Notion, Jira, Linear, Google Drive or Calendar, email, a database, a map, a payment or cloud provider, a social network — as opposed to a general task done with local files, the shell or calculation?"),
     );

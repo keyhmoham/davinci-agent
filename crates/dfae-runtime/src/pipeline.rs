@@ -418,6 +418,9 @@ impl Inner {
                     latency_ms: latency,
                     cached,
                     origin: None,
+                    reasoning_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost_usd: None,
                 },
             )
             .await;

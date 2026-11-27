@@ -269,7 +269,9 @@ async fn a_result_that_misses_the_planners_expectation_goes_back_to_the_external
     assert!(problem.contains("Re-plan with a patch"), "the re-plan rules are in the message, so one cached system prompt serves both: {problem}");
     assert!(problem.contains("does not meet what was expected") && problem.contains("status = BAD"), "the planner is told what was actually found: {problem}");
     assert_eq!(t.plan.as_ref().unwrap().step("s1").unwrap().status, StepStatus::Succeeded, "the result is kept, not thrown away");
-    assert!(t.final_answer.as_deref().unwrap().contains("status = fine"), "{:?}", t.final_answer);
+    // the request asks for a report: the answer is written from the evidence, not the raw file
+    let a = t.final_answer.as_deref().unwrap();
+    assert!(a.contains("fine") && a.contains("backup.toml"), "{a:?}");
 }
 
 #[tokio::test]
@@ -320,10 +322,13 @@ async fn when_the_decision_model_says_it_needs_planning_the_external_model_plans
     let r = oracle_rig_with_strong(vec![oracle("escalated")]);
     std::fs::write(r.ws.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
     r.planner.push(&json!({"steps": [{"id": "s1", "do": "read notes.txt", "tool": "fs_read"}]}).to_string());
+    // the plan reads the file but has no step that states the answer: the worker writes it from the evidence
+    r.worker.push("The first line is: first line");
     let t = say(&r, "p", "tell me the first line of notes.txt").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Planner);
     assert_eq!(r.planner.calls(), 1);
+    assert_eq!(t.final_answer.as_deref(), Some("The first line is: first line"));
 }
 
 #[tokio::test]
