@@ -29,6 +29,12 @@ anyhow = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 toml = { workspace = true }
+# in-process JS/TS/JSX syntax check (coding plan A6); 0.96 is the newest release whose MSRV (1.88) matches the workspace
+oxc_parser = "=0.96.0"
+oxc_allocator = "=0.96.0"
+oxc_span = "=0.96.0"
+oxc_syntax = "=0.96.0"
+oxc_diagnostics = "=0.96.0"
 [dev-dependencies]
 tempfile = "3"
 axum = { workspace = true }
