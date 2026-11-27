@@ -363,7 +363,8 @@ impl Config {
     pub fn from_env() -> Self {
         let mut planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium", "");
         // the planner thinks as hard as the request needs (Ares-style adaptive effort); off: one effort for every plan
-        if !matches!(env("PLANNER_REASONING_ADAPTIVE").as_deref(), Some("off" | "false" | "0")) {
+        // off by default: measured, thinking less on simple requests made plans worse (14/20 vs 19/20, more re-plans, more planner tokens)
+        if matches!(env("PLANNER_REASONING_ADAPTIVE").as_deref(), Some("on" | "true" | "1")) {
             let level = |k: &str, d: &str| Some(env(k).unwrap_or_else(|| d.into()).to_ascii_lowercase()).filter(|v| v != "default" && !v.is_empty());
             planner.reasoning_simple = level("PLANNER_REASONING_SIMPLE", "none");
             planner.reasoning_complex = level("PLANNER_REASONING_COMPLEX", "medium");

@@ -656,9 +656,22 @@ impl Inner {
 
     /// Generate text on a tier with budget + ledger accounting. A worker model that cannot be reached (after the provider layer's
     /// own retries) does not stop the task: the planner model does the work instead, and the log says so.
+    /// How long the task may still run: a model call never outlives the task's time budget (a provider that stalls, retried three
+    /// times, would otherwise hold a task far past it — seen: 900 s in `Recovering` with every step done).
+    pub(crate) async fn time_left(&self, ctx: &Arc<TaskCtx>) -> std::time::Duration {
+        let r = ctx.rec.lock().await;
+        let elapsed = (Utc::now() - r.created_at).num_seconds().max(0) as u64;
+        std::time::Duration::from_secs(r.budget.max_seconds.saturating_sub(elapsed).max(5))
+    }
+
     pub(crate) async fn generate_text(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<String, String> {
         self.take_model_call(ctx, tier, 1).await?;
-        match self.models.generate(tier, req.clone()).await {
+        let left = self.time_left(ctx).await;
+        let first = match tokio::time::timeout(left, self.models.generate(tier, req.clone())).await {
+            Ok(r) => r,
+            Err(_) => return Err(format!("time budget exceeded during a {tier:?} call")),
+        };
+        match first {
             Ok(g) => {
                 self.add_ledger(ctx, g.entry.clone()).await;
                 Ok(g.text)
@@ -676,7 +689,10 @@ impl Inner {
 
     pub(crate) async fn gen_json(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<Value, String> {
         self.take_model_call(ctx, tier, 1).await?;
-        let (result, calls) = self.models.generate_json(tier, req).await;
+        let left = self.time_left(ctx).await;
+        let Ok((result, calls)) = tokio::time::timeout(left, self.models.generate_json(tier, req)).await else {
+            return Err(format!("time budget exceeded during a {tier:?} call"));
+        };
         if calls.len() > 1 {
             self.take_model_call(ctx, tier, (calls.len() - 1) as u32).await.ok();
         }

@@ -630,4 +630,8 @@ Evidence for every line is in `docs/eval/validation-2026-11-27.md`.
 | M4 plan templates | **done** | a paraphrase gets the verified plan as a worked example (checked with real embeddings); effect on re-plans not yet measured |
 | A1 step agent | **done, on by default** | re-plans −67%, planner calls −16%, cost +7%, same success (20 tasks per arm, interleaved) |
 | Quality fixes found by the suite | **done** | answers to questions, markdown fences, typed computed data, one-file steps naming several files, fs_edit on a directory, patch cycles, served addresses, the cwd of "the X directory", own-server checks |
-| W1 native function calling, W3 deterministic condensation, X1 masking for re-plans, P1 adaptive effort, E1c/E1d | not done | next candidates; each needs its own measurement |
+| P1 adaptive planner effort | **refuted, off by default** | 14/20 vs 19/20, more re-plans and planner tokens |
+| W1 native function calling | **refuted, not adopted** | 23/24 vs 22/24 correct, +41% cost |
+| E1c quarantined extraction | **done** | defence in depth; the baseline was already safe on the two injection pages (6/6 both arms) |
+| E1d personal-data redaction | **done** | fresh held-out set: 18/18 found, 15/15 lookalikes untouched |
+| W3 deterministic condensation, X1 masking for re-plans | not done | next candidates |

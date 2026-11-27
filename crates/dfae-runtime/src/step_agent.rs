@@ -46,7 +46,13 @@ pub fn parse(v: &Value) -> Option<Action> {
     match v["action"].as_str().unwrap_or(if v.get("tool").is_some_and(|t| t.is_string()) { "tool" } else { "" }) {
         "tool" => {
             let tool = s("tool");
-            let args = v.get("args").filter(|a| a.is_object()).cloned().unwrap_or_else(|| json!({}));
+            let mut args = v.get("args").filter(|a| a.is_object()).cloned().unwrap_or_else(|| json!({}));
+            // the action's own fields are not the tool's (seen: `why` inside args, refused as an unknown argument)
+            if let Some(m) = args.as_object_mut() {
+                for k in ["why", "action", "summary", "reason", "tool"] {
+                    m.remove(k);
+                }
+            }
             (!tool.is_empty()).then(|| Action::Tool { tool, args, why: s("why") })
         }
         "done" => Some(Action::Done(s("summary"))),
@@ -92,6 +98,11 @@ mod tests {
         assert_eq!(parse(&json!({"action": "done", "summary": "fixed the test"})), Some(Action::Done("fixed the test".into())));
         assert_eq!(parse(&json!({"action": "give_up", "reason": "needs another plan"})), Some(Action::GiveUp("needs another plan".into())));
         assert_eq!(parse(&json!({"action": "tool", "tool": null})), None);
+        assert_eq!(
+            parse(&json!({"action": "tool", "tool": "shell", "args": {"command": "pytest -q", "why": "rerun"}, "why": "rerun"})),
+            Some(Action::Tool { tool: "shell".into(), args: json!({"command": "pytest -q"}), why: "rerun".into() }),
+            "the action's own fields never reach the tool"
+        );
         assert_eq!(parse(&json!({"hello": 1})), None);
     }
 

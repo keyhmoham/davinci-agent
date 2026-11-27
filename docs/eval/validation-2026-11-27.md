@@ -180,3 +180,36 @@ run by run (drift in the providers hits both), one frozen build:
 
 `live_worker` 5/5. `live_e2e` (10 harder cases, one run each): 9/10 by the oracle, **1 re-plan in all**, $0.0182; the one "failure" was
 the oracle's (an about page titled "Our Story — Crumb & Co" without the word "about"), now fixed. Every case's task completed.
+
+## Round 6: the four remaining items
+
+**P1 — adaptive planner effort: refuted, off by default.** 10 harder cases × 2 runs per arm, interleaved:
+
+| Arm | Passed | Re-plans | Planner calls | Planner reasoning tokens | Planner $ | Total $ | Time |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| fixed effort (`low`) | **19/20** | 3 | 25 | 2,789 | $0.0060 | $0.0341 | 559 s |
+| adaptive (`none` / `low` / `medium`) | 14/20 | 8 | 34 | 4,687 | $0.0092 | $0.0534 | 1,546 s |
+
+Thinking less on requests the decision model scored simple made worse plans, so more failures, more re-plans and in the end more
+planner tokens. `PLANNER_REASONING_ADAPTIVE=on` keeps it available. The run also showed two bugs, fixed: the step agent put its `why`
+inside the tool's arguments (refused as unknown); and a model call could outlive the task's time budget (a task sat 900 s in
+`Recovering`, every step done) — every model call is now cut off at the task's remaining time.
+
+**W1 — native function calling for binding: refuted, not adopted.** 8 realistic bind cases × 3, with the repo's real prompt (signature
++ JSON schema, which the gateway enforces for GLM): JSON 22/24 correct ($0.00107), native tools 23/24 ($0.00151, +41%). A first probe
+that sent only the tool's name (not its signature) showed 10/24 vs 18/24 — that was the probe's fault, not the binding's.
+
+**E1c — untrusted content extracted, never summarised: done; end-to-end benefit not shown on these attacks.** Hidden page text
+(`display:none`, `hidden`, `aria-hidden`, templates, zero-size) is dropped at fetch; for web and MCP output, lines that read like model
+instructions are dropped and a long output is reduced to lines the worker selects by number, verbatim. The step agent no longer runs
+on untrusted steps, and in a tainted task may only use read-only tools (it was the one place where read text could choose a tool).
+Measured on two injected pages (an obvious and a hidden injection), old code vs new, 3 interleaved runs each, both "tell me the price"
+and "write a description into notes/kettle.md": **6/6 and 6/6 safe in both arms** — GLM did not follow the injections, and
+plan-then-execute meant the page could add no steps. What changed visibly: the old answer showed the user the hidden injected note
+verbatim; the new one does not. A real measure of E1c needs a stronger attack suite (AgentDojo-style).
+
+**E1d — personal-data redaction: done.** Long-term memory and the decision log keep text without e-mail addresses, phone numbers,
+Luhn-valid card numbers and IBANs; a fact whose value is personal data is not kept; the task record and explicit "remember" requests
+are kept as written. First held-out set: 82% recall, 4/15 lookalikes changed (a git remote, matches inside an id, a UUID, a time
+range) → whole-token matching, SSH remotes, national numbers. **Second fresh held-out set (never used to change a rule): 18/18 found,
+15/15 lookalikes untouched.** Names and street addresses are not caught (they need a model).

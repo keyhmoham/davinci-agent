@@ -1129,7 +1129,20 @@ impl Inner {
         if !self.cfg.economy.step_agent || !self.models.has(Tier::Worker) || step.kind != StepKind::Tool || !ctx.fixed.lock().insert(id.to_string()) {
             return false;
         }
-        let mut tools: Vec<String> = ctx.allowed.lock().iter().filter(|t| ctx.in_scope(t)).cloned().collect();
+        // Untrusted data never chooses actions (the plan-then-execute guarantee): a web page's or an outside service's text is not
+        // shown to a loop that may call tools, and once a task has seen text that reads like an injection, the loop may only read.
+        if step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m)) {
+            return false;
+        }
+        let tainted = ctx.rec.lock().await.tainted;
+        let mut tools: Vec<String> = ctx
+            .allowed
+            .lock()
+            .iter()
+            .filter(|t| ctx.in_scope(t))
+            .filter(|t| !tainted || self.tools.meta(t).is_some_and(|m| !m.side_effects))
+            .cloned()
+            .collect();
         tools.sort();
         let catalog = self.tools.catalog_lines(&tools);
         let goal = ctx.rec.lock().await.goal.clone();
