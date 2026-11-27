@@ -254,3 +254,15 @@ service, labels `person` and `street address`. Tuning set (13 names/addresses, 1
 ("Rust" as a person), 0.7 → 12/13 and 0/12; **0.6 chosen before a fresh held-out set → 14/14 found, 0/12 lookalikes touched** (products,
 companies, cities, frameworks). Wired in as a second redaction pass when memory is written (`DFAE_PII_NER_URL`, compose profile `pii`);
 live test: a request naming a person and an address leaves "post it to [NAME] at [ADDRESS]" in memory, the task record unchanged.
+
+**CodeAct-style step agent (the action-format idea, moved from binding to the fix loop).** Two cases built to start broken (a Python
+package with three bugs in two modules; a JavaScript slug function failing three assertions) plus the CLI case, 4 interleaved runs per arm:
+
+| Step agent | Passed | Fix actions | Re-plans | Planner calls | Cost | Time |
+|---|---:|---:|---:|---:|---:|---:|
+| one tool per action | 12/12 | 50 | 8 | 29 | $0.0395 | 365 s |
+| **one script per action (CodeAct), adopted** | 12/12 | **25** | **2** | **16** | **$0.0211** | **189 s** |
+
+Same success; −50% fix actions, −75% re-plans, −45% planner calls, −47% cost and time — the direction and size CodeAct reports for
+multi-step work. A script that writes a file skips `fs_write`'s parse check; the failed step always runs again and is judged, which
+is the stronger check. `DFAE_STEP_AGENT_STYLE=tools` keeps the old form.

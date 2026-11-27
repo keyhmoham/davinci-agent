@@ -322,6 +322,52 @@ fn cases() -> Vec<Case> {
             },
         },
         Case {
+            name: "fixloop python three bugs",
+            goal: "Run the tests with `python3 -m pytest -q` and fix the code until they all pass. Do not change the tests.",
+            then: &[],
+            between: None,
+            files: |ws| {
+                write(ws, "shop/__init__.py", "");
+                write(ws, "shop/cart.py", "def total(items):\n    return sum(i['price'] for i in items)\n\n\ndef count(items):\n    return len(items) - 1\n");
+                write(ws, "shop/discount.py", "def apply(price, pct):\n    return price * pct\n");
+                write(
+                    ws,
+                    "tests/test_shop.py",
+                    "from shop.cart import total, count\nfrom shop.discount import apply\n\n\ndef test_total_uses_quantity():\n    assert total([{'price': 2.0, 'qty': 3}]) == 6.0\n\n\ndef test_count():\n    assert count([1, 2, 3]) == 3\n\n\ndef test_apply_percent():\n    assert apply(200, 10) == 180\n",
+                );
+            },
+            check: |ws, _| {
+                let tests = std::fs::read_to_string(ws.join("tests/test_shop.py")).unwrap_or_default();
+                if !tests.contains("== 180") || !tests.contains("== 6.0") {
+                    return Err("the tests were changed".into());
+                }
+                let (ok, out) = run(ws, "python3 -m pytest -q 2>&1 | tail -3");
+                if ok && out.contains("3 passed") { Ok(()) } else { Err(format!("pytest: {out}")) }
+            },
+        },
+        Case {
+            name: "fixloop node failing test",
+            goal: "`node test.js` fails. Fix lib/slug.js so that it passes, without changing test.js.",
+            then: &[],
+            between: None,
+            files: |ws| {
+                write(ws, "lib/slug.js", "function slug(s) {\n  return s.toLowerCase().replace(' ', '-');\n}\nmodule.exports = { slug };\n");
+                write(
+                    ws,
+                    "test.js",
+                    "const assert = require('assert');\nconst { slug } = require('./lib/slug');\nassert.strictEqual(slug('Hello Big World'), 'hello-big-world');\nassert.strictEqual(slug('  Trim  Me  '), 'trim-me');\nassert.strictEqual(slug('Café Crème!'), 'cafe-creme');\nconsole.log('ok');\n",
+                );
+            },
+            check: |ws, _| {
+                let t = std::fs::read_to_string(ws.join("test.js")).unwrap_or_default();
+                if !t.contains("cafe-creme") {
+                    return Err("test.js was changed".into());
+                }
+                let (ok, out) = run(ws, "node test.js");
+                if ok && out.contains("ok") { Ok(()) } else { Err(format!("node test.js: {out}")) }
+            },
+        },
+        Case {
             name: "nextjs scaffold and build",
             goal: "Create a Next.js app in the directory notes-app whose home page lists three example notes, and make sure `npm run build` succeeds.",
             then: &[],
@@ -497,6 +543,8 @@ async fn harder_tasks_end_to_end() {
                 s.decision_cost_usd,
                 s.decision_calls
             );
+            let fixes = t.plan.as_ref().map(|p| p.steps.iter().filter(|s| s.how.as_deref() == Some("step-agent")).count()).unwrap_or(0);
+            eprintln!("  fix actions: {fixes}");
             eprintln!("  answer: {}", tokens::truncate_tokens(&answer(&t), 80).replace('\n', " ⏎ "));
             // LIVE_EVENTS=1: what the task was told along the way (MCP servers found and connected, warnings, repairs)
             if std::env::var("LIVE_EVENTS").is_ok() {

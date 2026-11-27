@@ -1158,7 +1158,9 @@ impl Inner {
                 self.shell_environment(true),
                 if turns.is_empty() { "nothing yet".to_string() } else { render_history(&turns, 2) }
             );
-            let mut req = self.gen_request(Tier::Worker, FIX_SYSTEM, user, "fix");
+            let system =
+                if self.cfg.economy.step_agent_script { format!("{FIX_SYSTEM}{}", crate::step_agent::FIX_SCRIPT_HINT) } else { FIX_SYSTEM.to_string() };
+            let mut req = self.gen_request(Tier::Worker, &system, user, "fix");
             req.json = true;
             req.schema = Some(schema(&tools));
             req.schema_strict = true;
