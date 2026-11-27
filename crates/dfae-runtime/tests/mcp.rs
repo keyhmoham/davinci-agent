@@ -153,7 +153,11 @@ async fn a_request_about_an_outside_service_finds_connects_and_uses_its_mcp_serv
     assert_eq!(listing.as_deref(), Some("https://glama.ai/mcp/connectors/ex.test/open-weather"));
     // the planner was shown the new tool
     let plan_req = r.planner.requests.lock().iter().find(|q| q.purpose == "plan").cloned().unwrap();
-    assert!(plan_req.system.contains("mcp__open_weather__get_forecast"), "the planner's catalogue has the MCP tool");
+    // (in the request, not in the system prompt: that is the cached prefix every task shares)
+    let user = &plan_req.messages[0].content;
+    assert!(user.contains("EXTRA TOOLS") && user.contains("mcp__open_weather__get_forecast"), "the planner is told of the MCP tool: {user}");
+    assert!(!plan_req.system.contains("mcp__"), "the shared system prompt stays the same");
+    assert!(plan_req.schema.as_ref().unwrap().to_string().contains("mcp__open_weather__get_forecast"), "and may plan with it");
     // the directory was asked with the few words the worker wrote, not with the request
     let query = r.worker.requests.lock().iter().find(|q| q.purpose == "mcp_query").cloned().unwrap();
     assert_eq!(query.max_tokens, 40);
@@ -188,7 +192,10 @@ async fn a_request_about_something_else_never_sees_mcp_tools() {
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     let plans: Vec<GenerationRequest> = r.planner.requests.lock().iter().filter(|q| q.purpose == "plan").cloned().collect();
     assert_eq!(plans.len(), 2);
-    assert!(plans[0].system.contains("mcp__open_weather__") && !plans[1].system.contains("mcp__"), "the catalogue of an unrelated task has no MCP tools");
+    let shown = |q: &GenerationRequest| q.messages[0].content.contains("mcp__open_weather__");
+    assert!(shown(&plans[0]) && !shown(&plans[1]), "an unrelated task is not told of MCP tools");
+    assert!(!plans[1].schema.as_ref().unwrap().to_string().contains("mcp__"), "nor may it plan with them");
+    assert_eq!(plans[0].system, plans[1].system, "both share one cached system prompt");
 }
 
 #[tokio::test]

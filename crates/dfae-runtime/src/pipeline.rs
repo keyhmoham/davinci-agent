@@ -928,23 +928,31 @@ impl Inner {
         purpose: &str,
     ) -> GenerationRequest {
         let eco = &self.cfg.economy;
-        let mut names: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
-        names.sort();
-        // the whole catalogue is always in the system prompt; with a provider that caches prompts and traffic that keeps the cache
-        // warm, the worked examples ride along too and the prompt is marked cacheable
+        // The system prompt and the schema are the provider's cached prefix: they list every native tool, whatever this task's scope,
+        // so every task shares one cache line (one tool more or less in either is a full cache miss: measured 4.7x the cost of the call).
+        // What differs — an MCP server's tools attached to this task, native tools outside its scope — is said in the request.
+        let mut native: Vec<String> = self.tools.names().into_iter().filter(|n| dfae_mcp::server_of(n).is_none()).collect();
+        native.sort();
+        let mut extra: Vec<String> = self.tools.names().into_iter().filter(|n| dfae_mcp::server_of(n).is_some() && ctx.in_scope(n)).collect();
+        extra.sort();
+        let unavailable: Vec<&String> = native.iter().filter(|n| !ctx.in_scope(n)).collect();
+        // with a provider that caches prompts and traffic that keeps the cache warm, the worked examples ride along too
         let cached = self.prefix_enabled();
-        let system = prompts::brief_system(eco.plan_report, self.shell_environment(false), &self.tools.catalog_lines(&names), cached);
-        let user = match replan {
+        let system = prompts::brief_system(eco.plan_report, self.shell_environment(false), &self.tools.catalog_lines(&native), cached);
+        let mut user = match replan {
             None => prompts::plan_request(ctx_text, max_steps),
             Some((state, problem, prefix)) => prompts::patch_request(ctx_text, state, problem, prefix, max_steps),
         };
+        if !extra.is_empty() {
+            user.push_str(&format!("\nEXTRA TOOLS (this task only):\n{}", self.tools.catalog_lines(&extra)));
+        }
+        if !unavailable.is_empty() {
+            user.push_str(&format!("\nNOT AVAILABLE IN THIS TASK: {}", unavailable.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        let names: Vec<String> = native.iter().chain(extra.iter()).cloned().collect();
         let mut req = self.gen_request(Tier::Planner, &system, user, purpose);
         req.json = true;
-        req.schema = Some(if replan.is_some() {
-            crate::plandoc::patch_schema(&names, max_steps)
-        } else {
-            crate::plandoc::plan_schema(&names, max_steps, eco.plan_report)
-        });
+        req.schema = Some(if replan.is_some() { crate::plandoc::patch_schema(&names) } else { crate::plandoc::plan_schema(&names, eco.plan_report) });
         req.schema_strict = true;
         req.cache = cached;
         req

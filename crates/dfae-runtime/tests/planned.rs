@@ -905,3 +905,20 @@ async fn an_answer_that_depends_on_what_the_world_looks_like_now_is_looked_up_ne
     assert_eq!(plan.source, PlanSource::Quick, "not a chat reply");
     assert_eq!(plan.steps[0].tool.as_deref(), Some("web_search"), "{:?}", plan.steps);
 }
+
+#[tokio::test]
+async fn every_plan_request_shares_one_cacheable_prefix() {
+    // the system prompt and the schema are the provider's cached prefix: they must not change from task to task (a tool more or less,
+    // a step limit in a description, ... each is a full cache miss)
+    let r = rig(true, |_| {});
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read a.txt", "tool": "fs_read"}]}).to_string());
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "create the directory out", "tool": "fs_mkdir"}]}).to_string());
+    run_as(&r, ModeRequest::Escalated, "Read a.txt").await;
+    run_as(&r, ModeRequest::Escalated, "Create a directory called out").await;
+    let reqs: Vec<GenerationRequest> = r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("plan")).cloned().collect();
+    assert!(reqs.len() >= 2, "{} plan requests", reqs.len());
+    assert_eq!(reqs[0].system, reqs[1].system, "one system prompt for every task");
+    assert_eq!(reqs[0].schema, reqs[1].schema, "one schema for every task");
+    assert!(!reqs[0].schema.as_ref().unwrap().to_string().contains("at most 12"), "no per-task limit inside the schema");
+}

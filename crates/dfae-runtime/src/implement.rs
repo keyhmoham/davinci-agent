@@ -146,6 +146,50 @@ pub(crate) fn directory_named(step: &str, command: &str, workspace: &std::path::
         .find(|d| !d.is_empty() && !d.starts_with("..") && workspace.join(d).is_dir() && !command.contains(d.as_str()))
 }
 
+/// The numbers of a data file (`.csv`, `.tsv`) that appear in none of `sources`: values a model made up while "writing" data that had to
+/// be computed. Only numbers of three digits or more (or with decimals) count; two such numbers make it a finding.
+pub(crate) fn invented_numbers(path: &str, content: &str, sources: &[&str]) -> Vec<String> {
+    static NUM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap());
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "csv" | "tsv") {
+        return vec![];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for m in NUM.find_iter(content) {
+        let n = m.as_str();
+        let digits = n.chars().filter(|c| c.is_ascii_digit()).count();
+        if (digits >= 3 || n.contains('.')) && !sources.iter().any(|s| s.contains(n)) && !out.iter().any(|o| o == n) {
+            out.push(n.to_string());
+        }
+    }
+    if out.len() >= 2 {
+        out.truncate(5);
+        out
+    } else {
+        vec![]
+    }
+}
+
+/// `DFAE_EXTRACT_AUDIT=<file>`: for every string argument a step was bound with, one JSON line saying which extractor's entities hold
+/// the value (`gliner`, `rules`, `both`, `none`). It answers whether the semantic extractor earns its keep: how often it is the only
+/// source of a value that ends up in a tool call.
+fn audit_extraction(task: &str, step: &str, tool: &str, args: &Map<String, Value>, entities: &[Entity]) {
+    let Ok(path) = std::env::var("DFAE_EXTRACT_AUDIT") else { return };
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    for (k, v) in args {
+        let Some(v) = v.as_str().filter(|v| !v.is_empty() && v.len() <= 300) else { continue };
+        let holds = |src: &str| entities.iter().any(|e| e.source.contains(src) && !e.text.is_empty() && (v == e.text || v.contains(e.text.as_str())));
+        let source = match (holds("gliner"), holds("rules")) {
+            (true, true) => "both",
+            (true, false) => "gliner",
+            (false, true) => "rules",
+            _ => "none",
+        };
+        let _ = writeln!(f, "{}", serde_json::json!({"task": task, "step": step, "tool": tool, "arg": k, "value": v, "source": source}));
+    }
+}
+
 /// Some models end a reply with their own tool-call syntax (`</arg_value><arg_key>path</arg_key>…</tool_call>`): it is never part
 /// of a file or an argument.
 pub(crate) fn strip_tool_markup(text: &str) -> String {
@@ -712,6 +756,22 @@ impl Inner {
             && !self.names_an_earlier_value(ctx, step)
             && let Some(text) = self.write_content(ctx, step, &args, deps, feedback).await
         {
+            // a data file whose numbers come from nowhere was typed, not computed: a model cannot add up 200 rows in its head
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let goal = ctx.rec.lock().await.goal.clone();
+            let mut sources: Vec<&str> = deps.iter().flat_map(|(_, _, summary, full)| [summary.as_str(), full.as_str()]).collect();
+            sources.extend([goal.as_str(), step.description.as_str()]);
+            let invented = invented_numbers(path, &text, &sources);
+            if !invented.is_empty() {
+                return Err(fail(
+                    ErrorKind::Other,
+                    format!(
+                        "the values written to {path} ({}) are in none of the step's inputs: values that have to be computed (totals, counts, \
+                         aggregates) are computed by a script — a shell step that reads the data and writes {path} — never typed",
+                        invented.join(", ")
+                    ),
+                ));
+            }
             args.insert("content".into(), Value::String(text));
             how.push(if self.step_tier_for_content(step) == Tier::Planner { "planner" } else { "worker" });
         }
@@ -831,6 +891,7 @@ impl Inner {
                 how.push("rules");
             }
         }
+        audit_extraction(&ctx.id, &step.id, &tool, &args, &entities);
         done.kind = StepKind::Tool;
         done.tool = Some(tool.clone());
         done.args = Value::Object(args.clone());
@@ -914,6 +975,16 @@ mod tests {
 
     fn m(v: Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn computed_data_that_was_typed_is_caught() {
+        use super::invented_numbers;
+        let src = "order_id,region,units,unit_price\n1000,north,1,5\n1001,west,5,36";
+        assert_eq!(invented_numbers("totals.csv", "region,revenue\nnorth,2914\nwest,3068\n", &[src]), vec!["2914", "3068"]);
+        assert!(invented_numbers("copy.csv", "order_id,region\n1000,north\n1001,west\n", &[src]).is_empty(), "copied values are in the input");
+        assert!(invented_numbers("notes.md", "north 2914, west 3068", &[src]).is_empty(), "only data files");
+        assert!(invented_numbers("t.csv", "a,b\n1,2\n3,4\n", &[src]).is_empty(), "small numbers are not evidence");
     }
 
     #[test]

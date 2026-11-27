@@ -306,9 +306,11 @@ fn step_schema(tools: &[String]) -> Value {
 }
 
 /// The JSON Schema of a plan (strict structured output: every property required, none extra).
-pub fn plan_schema(tools: &[String], max_steps: u32, with_report: bool) -> Value {
-    // no minItems/maxItems: strict structured-output modes of several providers reject them; the limit is in the description and validated in code
-    let mut props = json!({"steps": {"type": "array", "items": step_schema(tools), "description": format!("at most {max_steps} steps")}});
+///
+/// It is part of the provider's cached prompt prefix, so nothing in it varies from task to task: the step limit is in the request
+/// (`MAX_STEPS`) and validated in code (no minItems/maxItems either: strict structured-output modes of several providers reject them).
+pub fn plan_schema(tools: &[String], with_report: bool) -> Value {
+    let mut props = json!({"steps": {"type": "array", "items": step_schema(tools), "description": "the steps, at most MAX_STEPS"}});
     let mut required = vec!["steps"];
     if with_report {
         props["report"] = json!({"anyOf": [{"type": "string"}, {"type": "null"}], "description": "the final reply to the user with {{sN}} where step sN's output belongs, or null"});
@@ -318,8 +320,8 @@ pub fn plan_schema(tools: &[String], max_steps: u32, with_report: bool) -> Value
 }
 
 /// The JSON Schema of a re-planning patch.
-pub fn patch_schema(tools: &[String], max_steps: u32) -> Value {
-    let list = |desc: &str| json!({"type": "array", "items": step_schema(tools), "description": format!("{desc} (at most {max_steps})")});
+pub fn patch_schema(tools: &[String]) -> Value {
+    let list = |desc: &str| json!({"type": "array", "items": step_schema(tools), "description": desc});
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -406,14 +408,14 @@ mod tests {
 
     #[test]
     fn the_schemas_are_strict_and_name_the_tools() {
-        let s = plan_schema(&tools(), 12, false);
+        let s = plan_schema(&tools(), false);
         assert_eq!(s["additionalProperties"], false);
         let item = &s["properties"]["steps"]["items"];
         assert_eq!(item["required"].as_array().unwrap().len(), 6);
         let e = item["properties"]["tool"]["anyOf"][0]["enum"].as_array().unwrap();
         assert!(e.contains(&json!("fs_write")) && !e.contains(&json!("teleport")));
-        assert!(plan_schema(&tools(), 12, true)["required"].as_array().unwrap().contains(&json!("report")));
-        assert_eq!(patch_schema(&tools(), 8)["required"], json!(["edit", "add", "drop"]));
+        assert!(plan_schema(&tools(), true)["required"].as_array().unwrap().contains(&json!("report")));
+        assert_eq!(patch_schema(&tools())["required"], json!(["edit", "add", "drop"]));
     }
 
     #[test]

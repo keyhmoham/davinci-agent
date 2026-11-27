@@ -174,6 +174,7 @@ pub struct StatsReport {
 
 impl Engine {
     pub fn new(deps: EngineDeps) -> Self {
+        let prefix_policy = crate::economy::prefix::PrefixPolicy::for_model(&deps.config.planner.model);
         Self {
             inner: Arc::new(Inner {
                 dispatcher: Dispatcher::new(&deps.config.team),
@@ -188,7 +189,7 @@ impl Engine {
                 bus: EventBus::new(),
                 live: Mutex::new(HashMap::new()),
                 prefix_misses: std::sync::atomic::AtomicU32::new(0),
-                prefix_policy: Mutex::new(Default::default()),
+                prefix_policy: Mutex::new(prefix_policy),
                 shadow: Default::default(),
                 mcp: std::sync::OnceLock::new(),
                 runtimes: tokio::sync::OnceCell::new(),

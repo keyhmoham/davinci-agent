@@ -67,3 +67,36 @@ $0.15/$0.50, best p95 latency on the gateway's endpoint list) through `providerO
 **`WORKER_REASONING=low`** by default (GLM-5.3-Flash cannot switch thinking off; `low` measured 0 reasoning tokens on ordinary steps).
 
 Live suite after these changes: 5/5 × 3 runs pass.
+
+## Round 3: a harder end-to-end suite through the real bootstrap
+
+`crates/dfae-runtime/tests/live_e2e.rs` runs six harder tasks through `build_engine` (the container's sandbox policy, the hosted
+decisions, the real planner and worker, automatic routing), each checked by an oracle on the outcome:
+
+| Case | What the oracle checks |
+|---|---|
+| bug fix against failing tests | `pytest` reports 5 passed, the tests are unchanged |
+| CLI with tests | `wordcount.py sample.txt` prints 9, its tests pass |
+| CSV analysis | the answer names the right region; `totals.csv` has the right total for every region |
+| rename across a JS project | no `calcTotal` left in `src/`, `node test.js` passes |
+| a served two-page site | the address in the answer serves the home page, which links to an about page that is served too |
+| a question about code | the answer gives the right value (72) |
+
+Failures found, and the fixes (each with a test):
+
+| Seen | Cause | Fix |
+|---|---|---|
+| a re-plan in 3 of 6 tasks | a one-file step (`fs_read`, `fs_edit`) naming two files: the worker binds the first | `split_multi_file_steps`: one step per existing file, dependents wait for all |
+| a rename that failed after 4 re-plans | `fs_edit` "in each file the search found" changes one file; partial edits loop | `fs_edit` with a directory as `path` replaces in every file under it |
+| "replanning failed: dependency cycle" | a patch edits a waiting step to run after the new steps, and the new steps wait for it | the back edge is dropped, the edit kept |
+| the CSV answer was "wrote 56 bytes to totals.csv" | a question in a request that also changes something was not answered | `asks` answers whether or not the request changes something |
+| `totals.csv` with invented totals | the worker "wrote" computed data | `invented_numbers`: a data file whose numbers are in no input fails the step with "compute it with a script" |
+| a served site answered with a list of every step (the dead port first) | — | a request that started a server is answered with where to reach it |
+| the server served the workspace root, 2 re-plans | "for the site directory" was not read as the cwd; a bound cwd of `.` | the name before "directory/folder" is the cwd; `.` counts as unset |
+| false "not in the evidence" warnings | the address came from the command; `**url/**` markdown; a page under the address | served addresses and pages under them count as evidence |
+
+**Caching (C1, C3).** The planner's system prompt and schema now list every native tool whatever the task's scope; MCP tools attached
+to a task are listed in the request (`EXTRA TOOLS`) and added to that task's schema only; the step limit left the schema. Two different
+tasks send byte-identical system prompts and schemas (test). The prefix policy uses the planner's cache lifetime: 25 minutes for
+OpenAI models (`PLANNER_CACHE_TTL_SECS`), 270 s otherwise. C2 (one effort for plans and re-plans) was **not** done: a re-plan thinks
+harder on purpose, and its separate cache line costs ≈ $0.0003 per re-plan.
