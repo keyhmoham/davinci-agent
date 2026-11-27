@@ -521,8 +521,9 @@ impl Inner {
             })
             .await
             .unwrap_or_default();
-        // a fact a newer one replaced is history, not knowledge
-        let cands: Vec<ScoredMemory> = cands.into_iter().filter(|c| c.item.metadata.get("superseded_by").is_none()).collect();
+        // a fact a newer one replaced is history, not knowledge; a lesson that has hurt more than it helped is retired
+        let retired = |md: &serde_json::Value| md["harmful"].as_u64().unwrap_or(0) >= md["helpful"].as_u64().unwrap_or(0) + 2;
+        let cands: Vec<ScoredMemory> = cands.into_iter().filter(|c| c.item.metadata.get("superseded_by").is_none() && !retired(&c.item.metadata)).collect();
         let ranked: Vec<_> = dedupe_memories(rank_memories(cands, entities)).into_iter().filter(|m| m.relevant()).take(6).collect();
         let refs: Vec<RetrievedRef> = ranked
             .iter()
@@ -555,7 +556,7 @@ impl Inner {
             .map(|l| l.upstream.iter().map(|u| (u.label.clone(), u.summary.clone())).collect())
             .unwrap_or_default();
         let artifacts = session::artifacts_from(history);
-        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, artifacts, upstream };
+        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, artifacts, upstream, template: None };
         if profile != ContextProfile::Minimal {
             ctx.rec.lock().await.retrieved = refs.clone();
             self.emit(ctx, EventKind::Retrieval { items: refs }).await;
@@ -588,7 +589,6 @@ impl Inner {
             vec![]
         };
         // every context token is billed (planner and worker alike): the profile follows the request's complexity
-        let _ = tier;
         let profile = r.request.profile.unwrap_or(match r.route.as_ref().map(|x| x.complexity).unwrap_or(0.3) {
             c if c >= 0.65 => ContextProfile::Reasoning,
             c if c < 0.25 => ContextProfile::Minimal,
@@ -604,12 +604,53 @@ impl Inner {
             profile,
         });
         let mut text = pkg.render();
+        if tier == Tier::Planner
+            && let Some(t) = &base.template
+        {
+            text.push('\n');
+            text.push_str(t);
+        }
         // what "it", "that code" and "the page above" can refer to, by name: a step uses `{{prev_code}}`, nobody copies the code
         if !base.artifacts.is_empty() {
             let list = base.artifacts.iter().map(|(n, _, d)| format!("{n} = {d}")).collect::<Vec<_>>().join("; ");
             text.push_str(&format!("\nVALUES from the conversation (write {{{{name}}}} in an argument or a step instead of copying them): {list}"));
         }
         text
+    }
+
+    /// A verified plan for a request close in meaning but not in shape (a paraphrase, the same job on other things): it cannot replay,
+    /// but the planner is shown it as a worked example to adapt (cf. agentic plan caching). Only a skill that has worked more often
+    /// than not, and only a close semantic match (measured: right matches 0.54-1.0, wrong ones up to 0.62).
+    async fn find_template(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) {
+        if ctx.base_ctx.lock().template.is_some() {
+            return;
+        }
+        let masked = skills::mask_request(goal, &skills::slot_values(goal, entities));
+        let Ok(cands) = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 3, session_id: None }).await else {
+            return;
+        };
+        for c in cands.into_iter().filter(|c| c.semantic && c.similarity >= 0.65) {
+            let Some(skill) = c.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) else { continue };
+            if skill.successes <= skill.failures {
+                continue;
+            }
+            let steps: Vec<String> = skill
+                .template
+                .steps
+                .iter()
+                // a slot is shown as <name>: `{{slot:x}}` looks like a value the plan could use by name
+                .map(|s| {
+                    let d = tokens::truncate_tokens(&s.description, 40).replace("{{slot:", "<").replace("}}", ">");
+                    format!("{} {}: {d}", s.id, s.tool.as_deref().unwrap_or("reasoning"))
+                })
+                .collect();
+            ctx.base_ctx.lock().template = Some(format!(
+                "A PLAN THAT WORKED FOR A SIMILAR REQUEST (\"{}\"; adapt it to this request — its values are not this request's): {}",
+                tokens::truncate_tokens(&skill.masked_request, 40),
+                steps.join("; ")
+            ));
+            return;
+        }
     }
 
     async fn find_skill(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) -> Option<SkillMatch> {
@@ -654,6 +695,9 @@ impl Inner {
         // writes files with shell heredocs. The decision layer picks tools only for what the worker system does alone.
         let quick = mode == ExecMode::Assisted && has_planner && !is_member;
         let planner_plans = has_planner && !quick;
+        if planner_plans {
+            self.find_template(ctx, goal, entities).await;
+        }
         let (allowed, top_tool): (Vec<String>, Option<String>) = if planner_plans {
             (self.scoped_metas(ctx).into_iter().map(|m| m.name).collect(), None)
         } else {
@@ -1388,6 +1432,27 @@ impl Inner {
                         it.metadata = json!({"source": "promoted-entity", "task_id": rec.task_id});
                         let _ = self.store.store(it).await;
                     }
+                }
+            }
+        }
+
+        // 3a. lessons learn from their own use (cf. ACE's helpful/harmful counts): a lesson shown to a task that then went smoothly
+        //     helped; one shown to a task that failed did not. One that hurts more than it helps is retired (no longer shown).
+        let smooth = success && rec.usage.replans == 0;
+        if smooth || !success {
+            for r in rec.retrieved.iter().filter(|r| r.kind == "semantic") {
+                let found = self
+                    .store
+                    .retrieve(MemoryQuery { text: r.preview.clone(), kinds: vec![MemoryKind::Semantic], limit: 3, session_id: None })
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|m| m.item.id == r.id && m.item.metadata["source"] == "lesson");
+                if let Some(m) = found {
+                    let mut md = m.item.metadata.clone();
+                    let key = if smooth { "helpful" } else { "harmful" };
+                    md[key] = json!(md[key].as_u64().unwrap_or(0) + 1);
+                    let _ = self.store.update_metadata(&m.item.id, md).await;
                 }
             }
         }

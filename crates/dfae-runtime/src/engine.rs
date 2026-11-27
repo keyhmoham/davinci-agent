@@ -102,6 +102,9 @@ pub(crate) struct ContextBase {
     pub artifacts: Vec<(String, String, String)>,
     /// Results of the agents this one depends on `(label, summary)`.
     pub upstream: Vec<(String, String)>,
+    /// A verified plan for a request like this one in meaning but not in shape (so it cannot replay): shown to the planner as a worked
+    /// example to adapt (cf. agentic plan caching).
+    pub template: Option<String>,
 }
 
 pub(crate) struct Inner {

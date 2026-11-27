@@ -146,3 +146,10 @@ where "the service that handles our invoices" lives) passed **3/3 with and 3/3 w
 couple of memories, so the earlier episode is retrieved whatever the embedder. The e2e harness cannot show the ranking difference; the
 component eval above does. What would show it is a long-lived store with hundreds of memories — real traffic, measured with
 `DFAE_DECISION_LOG` and the memory hit rate.
+
+**M3 (lessons learn from use)**: a lesson shown to a task that then went smoothly (completed, no re-plan) counts `helpful`; one shown to a
+task that failed counts `harmful`; a lesson whose harmful count reaches its helpful count + 2 is retired (no longer shown).
+**M4 (plan templates)**: a verified skill close in meaning but not in shape (semantic similarity ≥ 0.65, more successes than failures)
+cannot replay, but the planner sees its plan as a worked example (`A PLAN THAT WORKED FOR A SIMILAR REQUEST …`, slots shown as `<name>`).
+Checked with real embeddings (`tests/memory_live.rs`): a paraphrase of a verified request gets the template, an unrelated request does not.
+Whether templates lower re-plans on real traffic is not measured yet (it needs a long-lived skill store).
