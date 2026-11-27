@@ -684,7 +684,8 @@ impl Tool for MemorySearch {
         let q = arg_str(&input, "query")?;
         let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(5).min(20) as usize;
         let r = self.memory.retrieve(MemoryQuery { text: q.into(), kinds: vec![], limit, session_id: None }).await.map_err(|e| ToolError::io(e.to_string()))?;
-        let r: Vec<_> = r.into_iter().filter(|m| m.similarity > 0.15).collect();
+        let r: Vec<_> =
+            r.into_iter().filter(|m| m.similarity > if m.semantic { 0.35 } else { 0.15 } && m.item.metadata.get("superseded_by").is_none()).collect();
         if r.is_empty() {
             return Ok(ToolOutput::ok(format!("no relevant memories for '{q}'")));
         }

@@ -5,7 +5,7 @@
 #   ./dfae                           both of the above
 #
 # Everything optional degrades gracefully: without the GLiNER model the engine
-# extracts with rules; decisions are made by the hosted Decisions API (openai/gpt-6-luna-decisions on Vercel AI Gateway, with the
+# extracts with rules (COMPOSE_PROFILES=gliner adds the GLiNER service); decisions are made by the hosted Decisions API (openai/gpt-6-luna-decisions on Vercel AI Gateway, with the
 # planner's key) and, if it cannot be reached, by built-in rules. A self-hosted decision model instead:
 #   COMPOSE_PROFILES=local-decisions DECISION_BASE_URL=http://ollama:11434/v1 docker compose up -d
 # (DECISION_PROVIDER=local: built-in rules only). Without
@@ -30,8 +30,11 @@ services:
       retries: 20
 
   # Entity extraction (GLiNER). The model downloads on first start.
+  # Optional (COMPOSE_PROFILES=gliner, GLINER_URL=http://gliner:8000): on the harder end-to-end suite it made no measurable difference
+  # (rules only 29/30, with GLiNER 28/30, same cost, +18% time), so requests are read with rules and the planner's own sentences.
   gliner:
     build: ./services/gliner-service
+    profiles: ["gliner"]
     restart: unless-stopped
     environment:
       GLINER_MODEL: ${GLINER_MODEL:-urchade/gliner_small-v2.1}
@@ -92,7 +95,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgres://dfae:${POSTGRES_PASSWORD:-dfae}@postgres:5432/dfae
-      GLINER_URL: http://gliner:8000
+      GLINER_URL: ${GLINER_URL:-}
+      DFAE_EMBEDDINGS: ${DFAE_EMBEDDINGS:-}
+      DFAE_EMBEDDINGS_DIM: ${DFAE_EMBEDDINGS_DIM:-}
+      DFAE_FACTS: ${DFAE_FACTS:-}
       # decision model: an open-weight model in the ollama service, answering typed questions through
       # token log-probabilities. DECISION_PROVIDER=local => built-in decision rules only.
       DECISION_BASE_URL: ${DECISION_BASE_URL:-}

@@ -1,4 +1,4 @@
-use crate::{GENESIS, HashEmbedder, chain_hash, cosine};
+use crate::{GENESIS, HashEmbedder, RemoteEmbedder, chain_hash, cosine};
 use async_trait::async_trait;
 use chrono::Utc;
 use dfae_core::*;
@@ -9,7 +9,8 @@ use std::collections::HashMap;
 #[derive(Default)]
 struct Inner {
     tasks: HashMap<String, TaskRecord>,
-    items: Vec<(MemoryItem, Vec<f32>)>,
+    /// (item, hash embedding, semantic embedding if the model gave one)
+    items: Vec<(MemoryItem, Vec<f32>, Option<Vec<f32>>)>,
     kv: HashMap<String, Value>,
     audit: Vec<AuditRecord>,
 }
@@ -18,17 +19,24 @@ struct Inner {
 pub struct InMemoryStore {
     inner: Mutex<Inner>,
     embedder: HashEmbedder,
+    semantic: Option<RemoteEmbedder>,
 }
 
 impl Default for InMemoryStore {
     fn default() -> Self {
-        Self { inner: Mutex::new(Inner::default()), embedder: HashEmbedder::default() }
+        Self { inner: Mutex::new(Inner::default()), embedder: HashEmbedder::default(), semantic: None }
     }
 }
 
 impl InMemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Also give every item a semantic embedding from `model` (retrieval then ranks by meaning).
+    pub fn with_semantic(mut self, model: Option<RemoteEmbedder>) -> Self {
+        self.semantic = model;
+        self
     }
 }
 
@@ -63,25 +71,39 @@ impl MemoryStore for InMemoryStore {
             use dfae_core::Embedder;
             self.embedder.embed(&item.text)
         };
+        let sem = match &self.semantic {
+            Some(m) => m.embed_one(&item.text).await.map_err(|e| tracing::warn!(error = %e, "semantic embedding failed")).ok(),
+            None => None,
+        };
         let mut g = self.inner.lock();
-        g.items.retain(|(i, _)| i.id != item.id);
-        g.items.push((item, emb));
+        g.items.retain(|(i, _, _)| i.id != item.id);
+        g.items.push((item, emb, sem));
         Ok(())
     }
 
     async fn retrieve(&self, q: MemoryQuery) -> Result<Vec<ScoredMemory>, MemoryError> {
         use dfae_core::Embedder;
         let qe = self.embedder.embed(&q.text);
+        let qs = match &self.semantic {
+            Some(m) => m.embed_one(&q.text).await.ok(),
+            None => None,
+        };
         let g = self.inner.lock();
         let mut out: Vec<ScoredMemory> = g
             .items
             .iter()
-            .filter(|(i, _)| q.kinds.is_empty() || q.kinds.contains(&i.kind))
-            .filter(|(i, _)| match (&q.session_id, &i.session_id) {
+            .filter(|(i, _, _)| q.kinds.is_empty() || q.kinds.contains(&i.kind))
+            .filter(|(i, _, _)| match (&q.session_id, &i.session_id) {
                 (Some(s), Some(is)) => s == is,
                 _ => true,
             })
-            .map(|(i, e)| ScoredMemory { item: i.clone(), similarity: cosine(&qe, e) })
+            .map(|(i, e, s)| {
+                let shape = cosine(&qe, e);
+                match (&qs, s) {
+                    (Some(qs), Some(s)) => ScoredMemory { item: i.clone(), similarity: cosine(qs, s), shape_similarity: shape, semantic: true },
+                    _ => ScoredMemory::by_shape(i.clone(), shape),
+                }
+            })
             .collect();
         out.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
         out.truncate(q.limit);
@@ -90,8 +112,8 @@ impl MemoryStore for InMemoryStore {
 
     async fn update_metadata(&self, id: &str, metadata: Value) -> Result<(), MemoryError> {
         let mut g = self.inner.lock();
-        match g.items.iter_mut().find(|(i, _)| i.id == id) {
-            Some((i, _)) => {
+        match g.items.iter_mut().find(|(i, _, _)| i.id == id) {
+            Some((i, _, _)) => {
                 i.metadata = metadata;
                 Ok(())
             }
@@ -99,7 +121,7 @@ impl MemoryStore for InMemoryStore {
         }
     }
     async fn delete(&self, id: &str) -> Result<(), MemoryError> {
-        self.inner.lock().items.retain(|(i, _)| i.id != id);
+        self.inner.lock().items.retain(|(i, _, _)| i.id != id);
         Ok(())
     }
 
@@ -124,7 +146,7 @@ impl MemoryStore for InMemoryStore {
 
     async fn stats(&self) -> Result<MemoryStats, MemoryError> {
         let g = self.inner.lock();
-        let c = |k: MemoryKind| g.items.iter().filter(|(i, _)| i.kind == k).count();
+        let c = |k: MemoryKind| g.items.iter().filter(|(i, _, _)| i.kind == k).count();
         Ok(MemoryStats {
             backend: "memory".into(),
             tasks: g.tasks.len(),

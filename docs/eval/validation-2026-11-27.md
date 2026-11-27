@@ -114,3 +114,35 @@ harder on purpose, and its separate cache line costs ≈ $0.0003 per re-plan.
   binds the same values (the planner writes them into the step, and the worker reads it): containment is not necessity.
 * Conclusion: on these tasks the semantic extractor adds latency and a service (and a ~600 MB model) without measurable benefit, so a
   higher-quality hosted extractor would not help either: extraction is not where these tasks fail.
+
+## Round 4: memory — semantic embeddings (M1) and the fact extractor (E1a/E1b)
+
+**M1, measured first** (`cargo test -p dfae-memory --test embed_eval -- --ignored`): 20 stored task descriptions, 20 paraphrased requests.
+
+| Embedder | recall@1 | recall@3 | right match (mean / lowest) | wrong match (mean / highest) |
+|---|---:|---:|---|---|
+| hash (256-d, the default until now) | 0.65 | 0.75 | 0.23 / -0.10 | 0.00 / 0.58 |
+| `openai/text-embedding-3-small` | 0.95 | 1.00 | 0.66 / 0.39 | 0.18 / 0.54 |
+| **`voyage/voyage-4-lite`** (0.3 s) | **1.00** | **1.00** | 0.78 / 0.54 | 0.22 / 0.62 |
+| `alibaba/qwen3-embedding-0.6b` (5 s) | 1.00 | 1.00 | 0.80 / 0.71 | 0.36 / 0.70 |
+
+* Right and wrong matches overlap (0.54 vs 0.62): a semantic score is excellent for **ranking** and unsafe as a **gate**. So retrieval ranks
+  by meaning, while a skill still replays only on a request of the same shape (the hash similarity, `shape_similarity`), and duplicate
+  checks stay on wording. A request with one value changed scores 0.78 semantically — under the 0.82 skill threshold — which is another
+  reason the gate must stay on shape.
+* Implementation: every item keeps its hash vector (free, offline fallback) and gets a semantic one; Postgres adds a nullable
+  `embedding_sem_<dim>` column with an HNSW index and backfills old rows in the background. Tested against the real gateway and a real
+  Postgres 16 + pgvector (`tests/semantic_store.rs`): four paraphrased queries whose hash similarity to the right memory was about 0 all
+  found it, old rows were backfilled, nothing was left to backfill afterwards.
+
+**E1b, the fact extractor**: after a verified task, the worker names durable facts (host, port, service, path, project, version, URL,
+preference); code keeps one only if its quote occurs verbatim in the request or a tool's output and holds the value, never anything
+secret-looking; a newer value supersedes the older (`superseded_by`, no longer retrieved). It runs after the task finishes (no latency)
+and its cost is written into the stored task's ledger. **E1a**: GLiNER is behind the `gliner` compose profile; extraction on the hot path
+is rules plus the planner's own sentences.
+
+**End-to-end, honestly:** a cross-session case (session A writes a billing service's config; the file is deleted; a new session asks
+where "the service that handles our invoices" lives) passed **3/3 with and 3/3 without** the new memory: each run's store holds only a
+couple of memories, so the earlier episode is retrieved whatever the embedder. The e2e harness cannot show the ranking difference; the
+component eval above does. What would show it is a long-lived store with hundreds of memories — real traffic, measured with
+`DFAE_DECISION_LOG` and the memory hit rate.

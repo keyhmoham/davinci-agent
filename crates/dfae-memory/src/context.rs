@@ -12,6 +12,17 @@ pub struct RankedMemory {
     pub item: MemoryItem,
     pub similarity: f32,
     pub score: f32,
+    /// `similarity` is semantic (see `ScoredMemory::semantic`).
+    pub semantic: bool,
+}
+
+impl RankedMemory {
+    /// Related enough to the query to be shown at all. The two similarity scales differ: unrelated texts score about 0 with the hash
+    /// embedding and about 0.2 with a semantic one (measured with voyage-4-lite: wrong matches averaged 0.22, right ones 0.78; a
+    /// paraphrased lesson or a preference that bears on a request scored 0.41-0.62). At most six are shown, within the context budget.
+    pub fn relevant(&self) -> bool {
+        self.similarity >= if self.semantic { 0.35 } else { 0.2 }
+    }
 }
 
 /// Rank retrieval candidates: semantic similarity dominates, with recency,
@@ -32,7 +43,7 @@ pub fn rank_memories(cands: Vec<ScoredMemory>, query_entities: &[Entity]) -> Vec
                 q.intersection(&theirs).count() as f32 / q.len() as f32
             };
             let score = 0.55 * c.similarity.max(0.0) + 0.15 * recency + 0.15 * c.item.importance + 0.15 * overlap;
-            RankedMemory { item: c.item, similarity: c.similarity, score }
+            RankedMemory { item: c.item, similarity: c.similarity, score, semantic: c.semantic }
         })
         .collect();
     out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
@@ -215,6 +226,7 @@ mod tests {
                 item: MemoryItem::new(MemoryKind::Semantic, format!("memory number {i} {}", "filler ".repeat(40)), 0.5),
                 similarity: 0.5,
                 score: 0.5,
+                semantic: false,
             })
             .collect();
         let obs = vec![("s1 fs_list".to_string(), "x ".repeat(2000))];
@@ -259,7 +271,7 @@ mod tests {
 
     #[test]
     fn ranking_prefers_similar_and_dedupes() {
-        let mk = |t: &str, sim: f32| ScoredMemory { item: MemoryItem::new(MemoryKind::Semantic, t, 0.5), similarity: sim };
+        let mk = |t: &str, sim: f32| ScoredMemory::by_shape(MemoryItem::new(MemoryKind::Semantic, t, 0.5), sim);
         let ranked = rank_memories(vec![mk("alpha beta gamma", 0.2), mk("delta epsilon", 0.9), mk("delta epsilon", 0.89)], &[]);
         assert_eq!(ranked[0].item.text, "delta epsilon");
         let d = dedupe_memories(ranked);

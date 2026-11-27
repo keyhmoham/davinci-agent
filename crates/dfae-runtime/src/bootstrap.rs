@@ -11,11 +11,30 @@ use std::sync::Arc;
 
 pub async fn build_engine(config: Config) -> Result<Engine, String> {
     // memory
+    let semantic = config
+        .embeddings
+        .as_ref()
+        .and_then(|e| dfae_memory::RemoteEmbedder::new(&e.base_url, &e.model, e.api_key.clone(), e.dim, std::time::Duration::from_secs(20)));
+    if let Some(m) = &semantic {
+        tracing::info!(model = m.model(), dim = m.dim(), "memory: semantic embeddings");
+    }
     let store: Arc<dyn MemoryStore> = match &config.database_url {
-        Some(url) => Arc::new(PgStore::connect(url).await.map_err(|e| e.to_string())?),
+        Some(url) => {
+            let pg = Arc::new(PgStore::connect(url).await.map_err(|e| e.to_string())?.with_semantic(semantic).await.map_err(|e| e.to_string())?);
+            // rows stored before (or while the model was unreachable) get their semantic embedding in the background
+            let bg = pg.clone();
+            tokio::spawn(async move {
+                match bg.backfill_semantic().await {
+                    Ok(n) if n > 0 => tracing::info!(rows = n, "memory: semantic embeddings backfilled"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "memory: semantic backfill stopped"),
+                }
+            });
+            pg
+        }
         None => {
             tracing::warn!("DATABASE_URL not set: using volatile in-memory storage");
-            Arc::new(InMemoryStore::new())
+            Arc::new(InMemoryStore::new().with_semantic(semantic))
         }
     };
     // policy

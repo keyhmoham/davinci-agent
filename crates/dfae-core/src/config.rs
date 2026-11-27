@@ -78,6 +78,44 @@ fn hosted_decisions(planner: &ModelConfig) -> Option<HostedDecisionConfig> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+    pub dim: usize,
+}
+
+/// Measured on paraphrase retrieval (`dfae-memory/tests/embed_eval.rs`): recall@1 0.65 for the hash embedder, 0.95 for
+/// `text-embedding-3-small`, 1.00 for `voyage-4-lite` and `qwen3-embedding-0.6b` (the fastest of the two: 0.3 s against 5 s).
+fn embeddings(planner: &ModelConfig) -> Option<EmbeddingConfig> {
+    let model = env("DFAE_EMBEDDINGS");
+    if model.as_deref().is_some_and(|m| matches!(m.to_ascii_lowercase().as_str(), "hash" | "off" | "none")) {
+        return None;
+    }
+    let base_url = env("DFAE_EMBEDDINGS_BASE_URL").unwrap_or_else(|| planner.base_url.clone());
+    let api_key = env("DFAE_EMBEDDINGS_API_KEY").or_else(|| (base_url == planner.base_url).then(|| planner.api_key.clone()).flatten());
+    if model.is_none() && !(base_url.contains("ai-gateway.vercel.sh") && api_key.is_some()) {
+        return None;
+    }
+    let model = model.unwrap_or_else(|| "voyage/voyage-4-lite".into());
+    let known = match model.rsplit('/').next().unwrap_or("") {
+        "voyage-4-lite" | "voyage-4" | "voyage-4-large" | "voyage-3.5" | "voyage-3.5-lite" | "qwen3-embedding-0.6b" => Some(1024),
+        "text-embedding-3-small" | "text-embedding-ada-002" => Some(1536),
+        "text-embedding-3-large" => Some(3072),
+        "qwen3-embedding-4b" => Some(2560),
+        "qwen3-embedding-8b" => Some(4096),
+        _ => None,
+    };
+    let dim = env_parse("DFAE_EMBEDDINGS_DIM", known.unwrap_or(0));
+    if dim == 0 {
+        eprintln!("warning: DFAE_EMBEDDINGS_DIM is not set for {model}: semantic embeddings are off");
+        return None;
+    }
+    Some(EmbeddingConfig { base_url, model, api_key, dim })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// `openai` (any OpenAI-compatible server), `anthropic`, `mock`, `none`.
     pub provider: String,
@@ -202,6 +240,9 @@ pub struct EconomyConfig {
     /// A big tool output is condensed by the self-hosted model into what matters for the task before the external
     /// model reads it (`DFAE_CONDENSE=off` keeps the mechanical summary).
     pub condense: bool,
+    /// After a verified task, the worker model names its durable facts for semantic memory (`DFAE_FACTS=off` disables it).
+    #[serde(default)]
+    pub facts: bool,
 }
 
 /// Team orchestration and dispatch limits.
@@ -241,6 +282,10 @@ pub struct Config {
     pub workspace: PathBuf,
     pub policy_path: Option<PathBuf>,
     pub gliner_url: Option<String>,
+    /// The semantic embedding model of the memory (`DFAE_EMBEDDINGS`), next to the hash embedding every item has. Default: Voyage's
+    /// `voyage/voyage-4-lite` through Vercel AI Gateway when the planner's key reaches it; `hash` turns it off.
+    #[serde(default)]
+    pub embeddings: Option<EmbeddingConfig>,
     pub decision: DecisionConfig,
     pub worker: ModelConfig,
     pub planner: ModelConfig,
@@ -326,6 +371,7 @@ impl Config {
             workspace: PathBuf::from(env_or("DFAE_WORKSPACE", "./workspace")),
             policy_path: env("DFAE_POLICY").map(PathBuf::from),
             gliner_url: env("GLINER_URL"),
+            embeddings: embeddings(&planner),
             decision: DecisionConfig {
                 // `DECISION_PROVIDER=local` switches the model off even when a URL is set
                 base_url: env("DECISION_BASE_URL").filter(|_| env("DECISION_PROVIDER").map(|p| p != "local").unwrap_or(true)),
@@ -365,6 +411,7 @@ impl Config {
                 answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
                 workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
                 condense: !matches!(env("DFAE_CONDENSE").as_deref(), Some("off" | "false" | "0")),
+                facts: !matches!(env("DFAE_FACTS").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),
@@ -389,6 +436,9 @@ impl Default for Config {
         let mut c = Self::from_env();
         c.database_url = None;
         c.gliner_url = None;
+        c.embeddings = None;
+        // scripted models answer in order: a post-task call would take a reply meant for a later step
+        c.economy.facts = false;
         c.decision.base_url = None;
         c.decision.hosted = None;
         c.approvals = ApprovalMode::Ask; // the approval machinery is what the hermetic tests exercise

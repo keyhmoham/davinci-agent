@@ -19,8 +19,11 @@ use std::time::Duration;
 struct Case {
     name: &'static str,
     goal: &'static str,
-    /// Follow-up requests in the same session and workspace, after the goal (the oracle checks the state after the last).
+    /// Follow-up requests in the same workspace, after the goal (the oracle checks the state after the last). One that starts with
+    /// `new:` is asked in a new session (what it needs comes from long-term memory, not the conversation).
     then: &'static [&'static str],
+    /// Run before the follow-ups (to take away what memory has to replace).
+    between: Option<fn(&Path)>,
     files: fn(&Path),
     check: fn(&Path, &TaskRecord) -> Result<(), String>,
 }
@@ -45,6 +48,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "bugfix with failing tests",
             then: &[],
+            between: None,
             goal: "The tests in test_stats.py fail. Fix stats.py so that all of them pass.",
             files: |ws| {
                 write(ws, "stats.py", "def median(xs):\n    xs.sort()\n    return xs[len(xs) // 2]\n\n\ndef mean(xs):\n    return sum(xs) / len(xs)\n");
@@ -66,6 +70,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "cli with tests",
             then: &[],
+            between: None,
             goal: "Write a Python command-line tool wordcount.py that prints the number of words in the file given as its argument, \
                    write pytest tests for it in test_wordcount.py, and run the tests.",
             files: |ws| write(ws, "sample.txt", "the quick brown fox\njumps over the lazy dog\n"),
@@ -81,6 +86,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "csv analysis",
             then: &[],
+            between: None,
             goal: "sales.csv has one row per order. Which region had the highest total revenue? Also write the total revenue per region \
                    to totals.csv with the columns region,revenue.",
             files: |ws| {
@@ -123,6 +129,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "rename across a js project",
             then: &[],
+            between: None,
             goal: "Rename the function calcTotal to computeTotal everywhere in src/, and make sure `node test.js` still passes.",
             files: |ws| {
                 write(
@@ -157,6 +164,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "static site served",
             then: &[],
+            between: None,
             goal: "Create a small static website for a bakery called Crumb & Co in the site directory, with a home page and an about page \
                    linked from each other, and serve it on a free port from 8000 to 8010. Tell me the address.",
             files: |_| {},
@@ -177,6 +185,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "question about the code",
             then: &[],
+            between: None,
             goal: "What does the function apply_discount in shop/pricing.py do, and what does it return for a price of 80 with the code SAVE10?",
             files: |ws| {
                 write(
@@ -195,6 +204,7 @@ fn cases() -> Vec<Case> {
             name: "web lookup",
             goal: "What is the latest stable release of Python? Look it up on the web and give me the version number.",
             then: &[],
+            between: None,
             files: |_| {},
             check: |_, t| {
                 let a = answer(t);
@@ -210,6 +220,7 @@ fn cases() -> Vec<Case> {
             name: "follow-up in a session",
             goal: "Create a one-page website for a florist called Petal Lane in the shop directory.",
             then: &["Now add a contact page to it, with an address and opening hours, and link it from the home page."],
+            between: None,
             files: |_| {},
             check: |ws, _| {
                 let (_, found) = run(ws, "ls shop");
@@ -227,9 +238,23 @@ fn cases() -> Vec<Case> {
             },
         },
         Case {
+            name: "remembered across sessions",
+            goal: "Create config/billing.toml for our billing service: it runs on the host billing-7.internal on port 7421.",
+            then: &["new: Where does the service that handles our invoices live — which machine, and which port?"],
+            between: Some(|ws| {
+                let _ = std::fs::remove_dir_all(ws.join("config"));
+            }),
+            files: |_| {},
+            check: |_, t| {
+                let a = answer(t);
+                if a.contains("7421") && a.contains("billing-7") { Ok(()) } else { Err(format!("the answer does not recall it: {a}")) }
+            },
+        },
+        Case {
             name: "nextjs scaffold and build",
             goal: "Create a Next.js app in the directory notes-app whose home page lists three example notes, and make sure `npm run build` succeeds.",
             then: &[],
+            between: None,
             files: |_| {},
             check: |ws, _| {
                 let pkg = std::fs::read_to_string(ws.join("notes-app/package.json")).map_err(|e| format!("notes-app/package.json: {e}"))?;
@@ -276,12 +301,21 @@ async fn harder_tasks_end_to_end() {
             let session = format!("e2e-{}-{run_no}", c.name.replace(' ', "-"));
             let id = e.submit(TaskRequest { goal: c.goal.into(), session_id: Some(session.clone()), ..Default::default() }).await.unwrap();
             let mut t = e.wait(&id, Duration::from_secs(900)).await.expect("the task did not finish in 15 minutes");
+            if let Some(b) = c.between {
+                // memory is written after a task finishes: give it a moment
+                tokio::time::sleep(Duration::from_secs(8)).await;
+                b(ws.path());
+            }
             for follow in c.then {
                 if t.status != TaskStatus::Completed {
                     break;
                 }
                 let first = t.ledger.summary().cost_usd;
-                let id = e.submit(TaskRequest { goal: (*follow).into(), session_id: Some(session.clone()), ..Default::default() }).await.unwrap();
+                let (follow, session) = match follow.strip_prefix("new:") {
+                    Some(f) => (f.trim(), format!("{session}-new")),
+                    None => (*follow, session.clone()),
+                };
+                let id = e.submit(TaskRequest { goal: follow.into(), session_id: Some(session), ..Default::default() }).await.unwrap();
                 t = e.wait(&id, Duration::from_secs(900)).await.expect("the follow-up did not finish in 15 minutes");
                 cost += first;
                 eprintln!("  (follow-up: {follow})");

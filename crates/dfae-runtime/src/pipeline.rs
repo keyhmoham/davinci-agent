@@ -521,7 +521,9 @@ impl Inner {
             })
             .await
             .unwrap_or_default();
-        let ranked: Vec<_> = dedupe_memories(rank_memories(cands, entities)).into_iter().filter(|m| m.similarity >= 0.2).take(6).collect();
+        // a fact a newer one replaced is history, not knowledge
+        let cands: Vec<ScoredMemory> = cands.into_iter().filter(|c| c.item.metadata.get("superseded_by").is_none()).collect();
+        let ranked: Vec<_> = dedupe_memories(rank_memories(cands, entities)).into_iter().filter(|m| m.relevant()).take(6).collect();
         let refs: Vec<RetrievedRef> = ranked
             .iter()
             .map(|m| RetrievedRef {
@@ -616,7 +618,8 @@ impl Inner {
         let masked_now = masked.clone();
         let cands = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 3, session_id: None }).await.ok()?;
         for c in cands {
-            if c.similarity < self.cfg.thresholds.skill_min_similarity {
+            // a skill replays on a request of the same shape: the wording, not only the meaning (the candidates are found by meaning)
+            if c.shape_similarity < self.cfg.thresholds.skill_min_similarity {
                 continue;
             }
             let Some(skill) = c.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) else { continue };
@@ -1255,6 +1258,54 @@ impl Inner {
         }
     }
 
+    /// The memory write path: facts of a verified task, verified against its evidence, a newer value superseding an older one.
+    async fn learn_facts(&self, rec: &TaskRecord) {
+        let sources = crate::facts::sources(rec, 2500);
+        let user = dfae_core::safety::wrap_untrusted("task", &tokens::truncate_tokens(&sources, 3000));
+        let mut req = self.gen_request(Tier::Worker, crate::facts::FACTS_SYSTEM, user, "facts");
+        req.json = true;
+        req.schema = Some(crate::facts::schema());
+        req.schema_strict = true;
+        let (reply, calls) = self.models.generate_json(Tier::Worker, req).await;
+        // the task has finished: its cost goes into the stored record, so the ledger stays the whole bill
+        if !calls.is_empty()
+            && let Ok(Some(mut stored)) = self.store.get_task(&rec.task_id).await
+        {
+            for c in &calls {
+                stored.ledger.record(c.entry.clone());
+            }
+            let _ = self.store.put_task(&stored).await;
+        }
+        let Ok(reply) = reply else { return };
+        for fact in crate::facts::verified(&reply, &sources) {
+            let text = fact.text();
+            let same: Vec<ScoredMemory> = self
+                .store
+                .retrieve(MemoryQuery { text: text.clone(), kinds: vec![MemoryKind::Semantic], limit: 5, session_id: None })
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| {
+                    let md = &m.item.metadata;
+                    md["source"] == "fact" && md["kind"] == fact.kind.as_str() && md["subject"] == fact.subject.as_str() && md.get("superseded_by").is_none()
+                })
+                .collect();
+            if same.iter().any(|m| m.item.metadata["value"] == fact.value.as_str()) {
+                continue; // already known
+            }
+            let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.65);
+            it.metadata = json!({"source": "fact", "kind": fact.kind, "subject": fact.subject, "value": fact.value, "task_id": rec.task_id});
+            let new_id = it.id.clone();
+            if self.store.store(it).await.is_ok() {
+                for old in same {
+                    let mut md = old.item.metadata.clone();
+                    md["superseded_by"] = json!(new_id);
+                    let _ = self.store.update_metadata(&old.item.id, md).await;
+                }
+            }
+        }
+    }
+
     async fn learn(&self, rec: &TaskRecord) {
         let verified = rec.verification.as_ref().map(|v| v.status == VerificationStatus::Verified).unwrap_or(false);
         let success = rec.status == TaskStatus::Completed && rec.verification.as_ref().map(|v| v.status != VerificationStatus::Failed).unwrap_or(false);
@@ -1302,7 +1353,7 @@ impl Inner {
                 .await
                 .ok()
                 .and_then(|r| r.into_iter().next())
-                .map(|r| r.similarity > 0.9)
+                .map(|r| r.shape_similarity > 0.9)
                 .unwrap_or(false);
             if !dup {
                 let mut it = MemoryItem::new(MemoryKind::Semantic, lesson, 0.75);
@@ -1329,7 +1380,7 @@ impl Inner {
                         .await
                         .ok()
                         .and_then(|r| r.into_iter().next())
-                        .map(|r| r.similarity > 0.95)
+                        .map(|r| r.shape_similarity > 0.95)
                         .unwrap_or(false);
                     if !dup {
                         let mut it = MemoryItem::new(MemoryKind::Semantic, fact, 0.6);
@@ -1339,6 +1390,11 @@ impl Inner {
                     }
                 }
             }
+        }
+
+        // 3b. durable facts for semantic memory: named by the worker model, kept only when the evidence states them word for word
+        if verified && self.cfg.economy.facts && self.models.has(Tier::Worker) {
+            self.learn_facts(rec).await;
         }
 
         // 4. skills: replay bookkeeping, or crystallise a new one

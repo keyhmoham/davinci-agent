@@ -922,3 +922,53 @@ async fn every_plan_request_shares_one_cacheable_prefix() {
     assert_eq!(reqs[0].schema, reqs[1].schema, "one schema for every task");
     assert!(!reqs[0].schema.as_ref().unwrap().to_string().contains("at most 12"), "no per-task limit inside the schema");
 }
+
+#[tokio::test]
+async fn a_verified_task_leaves_its_durable_facts_and_a_newer_value_supersedes_the_old() {
+    let r = rig(true, |c| c.economy.facts = true);
+    let ask = |r: &Rig, port: &str| {
+        std::fs::write(r.ws.path().join("app.toml"), format!("[server]\nhost = \"app-3.internal\"\nport = {port}\n")).unwrap();
+        r.planner.push(&json!({"steps": [{"id": "s1", "do": "read app.toml", "tool": "fs_read"}]}).to_string());
+        // the worker's facts: one the file states, one it does not (never kept)
+        r.worker.push(
+            &json!({"facts": [
+                {"kind": "port", "subject": "app server", "value": port, "quote": format!("port = {port}")},
+                {"kind": "host", "subject": "app server", "value": "app-9.internal", "quote": "host = \"app-9.internal\""}
+            ]})
+            .to_string(),
+        );
+    };
+    ask(&r, "8443");
+    let t = run_as(&r, ModeRequest::Escalated, "Read app.toml").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let facts = |r: &Rig| {
+        let store = r.engine.store();
+        async move {
+            store
+                .retrieve(MemoryQuery { text: "port of app server".into(), kinds: vec![MemoryKind::Semantic], limit: 10, session_id: None })
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.item.metadata["source"] == "fact")
+                .collect::<Vec<_>>()
+        }
+    };
+    let mut first = Vec::new();
+    for _ in 0..50 {
+        first = facts(&r).await;
+        if !first.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(first.len(), 1, "only the fact the file states: {:?}", first.iter().map(|m| &m.item.text).collect::<Vec<_>>());
+    assert_eq!(first[0].item.text, "port of app server: 8443");
+    // the port changes: the newer fact supersedes the older
+    ask(&r, "9443");
+    run_as(&r, ModeRequest::Escalated, "Read app.toml").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let all = facts(&r).await;
+    let current: Vec<&String> = all.iter().filter(|m| m.item.metadata.get("superseded_by").is_none()).map(|m| &m.item.text).collect();
+    assert_eq!(current, vec!["port of app server: 9443"]);
+    assert!(all.iter().any(|m| m.item.text.ends_with("8443") && m.item.metadata.get("superseded_by").is_some()), "the old one is kept as history");
+}
