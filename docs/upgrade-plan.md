@@ -628,6 +628,6 @@ Evidence for every line is in `docs/eval/validation-2026-11-27.md`.
 | M1 semantic embeddings | **done** | paraphrase recall@1 0.65 → 1.00 (voyage-4-lite); ranking only, the skill gate stays on shape |
 | M3 lessons with outcome counts | **done** | retire a lesson that hurts more than it helps |
 | M4 plan templates | **done** | a paraphrase gets the verified plan as a worked example (checked with real embeddings); effect on re-plans not yet measured |
-| A1 step agent | **done, behind a flag** | A/B on the harder suite pending at the time of writing |
+| A1 step agent | **done, on by default** | re-plans −67%, planner calls −16%, cost +7%, same success (20 tasks per arm, interleaved) |
 | Quality fixes found by the suite | **done** | answers to questions, markdown fences, typed computed data, one-file steps naming several files, fs_edit on a directory, patch cycles, served addresses, the cwd of "the X directory", own-server checks |
 | W1 native function calling, W3 deterministic condensation, X1 masking for re-plans, P1 adaptive effort, E1c/E1d | not done | next candidates; each needs its own measurement |
