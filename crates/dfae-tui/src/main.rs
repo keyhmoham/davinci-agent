@@ -20,6 +20,7 @@ enum Msg {
     Info(Value),
     Stats(Value),
     Dispatch(Value),
+    Board(Box<dfae_core::routine::Board>),
     Tasks(Vec<TaskRow>),
     Detail(Box<TaskRecord>),
     Ev(Box<Event>),
@@ -137,7 +138,7 @@ fn describe(e: &Event) -> Option<String> {
 }
 
 async fn ask(api: &Api, goal: String, mode: ModeRequest, auto: bool) -> i32 {
-    let req = TaskRequest { goal, session_id: None, mode, profile: None, auto_approve: auto, delegate: None };
+    let req = TaskRequest { goal, session_id: None, mode, profile: None, auto_approve: auto, delegate: None, routine: None };
     let id = match api.create(&req).await {
         Ok(id) => id,
         Err(e) => {
@@ -281,6 +282,18 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
             }
         });
     }
+    // the board: what runs, waits, finished and is scheduled (live while visible; it is one cheap local call)
+    {
+        let (tx, api) = (tx.clone(), api.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(b) = api.board().await {
+                    let _ = tx.send(Msg::Board(Box::new(b)));
+                }
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+            }
+        });
+    }
     // task list
     {
         let (tx, api) = (tx.clone(), api.clone());
@@ -420,6 +433,28 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
                                 let _ = tx.send(Msg::Notice(m.0, m.1));
                             });
                         }
+                        Action::Routine { id, op } => {
+                            let (api, tx) = (api.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let id = id.unwrap_or_default();
+                                let m = match op {
+                                    app::RoutineOp::Add { when, goal } => api
+                                        .routine_add(&serde_json::json!({"when": when, "goal": goal}))
+                                        .await
+                                        .map(|r| format!("routine {} added: {}", short(&r.id), r.when)),
+                                    app::RoutineOp::Update(spec) => api.routine_update(&id, &spec).await.map(|r| format!("routine {} updated", short(&r.id))),
+                                    app::RoutineOp::Remove => api.routine_remove(&id).await.map(|_| format!("routine {} removed", short(&id))),
+                                    app::RoutineOp::Run => api.routine_run(&id).await.map(|t| match t {
+                                        Some(t) => format!("routine {} started task {}", short(&id), short(&t)),
+                                        None => "the run was skipped (see its history)".into(),
+                                    }),
+                                };
+                                let _ = tx.send(match m {
+                                    Ok(m) => Msg::Notice(m, false),
+                                    Err(e) => Msg::Notice(format!("routine: {e}"), true),
+                                });
+                            });
+                        }
                         Action::SelectionChanged => {}
                     }
                 }
@@ -434,6 +469,7 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
             Msg::Info(i) => app.info = Some(i),
             Msg::Stats(s) => app.stats = Some(s),
             Msg::Dispatch(d) => app.dispatch = Some(d),
+            Msg::Board(b) => app.apply_board(*b),
             Msg::Tasks(t) => app.apply_tasks(t),
             Msg::Detail(d) => app.apply_detail(*d),
             Msg::Ev(e) => app.push_event(*e),

@@ -4,7 +4,8 @@
 
 > The model proposes; the engine decides what is authorised, executes, observes and verifies.
 
-The runtime is the agent. The decision model, GLiNER and the worker model are services it calls for *bounded* questions.
+The runtime is the agent. The decision model (by default the hosted Decisions API), the extractors and the worker model are services it
+calls for *bounded* questions.
 No model owns control flow, permissions, or the claim that a task is done.
 
 ## Pipeline (`crates/dfae-runtime/src/pipeline.rs`)
@@ -51,7 +52,7 @@ place with phrase lists and regexes, and it answers exactly the same questions.
 ## Planning and acting (`plandoc.rs`, `planner.rs`, `implement.rs`, `executor.rs`)
 
 Two hosted models and a worker system. The **planner model** writes and revises plans. The **worker system** carries them out: rules and
-the tools' own patterns, the extractor (GLiNER), the self-hosted decision model, and the **worker model** (hosted, cheaper), under the
+the tools' own patterns, the extractor (rules; GLiNER optionally), the decision model, and the **worker model** (hosted, cheaper), under the
 program's control. The decision model chooses the handling (`select_mode`): `direct` (binds to tools outright), `assisted` = *quick* (one
 action or a reply the worker system handles alone) or `escalated` = *needs a plan*. Code only enforces limits: `escalated` without a planner
 falls back to the worker model; a low-confidence `assisted` is escalated; a user's explicit mode wins. There is no complexity rule on top
@@ -82,6 +83,12 @@ reply) that the acting phase binds and runs; if it fails, the re-plan is the pla
   repairs it like a plan (and reads a whole plan in its place as additions); `planner::apply_patch` applies it: finished steps are never touched, an
   edited step runs again from a clean state, new steps are numbered `r{n}_{i}`, nothing may wait for a dropped step, and a failed step that is
   neither edited nor dropped is an issue sent back for one repair round. Without a planner the worker model re-plans in concrete steps as before.
+* **Step agent** (`step_agent.rs`, `executor.rs::local_fix`): before the planner hears of a failed step, the worker runs a short bounded loop
+  (`DFAE_STEP_AGENT_TURNS`, default 6) to fix it where it happened. Each turn is one action under a JSON schema — by default one shell
+  script that inspects, changes and re-runs in one go (CodeAct; measured: fix actions −50%, re-plans 8 → 2, cost −47% at the same success);
+  `DFAE_STEP_AGENT_STYLE=tools` makes it one tool call per turn. Every action is a plan step through the normal tool path (policy, budgets,
+  syntax checks); older results are masked to one line. Then the failed step runs again and its own checks decide. It never runs on a step
+  whose tool reads outside content, nor on a task that has read any (see *Outside content*).
 * **Fault tolerance**: argument problems are repaired in code first; a worker call that fails because the provider is unreachable is made by the
   planner instead (`generate_text`); a malformed written file, a reasoning step that misses its expectation, and a reply that only asks the user a
   question are redone locally with the reason; only then does the planner hear of it.
@@ -102,6 +109,21 @@ reply) that the acting phase binds and runs; if it fails, the re-plan is the pla
   sentence says it writes something) may run long (`WORKER_CONTENT_MAX_TOKENS`).
 * **What the planner is told**: a one-line workspace snapshot (two levels, capped), the condensed form of big outputs, a lesson from an earlier
   similar task, and for a re-plan the state of the plan and the step's actual result.
+* **Condensing big outputs** (`quarantine.rs`, `executor.rs::select_lines`): code numbers the output's lines (JSON flattened to one record per
+  line); when there are more than 400, it offers the head and tail, the lines that report trouble and those that share words with the task,
+  each with its neighbours; the worker answers `{"lines":[…]}` and code passes those lines on verbatim. No summary is written, so nothing can
+  be invented (measured: 19/19 facts, 0 invented values, −78% output tokens vs the free-text summary it replaced).
+
+### Outside content (`quarantine.rs`, `dfae_tools::changes`, `executor.rs::exposed_change`)
+
+Output of `web` and `mcp` tools is untrusted. Lines that read like instructions are dropped and the rest goes through line selection as
+above (never a summary). The first such output marks the task `exposed` (inherited by and from subagents). From then on: the step agent does
+not run; a call that changes, moves, empties or removes a file that existed before the task — found in the fs tools' arguments and in shell
+commands (`rm`, `mv`, redirections, `sed -i`, `git checkout`, file-writing scripts) — needs the request to name the file or a directory it is
+in, else it is withheld (`ErrorKind::Withheld`: approval with `DFAE_APPROVALS=ask`; refused with `never`); a value read locally that appears
+in a network call is withheld the same way. A withheld action is re-planned around once (the planner is told why), then skipped and
+reported; it is never retried as it is. Verification asks the completion judge on such a task, because its steps' checks cannot know what
+the content asked for. `DFAE_EXPOSED_CHANGES=allow` turns the guard off. Threat model and measurements: `security.md`.
 
 ### Checking what was done (`planner::expect_checks`, `syntax.rs`, `implement.rs::judge_step`)
 
@@ -248,6 +270,20 @@ decision: `(raw·6 + successes) / (6 + n)`. The counters persist in the store (`
   (completed steps and outputs are kept, ids are prefixed `rN_`, the merged plan is re-validated). The tool
   set may widen to siblings of the same category, never to unrelated tools.
 
+## Routines and custom agents (`routines.rs`, `profiles.rs`, `dfae_core::routine`)
+
+* **Schedules** are parsed by code from what an agent or a person writes (`parse_when`: relative, absolute, clock, readable recurring,
+  cron through croner with IANA zones) into `At | Every{anchor} | Cron`; `compute_next` applies max runs, until and active hours. All
+  of it is pure (the clock is passed in) and tested across DST.
+* **The scheduler** sleeps until the earliest due routine (at most a minute; woken when the book changes), starts what is due within
+  the concurrency and the daily cap, runs the gates first (no task, no model when they say no), submits the run as a task in session
+  `routine-<id>` with the last run's finding appended, and a watcher records the outcome, cost and summary, backs off failures and
+  ends routines whose limits are reached. The book is one key/value document, written on every change and reloaded at start.
+* **Custom agents**: a plan step's `agent` (a saved name, an inline profile, or both: the inline fields override) and `each`
+  (parallel instances, ids `sN_1…`, dependencies rewritten so a join waits for all). The child's `TeamLink.profile` sets its scope
+  (`profile_scope`), its pool (writer → operator, reader → researcher) and the first line of every prompt it builds.
+* **The board** (`Engine::board`): live tasks from the engine, recent ones from the store, the routine book, the queue length.
+
 ## Memory
 
 | Layer | Content | Where |
@@ -257,9 +293,20 @@ decision: `(raw·6 + successes) / (6 + n)`. The counters persist in the store (`
 | semantic | facts: explicit (`memory_store`, `/remember`) or **promoted entities** | kind `semantic` |
 | procedural | skills: parameterised verified plans | kind `procedural` |
 
-Embeddings are a deterministic signed feature-hash of stemmed unigrams+bigrams (256-d): no model, no network,
-stable across restarts. With pgvector the search is `ORDER BY embedding <=> $q`; without it, `real[]` rows are
-scored in-process. Swap in a neural embedder by implementing `Embedder`.
+Every item has two embeddings: a deterministic signed feature-hash of stemmed unigrams+bigrams (256-d; no model, no network) and,
+by default, a semantic one from a hosted model (`DFAE_EMBEDDINGS`, default `voyage/voyage-4-lite`, 1024-d, through the gateway). Ranking
+uses the semantic similarity when both sides have one (measured: recall@1 on paraphrases 0.65 → 1.00; with 200 distractors only the
+semantic embedder puts the answer in front of the planner), the hash one otherwise; skill replay still requires the same request *shape*
+(hash). With pgvector the search is `ORDER BY embedding_sem_<dim> <=> $q` (items written before are backfilled); without it, `real[]` rows
+are scored in-process. Text is redacted for personal data before it is stored (`DFAE_REDACT_PII`; names and addresses with `DFAE_PII_NER_URL`).
+
+* **Facts** (`facts.rs`, `DFAE_FACTS`): after a verified task the worker proposes durable facts, each with a verbatim quote from the request
+  or the tool evidence; a fact whose quote is not found is dropped, and a new fact about the same subject supersedes the old one.
+* **Lessons** keep helpful / harmful counts from later use; one that keeps hurting stops being shown.
+* **Plan templates**: a verified plan is shown to the planner as a worked example (slots as `<name>`) for a request that says the same
+  thing in other words, where replay is not allowed.
+* Every profile keeps the most relevant memories: `minimal` (simple requests) 2 memories and the last turn — it used to keep none, so the
+  planner of a simple request never saw a lesson or a fact.
 
 **Promotion rule**: an extracted entity becomes semantic memory only if the task was *verified*, its label is on
 the allowlist (`server`, `database`, `repository`), its score ≥ 0.6, and its text also appears in a *tool*

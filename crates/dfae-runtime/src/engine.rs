@@ -62,8 +62,9 @@ pub(crate) struct TaskCtx {
     /// How hard the planner thinks for this task (from the request's complexity), and how many re-planning rounds it has had.
     pub planner_effort: Mutex<Option<String>>,
     pub planner_rounds: std::sync::atomic::AtomicU32,
-    /// How many actions were held back for the user (`ErrorKind::Withheld`).
-    pub withheld: std::sync::atomic::AtomicU32,
+    /// What was held back for the user (`ErrorKind::Withheld`), one line each: every later re-plan is told, so it neither plans it again
+    /// nor checks for it.
+    pub withheld: Mutex<Vec<String>>,
 }
 
 impl TaskCtx {
@@ -88,7 +89,7 @@ impl TaskCtx {
             fixed: Mutex::new(HashSet::new()),
             planner_effort: Mutex::new(None),
             planner_rounds: std::sync::atomic::AtomicU32::new(0),
-            withheld: std::sync::atomic::AtomicU32::new(0),
+            withheld: Mutex::new(Vec::new()),
         })
     }
 
@@ -142,6 +143,8 @@ pub(crate) struct Inner {
     pub pii_ner: std::sync::OnceLock<Arc<dyn EntityExtractor>>,
     /// The versions of the runtimes the shell has (`node v26…, python 3.13…`), asked once.
     pub runtimes: tokio::sync::OnceCell<String>,
+    pub routines: crate::routines::RoutineBook,
+    pub profiles: crate::profiles::ProfileBook,
 }
 
 /// The agent engine. Cheap to clone.
@@ -192,7 +195,7 @@ pub struct StatsReport {
 impl Engine {
     pub fn new(deps: EngineDeps) -> Self {
         let prefix_policy = crate::economy::prefix::PrefixPolicy::for_model(&deps.config.planner.model);
-        Self {
+        let engine = Self {
             inner: Arc::new(Inner {
                 dispatcher: Dispatcher::new(&deps.config.team),
                 cost: crate::economy::CostModel::new(),
@@ -211,8 +214,13 @@ impl Engine {
                 mcp: std::sync::OnceLock::new(),
                 pii_ner: std::sync::OnceLock::new(),
                 runtimes: tokio::sync::OnceCell::new(),
+                routines: Default::default(),
+                profiles: Default::default(),
             }),
-        }
+        };
+        crate::routines::register_tools(&engine.inner);
+        crate::profiles::register_tools(&engine.inner);
+        engine
     }
 
     /// Give the engine its MCP servers (once).
@@ -240,6 +248,7 @@ impl Engine {
         if let Ok(Some(v)) = self.inner.store.kv_get("costmodel").await {
             self.inner.cost.load(&v);
         }
+        let _ = self.inner.list_profiles().await; // saved agents, for the planner's prompt
     }
 
     /// What each kind of model call costs here: priors, observations, the estimate in use.
@@ -261,6 +270,13 @@ impl Engine {
 
     /// Submit a task; returns its id immediately. The task runs in the background.
     pub async fn submit(&self, mut request: TaskRequest) -> Result<String, String> {
+        request.routine = None; // only the scheduler says a routine started a task
+        self.inner.submit_request(request).await
+    }
+}
+
+impl Inner {
+    pub(crate) async fn submit_request(self: &Arc<Self>, mut request: TaskRequest) -> Result<String, String> {
         request.goal = request.goal.trim().to_string();
         if request.goal.is_empty() {
             return Err("goal must not be empty".into());
@@ -268,24 +284,26 @@ impl Engine {
         if request.goal.chars().count() > 8000 {
             return Err("goal is too long (max 8000 characters)".into());
         }
-        if request.auto_approve && !self.inner.cfg.allow_auto_approve {
+        if request.auto_approve && !self.cfg.allow_auto_approve {
             return Err("auto_approve is disabled on this server (set DFAE_ALLOW_AUTO_APPROVE=true)".into());
         }
-        if self.inner.dispatcher.saturated() {
-            return Err(format!("the dispatch queue is full ({} tasks waiting); try again shortly", self.inner.cfg.team.max_queued_tasks));
+        if self.dispatcher.saturated() {
+            return Err(format!("the dispatch queue is full ({} tasks waiting); try again shortly", self.cfg.team.max_queued_tasks));
         }
-        let rec = TaskRecord::new(request, self.inner.cfg.budget.clone());
+        let rec = TaskRecord::new(request, self.cfg.budget.clone());
         let id = rec.task_id.clone();
         let goal = rec.goal.clone();
         let ctx = TaskCtx::new(rec, CancellationToken::new(), 0);
-        self.inner.live.lock().insert(id.clone(), ctx.clone());
-        self.inner.persist(&ctx).await;
-        self.inner.emit(&ctx, EventKind::TaskCreated { goal }).await;
-        let inner = self.inner.clone();
+        self.live.lock().insert(id.clone(), ctx.clone());
+        self.persist(&ctx).await;
+        self.emit(&ctx, EventKind::TaskCreated { goal }).await;
+        let inner = self.clone();
         tokio::spawn(async move { inner.run_task(ctx).await });
         Ok(id)
     }
+}
 
+impl Engine {
     /// Resume tasks left unfinished by a previous process. Returns their ids.
     pub async fn resume_unfinished(&self) -> Vec<String> {
         let mut ids = Vec::new();

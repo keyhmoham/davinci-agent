@@ -125,6 +125,13 @@ pub enum EventKind {
     Warning {
         message: String,
     },
+    /// A routine was added, changed, removed, started a run, finished one or skipped one (`task_id` of the event is `routines`).
+    Routine {
+        routine_id: String,
+        /// `added`, `proposed`, `updated`, `removed`, `started`, `finished`, `skipped`, `ended`.
+        action: String,
+        detail: String,
+    },
     Final {
         answer: String,
         status: TaskStatus,

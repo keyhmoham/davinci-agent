@@ -271,6 +271,24 @@ impl Inner {
         ctx.rec.lock().await.verification = Some(verification);
         let mode = ctx.rec.lock().await.mode.unwrap_or(mode);
         self.stage_answer(ctx, mode, exec_err.as_deref()).await;
+        // what was held back for the user is said in the answer, whoever wrote it (a templated answer lists only what ran)
+        let held = ctx.withheld.lock().clone();
+        if !held.is_empty() {
+            let mut r = ctx.rec.lock().await;
+            let note = format!(
+                "\n⚠ Left out — content from outside asked for it, your request did not: {}. Ask again naming it if you want it done.",
+                held.iter()
+                    .map(|h| {
+                        // "<step> (refused: this removes tests — files that …)" → "removes tests"
+                        let what = h.split_once("refused: this ").map(|(_, w)| w).unwrap_or(h);
+                        what.split(" — ").next().unwrap_or(what).split(", read from").next().unwrap_or(what).to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            let a = r.final_answer.get_or_insert_with(String::new);
+            a.push_str(&note);
+        }
         match exec_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -604,6 +622,15 @@ impl Inner {
             profile,
         });
         let mut text = pkg.render();
+        // a custom agent works as its instructions say: every model it calls is told first
+        if let Some(p) = r.team.as_ref().and_then(|t| t.link.as_ref()).and_then(|l| l.profile.as_ref()).filter(|p| !p.instructions.is_empty()) {
+            text = format!(
+                "YOU ARE AGENT \"{}\"{}. HOW YOU WORK: {}\n{text}",
+                p.name,
+                if p.description.is_empty() { String::new() } else { format!(" ({})", p.description) },
+                p.instructions
+            );
+        }
         if tier == Tier::Planner
             && let Some(t) = &base.template
         {
@@ -1006,6 +1033,15 @@ impl Inner {
         }
         if !unavailable.is_empty() {
             user.push_str(&format!("\nNOT AVAILABLE IN THIS TASK: {}", unavailable.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        // saved custom agents the plan may delegate to (none: nothing is said, nothing is paid); an agent itself delegates to no one
+        if ctx.depth == 0 {
+            let agents = self.profiles.snapshot();
+            if !agents.is_empty() {
+                let list =
+                    agents.iter().map(|p| format!("{} ({}{})", p.name, p.description, if p.writes { ", writes" } else { "" })).collect::<Vec<_>>().join("; ");
+                user.push_str(&format!("\nSAVED AGENTS: {list}"));
+            }
         }
         let names: Vec<String> = native.iter().chain(extra.iter()).cloned().collect();
         let mut req = self.gen_request(Tier::Planner, &system, user, purpose);

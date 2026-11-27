@@ -56,6 +56,8 @@ crossterm = "0.29"
 shlex = "2"
 libc = "0.2"
 toml = "1"
+croner = "3"
+chrono-tz = "0.10"
 
 [profile.release]
 opt-level = 3

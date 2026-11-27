@@ -130,3 +130,50 @@ async fn dispatch_and_team_fields_are_exposed() {
     assert_eq!(cost["plan"]["prior"], 330.0);
     assert!(cost["step"]["estimate"].as_f64().unwrap() > 0.0);
 }
+
+#[tokio::test]
+async fn routines_and_the_board_over_http() {
+    let (base, _ws) = spawn(None).await;
+    let c = reqwest::Client::new();
+    // a person adds a routine: enabled, scheduled
+    let r = c.post(format!("{base}/v1/routines")).json(&json!({"goal": "what is 6 * 7?", "when": "every 2h", "name": "sum"})).send().await.unwrap();
+    assert_eq!(r.status(), 201);
+    let rt: Value = r.json().await.unwrap();
+    let id = rt["id"].as_str().unwrap().to_string();
+    assert_eq!(rt["enabled"], true);
+    assert_eq!(rt["origin"]["by"], "user");
+    assert!(rt["state"]["next_run"].is_string());
+    // a bad schedule is refused with the forms that work
+    let bad = c.post(format!("{base}/v1/routines")).json(&json!({"goal": "x", "when": "whenever"})).send().await.unwrap();
+    assert_eq!(bad.status(), 400);
+    assert!(bad.json::<Value>().await.unwrap()["error"].as_str().unwrap().contains("every 2h"));
+    // run it now: a task with the routine on it, shown on the board
+    let run: Value = c.post(format!("{base}/v1/routines/{id}/run")).send().await.unwrap().json().await.unwrap();
+    let task = run["task_id"].as_str().unwrap().to_string();
+    let t = wait_done(&c, &base, &task).await;
+    assert_eq!(t["request"]["routine"], id.as_str());
+    let mut board = Value::Null;
+    for _ in 0..100 {
+        board = c.get(format!("{base}/v1/board")).send().await.unwrap().json().await.unwrap();
+        if board["routines"][0]["history"].as_array().is_some_and(|h| !h.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(board["routines"][0]["id"], id.as_str());
+    assert_eq!(board["routines"][0]["history"][0]["outcome"], "ok", "{board}");
+    assert!(board["recent"].as_array().unwrap().iter().any(|x| x["task_id"] == task.as_str() && x["routine_id"] == id.as_str()));
+    // pause, change the schedule, remove
+    let p: Value = c.patch(format!("{base}/v1/routines/{id}")).json(&json!({"enabled": false})).send().await.unwrap().json().await.unwrap();
+    assert_eq!(p["enabled"], false);
+    assert!(p["state"]["next_run"].is_null());
+    let w: Value =
+        c.patch(format!("{base}/v1/routines/{id}")).json(&json!({"when": "weekdays 08:30", "enabled": true})).send().await.unwrap().json().await.unwrap();
+    assert_eq!(w["schedule"]["expr"], "30 8 * * 1-5");
+    assert_eq!(c.delete(format!("{base}/v1/routines/{id}")).send().await.unwrap().status(), 200);
+    assert_eq!(c.get(format!("{base}/v1/routines/{id}")).send().await.unwrap().status(), 404);
+    // a caller cannot claim a task was started by a routine
+    let forged = c.post(format!("{base}/v1/tasks")).json(&json!({"goal": "what is 1 + 1?", "routine": "nope"})).send().await.unwrap();
+    let fid = forged.json::<Value>().await.unwrap()["task_id"].as_str().unwrap().to_string();
+    assert!(wait_done(&c, &base, &fid).await["request"]["routine"].is_null());
+}

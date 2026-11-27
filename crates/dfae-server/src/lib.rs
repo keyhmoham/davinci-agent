@@ -33,6 +33,12 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/mcp/servers", get(mcp_servers).post(mcp_add))
         .route("/v1/mcp/servers/{name}", axum::routing::delete(mcp_remove))
         .route("/v1/mcp/search", get(mcp_search))
+        .route("/v1/board", get(board))
+        .route("/v1/agents", get(list_agents).post(define_agent))
+        .route("/v1/agents/{name}", axum::routing::delete(remove_agent))
+        .route("/v1/routines", get(list_routines).post(add_routine))
+        .route("/v1/routines/{id}", get(get_routine).patch(update_routine).delete(remove_routine))
+        .route("/v1/routines/{id}/run", post(run_routine))
         .route("/v1/tasks", post(create_task).get(list_tasks))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/cancel", post(cancel_task))
@@ -162,6 +168,67 @@ async fn mcp_add(State(s): State<AppState>, Json(a): Json<McpAdd>) -> ApiResult<
 async fn mcp_remove(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
     let hub = s.engine.mcp().ok_or_else(|| err(StatusCode::NOT_FOUND, "MCP is not configured"))?;
     if hub.remove(&name).await { Ok(Json(json!({"removed": name}))) } else { Err(err(StatusCode::NOT_FOUND, format!("no MCP server '{name}'"))) }
+}
+
+// Routines and the board. What the API asks for is a person's request: routines it adds are enabled (an agent's may be proposals).
+
+async fn list_agents(State(s): State<AppState>) -> Json<Vec<AgentProfile>> {
+    Json(s.engine.agent_profiles().await)
+}
+
+async fn define_agent(State(s): State<AppState>, Json(v): Json<Value>) -> Result<(StatusCode, Json<AgentProfile>), (StatusCode, Json<Value>)> {
+    let p = AgentProfile::from_value(&v).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    s.engine.define_agent(p).await.map(|p| (StatusCode::CREATED, Json(p))).map_err(|e| err(StatusCode::BAD_REQUEST, e))
+}
+
+async fn remove_agent(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
+    s.engine.remove_agent(&name).await.map(|p| Json(json!({"removed": p.name}))).map_err(|e| err(StatusCode::NOT_FOUND, e))
+}
+
+async fn board(State(s): State<AppState>) -> Json<dfae_runtime::routines::Board> {
+    Json(s.engine.board().await)
+}
+
+async fn list_routines(State(s): State<AppState>) -> Json<Vec<dfae_core::routine::Routine>> {
+    Json(s.engine.routines())
+}
+
+async fn get_routine(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<dfae_core::routine::Routine> {
+    s.engine.routine(&id).map(Json).ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no routine '{id}'")))
+}
+
+async fn add_routine(
+    State(s): State<AppState>,
+    Json(spec): Json<dfae_runtime::routines::RoutineSpec>,
+) -> Result<(StatusCode, Json<dfae_core::routine::Routine>), (StatusCode, Json<Value>)> {
+    s.engine.add_routine(spec, "user").await.map(|r| (StatusCode::CREATED, Json(r))).map_err(|e| err(StatusCode::BAD_REQUEST, e))
+}
+
+async fn update_routine(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(spec): Json<dfae_runtime::routines::RoutineSpec>,
+) -> ApiResult<dfae_core::routine::Routine> {
+    s.engine
+        .update_routine(&id, spec)
+        .await
+        .map(Json)
+        .map_err(|e| err(if e.starts_with("no routine") { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST }, e))
+}
+
+async fn remove_routine(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Value> {
+    s.engine.remove_routine(&id).await.map(|r| Json(json!({"removed": r.id}))).map_err(|e| err(StatusCode::NOT_FOUND, e))
+}
+
+#[derive(Deserialize)]
+struct RunQ {
+    /// `true`: still only if the routine's gates pass.
+    #[serde(default)]
+    gates: bool,
+}
+
+async fn run_routine(State(s): State<AppState>, Path(id): Path<String>, Query(q): Query<RunQ>) -> ApiResult<Value> {
+    s.engine.run_routine(&id, q.gates).await.map(|t| Json(json!({"task_id": t}))).map_err(|e| err(StatusCode::BAD_REQUEST, e))
 }
 
 #[derive(Serialize)]

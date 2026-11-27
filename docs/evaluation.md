@@ -70,7 +70,7 @@ cargo test -p dfae-runtime --test bench -- --nocapture
 * With prompt caching: **−37 % effective planner tokens, −14 % planner calls**, and −28 % effective tokens counting the worker too; without it
   only −3 % (the worker-written answer and the snapshot roughly cancel). Raw planner tokens go *up* with caching because the whole tool catalogue
   and worked examples ride in the prefix — billed at a tenth, which is why the prefix is sent only to a provider that caches
-  (`LanguageModel::caches_prompts`: Anthropic, OpenAI's API, or `PLANNER_PROMPT_CACHE=on`), only while the cache is warm or traffic is dense enough to
+  (`LanguageModel::caches_prompts`: Anthropic, OpenAI's API, Vercel AI Gateway, or `PLANNER_PROMPT_CACHE=on`), only while the cache is warm or traffic is dense enough to
   warm it (`economy/prefix.rs`), and never after three prefixed calls in a row came back with no cache hit.
 * The worker's cost is its own line: argument binding and short reasoning are ~160 tokens per task here (compact prompts, small limits). Writing a
   file's content is the one thing allowed to run long and is not in this benchmark's numbers (scripted contents are a few words).
@@ -100,7 +100,7 @@ Each item is pinned by a test that fails without the change (`crates/dfae-runtim
 | written files are parsed (JSON, TOML, HTML balance, Python, shell, JS) | a JSON object cut off by the token limit is caught, the worker model rewrites it with the parser's complaint, and the external model is not called again |
 | a reasoning step that misses its expectation is rewritten once locally, with the judge's reason | planner calls stay at 1 |
 | arguments are bound under a JSON schema (servers that support `response_format: json_schema`; others fall back by themselves) and a second local attempt is a 3-sample vote | wire test (`dfae-models/tests/wire.rs`) and unit test |
-| a big tool output is condensed by the worker model, kept only if it states nothing the output lacks | the planner's step prompt holds the condensed text, not 600 lines (`tiers.rs`) |
+| a big tool output is condensed by line selection: the worker names line numbers, code passes those lines on verbatim | the planner's step prompt holds the selected lines, not 600 (`tiers.rs`); live: 19/19 facts, 0 invented values |
 | work the planner plans is one plan, not a team of planners | `work_the_external_model_plans_is_one_plan_not_a_team_of_planners` fails without the change |
 | a task that went wrong and then worked leaves a one-line lesson that the next planner sees | lesson stored from `problems`, retrieved into the next plan prompt |
 | "that's wrong, try again" (decision model: `feedback`) marks the previous result as rejected | calibration, the skill that produced it, a lesson and a decision-log line (`rejected_by_user`) |
@@ -112,7 +112,7 @@ Compare, on *your* task distribution:
 
 1. a plain worker model agent (no tools);
 2. the same worker model with native tool calling;
-3. DFAE (decision model + GLiNER + worker model);
+3. DFAE (decision model + extractors + worker model);
 4. DFAE with a planner model enabled for escalation (or a planner model alone).
 
 `scripts/bench.sh [file]` runs a list of requests and prints mode, verification and tokens per request;
@@ -127,13 +127,15 @@ Compare, on *your* task distribution:
 | escalation quality | `mode == escalated` vs outcome, `planner_tokens`, calibration table (`/v1/calibration`) |
 | cost / tokens per task | `ledger` (per task), `dfae_tokens*` (`/metrics`) |
 | latency | event timestamps; `latency_ms` on every ledger entry |
-| security | `crates/dfae-tools` policy tests; add your own red-team cases to `crates/dfae-runtime/tests/e2e.rs` |
+| security | `crates/dfae-tools` policy tests, `crates/dfae-runtime/tests/exposure.rs` (outside-content guard), the AgentDojo-style cases in `tests/live_e2e.rs` (`LIVE_CASES=dojo,injection`) |
 | persistence | `interrupted_tasks_resume_from_their_checkpoint` |
 
 A cheaper agent that silently fails is not an optimisation: read **verified** success next to tokens.
 
 ## What the test suite proves (and does not)
 
-The end-to-end tests use *scripted* models, so they prove the **runtime** — validation, repair, policy, approvals,
-recovery, grounding, skills, resume — behaves correctly for given model outputs. They say nothing about how often a
-real 3B model produces a valid plan. Measure that before trusting assisted mode with anything important.
+The hermetic tests use *scripted* models, so they prove the **runtime** — validation, repair, policy, approvals,
+recovery, grounding, skills, resume — behaves correctly for given model outputs. How the real models behave is measured by the
+ignored live suites (`live_e2e.rs`, `live_worker.rs`, `memory_live.rs`, …: run with `-- --ignored` and the gateway key): harder tasks whose
+oracles check outcomes, run several times and A/B'd against frozen builds. The results, with costs, are in `docs/eval/`; a change that
+claims a gain is adopted only when it shows one there.

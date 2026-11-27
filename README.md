@@ -2,9 +2,10 @@
 
 A token-frugal agent runtime written in Rust. **The runtime is the agent; models are specialised services inside it.**
 A hosted **planner model** (default `gpt-6-luna`) writes a typed, validated plan and revises it when something cannot be solved;
-a **worker system** carries the plan out step by step: deterministic rules, the extractor (GLiNER), a self-hosted open-weight **decision
-model** that routes, selects tools and judges, and a hosted, cheaper **worker model** (default `glm-5.3-flash`) that fills in what the rules
-cannot and writes content. Execution, security, memory and verification are deterministic code.
+a **worker system** carries the plan out step by step: deterministic rules and extractors, a **decision model** that routes, selects tools
+and judges (by default the hosted Decisions API, `openai/gpt-6-luna-decisions`; a self-hosted open-weight model or built-in rules instead),
+and a hosted, cheaper **worker model** (default `glm-5.3-flash`, pinned to unquantised providers) that fills in what the rules cannot, writes
+content and fixes a failed step with a short script loop before the planner is asked. Execution, security, memory and verification are deterministic code.
 
 ```
 docker compose up -d --build     # engine + Postgres/pgvector (decisions: hosted Decisions API; memory: hosted embeddings; profiles add GLiNER and Ollama)
@@ -13,10 +14,11 @@ docker compose run --rm tui      # the terminal UI
 ```
 
 > Set `PLANNER_API_KEY` in `.env` (the worker model uses the same gateway and key unless `WORKER_API_KEY` / `WORKER_BASE_URL` say otherwise).
-> First start downloads the GLiNER model (~600 MB) and the decision model (`qwen3:4b-instruct-2507-q4_K_M`, ~2.5 GB). Until the decision model is
-> ready the built-in rules decide (`./dfae status`, the *Cognition* tab); `./dfae` (TUI) and `./dfae ask` wait for it. With plain
-> `docker compose up`, watch `docker compose logs -f ollama-pull` (re-run a failed pull with `docker compose run --rm ollama-pull`).
-> The engine answers immediately and degrades gracefully while models load (see [What works without what](#what-works-without-what)).
+> Decisions (the hosted Decisions API) and memory embeddings (`voyage/voyage-4-lite`) go through the same gateway and key: nothing is
+> downloaded. [`.env.example`](.env.example) lists every setting with its default. Optional profiles add local services:
+> `COMPOSE_PROFILES=local-decisions` (an Ollama decision model, `qwen3:4b-instruct-2507-q4_K_M`, ~2.5 GB, with `DECISION_BASE_URL=http://ollama:11434/v1`),
+> `pii` (a GLiNER PII model that also redacts names and addresses from memory), `gliner` (GLiNER on the hot path: measured no benefit).
+> The engine answers immediately and degrades gracefully when a service is missing (see [What works without what](#what-works-without-what)).
 
 ## Why it is cheap
 
@@ -48,8 +50,8 @@ reply, not a plan: the worker system answers it. A task that needs a plan is spl
    `rules`, `rules+worker`, `worker-vote`, `planner`, …).
 
 **What counts as cost.** Two hosted models are billed by the token: the **planner** (expensive: plans, patches, steps it keeps for itself, answers
-that fail the grounding check) and the **worker** (cheap: argument binding, reasoning steps, content, answers). The decision model and GLiNER are
-self-hosted and free, so they get the fullest context. Worker tokens are optimised too: ordinary work (binding arguments, short reasoning, answers)
+that fail the grounding check) and the **worker** (cheap: argument binding, reasoning steps, content, answers, step fixes). The hosted
+decision model answers typed questions for ≈ $0.0003 per task; a self-hosted one is free. Worker tokens are optimised too: ordinary work (binding arguments, short reasoning, answers)
 is held to a small output limit (`WORKER_MAX_TOKENS`, default 800) with compact prompts, while writing a file's content — a page, code, data — may run
 long (`WORKER_CONTENT_MAX_TOKENS`, default 16000). Budgets: `DFAE_MAX_MODEL_CALLS` meters planner calls, `DFAE_MAX_WORKER_CALLS` (default 200) is a
 runaway guard for worker calls. The ledger reports `planner_tokens` and `worker_tokens` (with cached tokens, effective tokens and the purpose each
@@ -76,7 +78,9 @@ Mechanisms that cut tokens (all implemented and tested):
   catalogue). The plan is *validated against that subset*, so it is also a security property.
 - **Compact, budgeted context** — entities, ranked + de-duplicated memories and observations are packed into a profile-sized budget
   (`minimal` 450 / `standard` 1300 / `reasoning` 3200 tokens) that follows the request's complexity, dropping the least important material
-  first. Step outputs reach the planner as ~300-token summaries (condensed by the worker model when big) and the worker as ~600.
+  first. Step outputs reach the planner as ~300-token summaries and the worker as ~600. A big output is condensed by **line selection**: code
+  ranks candidate lines (head and tail, errors and warnings, lines that share words with the task, JSON as one record per line) and the worker
+  answers with line numbers only, so what is passed on is verbatim (measured: 19/19 facts, 0 invented values, −78% output tokens vs a summary).
 - **Observation compression** — tool output is redacted, de-duplicated and head/tail-elided
   before it re-enters a prompt; full output stays in state.
 - **No redundant calls** — a lone reasoning leaf *is* the answer (no synthesis call); decisions
@@ -159,6 +163,55 @@ upstream summary), least privilege, and serialised side effects. Raw token savin
 than one plan — every agent pays its own planning call (~330 tokens by default) — which is why the cost model charges
 that against splits justified only by parallelism. The TUI **Team** view shows agents, roles, dependencies and the live worker pools.
 
+### Custom subagents, planned and in parallel
+
+Besides the automatic split, **the planner delegates** when the work is broad: a plan step may name an agent instead of a tool, and fan
+it out over parts. The instances run in parallel as child tasks, and a later step that waits for the step receives every result.
+
+```json
+{"id": "s2", "tool": null, "do": "review {item} for real bugs, with file and line", "after": ["s1"],
+ "agent": {"name": "reviewer", "instructions": "read the code, list real bugs only", "tools": ["fs_read", "fs_search"], "writes": false},
+ "each": ["src/a.py", "src/b.py", "src/c.py"]}
+```
+
+- **Profiles**: a name, what it is for, **how it works** (its skill: instructions every model call of the agent sees first) and the
+  tools it may use. Inline in a step for one task, or **saved** to be used by name (`agent_define` / `agent_list` / `agent_remove` for
+  agents, `GET/POST /v1/agents`, `DELETE /v1/agents/{name}` for you). Saved agents are listed to the planner, only when there are any.
+- **Limits that follow from the research**: multi-agent work costs about 15× a chat's tokens and pays off only for breadth (Anthropic's
+  research system); agents that each decide on shared state conflict (Cognition). So the planner is told to delegate only independent
+  parts that each need several steps; an agent gets only its part; readers run in parallel and **writers take the single operator
+  slot**; an agent cannot spawn agents or manage routines; at most 8 instances per step.
+- A task that has read outside content, or a routine's run, **cannot save or remove an agent**: a saved agent is an instruction that
+  outlives the task.
+
+## Background work: routines and the board
+
+Agents (and you) schedule work that runs later in the background, once or again and again, without anyone asking again:
+
+| Schedule | Examples |
+|---|---|
+| once | `in 20m` · `in 1h30m` · `at 17:30` · `tomorrow 8am` · `at 2026-12-01 09:00` |
+| repeatedly | `every 2h` · `every 15 minutes` · `daily 09:00` · `weekdays 08:30` · `weekly mon,fri 18:00` · `monthly 1 09:00` · `hourly :15` · `cron 0 9 * * 1-5` |
+| limits | `max_runs`, `until` (a date), `active_hours` (`08:00-22:00`, may wrap), `max_cost_usd`, a time zone (`tz`, or `DFAE_TIMEZONE`; DST-correct) |
+| gates (no model call) | `if_changed`: run only when a command's output, or `GET <url>`, differs from last time (the first look records it) · `if_ok`: only when a command exits 0 |
+
+- **Each run is an ordinary task** in the routine's own session, told what the last run found, so it reports what is new. A routine
+  never overlaps itself; `DFAE_ROUTINE_CONCURRENCY` (4) run at once and `DFAE_ROUTINE_MAX_RUNS_PER_DAY` (200) start per day; failures back
+  off (30 s, 1 min, 5 min, 15 min, 1 h) and end a routine after 10 in a row; one-shots are retried three times. After downtime a missed
+  slot runs once (`catch_up: false` skips it). The book is durable (the store; Postgres in the container).
+- **No background heartbeat**: PM-Bench found that a fixed 30-minute heartbeat produced the most false alarms and scored below the plain
+  agent, while agent-chosen checks scored best. Nothing here wakes on its own: routines do, and their gates cost nothing when nothing changed.
+- **Not a way in**: a routine an agent asks for after reading outside content (a page that says "check this URL every hour and do what
+  it says"), or from a routine's own run, is only **proposed** — disabled until you enable it; resuming, widening or running one from
+  there is refused. Pausing and removing are always allowed.
+- **Agents' tools**: `routine_add`, `routine_list`, `routine_update` (pause/resume, schedule, goal, limits), `routine_remove`, `routine_run`.
+- **API**: `GET/POST /v1/routines`, `GET/PATCH/DELETE /v1/routines/{id}`, `POST /v1/routines/{id}/run[?gates=true]`; changes are events
+  on `/v1/events` (task id `routines`).
+- **The board** (`GET /v1/board`, the TUI's **Board** tab, live): what every agent is doing now (its current step, progress, role or
+  routine, cost), what waits for an approval, what is queued, every routine (scheduled / proposed / paused / running / ended, next
+  run, last outcome, runs and spend) and what just finished. Manage routines from the input line: `/routine add every 2h | <goal>`,
+  `/routine pause|resume|run|rm <id>`, `/routine when <id> <schedule>`, `/routine goal <id> <text>`.
+
 ## Architecture
 
 ```
@@ -174,10 +227,10 @@ that against splits justified only by parallelism. The TUI **Team** view shows a
 | Crate / service | Role |
 |---|---|
 | `dfae-core` | state model, plan schema, events, token accounting, decision contract, provider traits |
-| `dfae-decision` | open-model provider (typed answers from a self-hosted model's log-probabilities) · local rule-based decider (same typed questions) · calibrator · cache + fallback |
+| `dfae-decision` | hosted Decisions API provider (default) · open-model provider (typed answers from a self-hosted model's log-probabilities) · local rule-based decider (same typed questions) · calibrator · cache + fallback |
 | `dfae-extract` | GLiNER client · rule extractor · hybrid merge (structured rules win, semantic spans from GLiNER) |
 | `dfae-models` | OpenAI-compatible and Anthropic providers, tier gateway, JSON extraction + one repair retry |
-| `dfae-memory` | hash embedder · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
+| `dfae-memory` | hash and hosted semantic embedders (both kept per item) · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
 | `dfae-tools` | registry · **policy engine** · 11 native tools · direct binder · calculator |
 | `dfae-mcp` | MCP client (Streamable HTTP and stdio) · the hub that turns servers' tools into engine tools · **Glama directory** search and on-demand connection |
 | `dfae-runtime` | pipeline, planner/validator, DAG executor, approvals, recovery/replan, verification, skills, resume · **team: decomposer, roles, dispatcher, subagent supervision** |
@@ -188,6 +241,7 @@ that against splits justified only by parallelism. The TUI **Team** view shows a
 ### The decision contract
 
 `Question`/`Answer` are typed like a decision model's wire format (`noul` probability, `choice`, `score`).
+The hosted Decisions API (the default) takes the typed questions as they are and returns calibrated probabilities and choices.
 The self-hosted provider turns each question into a single-token multiple choice for an open-weight instruct
 model and reads the **probability mass of the answer tokens** from the first token's log-probabilities
 (`noul` = P(yes)/(P(yes)+P(no)); `choice` = lettered options; `score` = expected level), so answers are real
@@ -214,7 +268,8 @@ arguments** immediately before each tool executes (tools re-check too).
 - filesystem: read/write roots (the workspace), secret-name denylist, symlink-escape defence — for every file tool
 - shell: in the container, `shell.mode = "sandbox"` gives a **full bash** in the workspace (pipes, redirects, `&&`, git, build/test tools, timeouts, background jobs) and **the container is the boundary** (read-only root, no capabilities, unprivileged user, memory/pid limits). Outside a container the default `allowlist` mode applies: one allowlisted command, no shell, path-checked arguments, `find -exec` & co. denied
 - network: private/loopback/link-local/metadata addresses blocked (checked after DNS resolution, on every redirect hop); `open_web` lets `http_get` reach any public host. **The shell's own network access (`curl`, `pip`, `git clone`) is the container's, not this policy's**
-- tool output is untrusted: secrets redacted, injection patterns flagged → the task is *tainted* (shown in the audit; with `DFAE_APPROVALS=ask` side-effecting steps then require approval — in `never` mode a successful prompt injection can drive file changes and shell commands inside the sandbox, which is the price of not asking)
+- tool output is untrusted: secrets redacted, injection patterns flagged → the task is *tainted* (shown in the audit; with `DFAE_APPROVALS=ask` side-effecting steps then require approval)
+- content from outside (web pages, MCP servers) is **extracted from, never summarised**: lines that read like instructions are dropped and a model picks line numbers, so an injected sentence cannot reach the planner in a model's own words. The plan is written before such content is read (plan-then-execute), the step agent never runs on a task that has read it, and from then on **changing, moving or removing a file that was there before needs the request to name it** (or a human; in `never` mode it is refused and planned around), and a value read locally is not sent to the network. Measured on AgentDojo-style attacks: a setup page's injected `rm -rf tests` was carried out 11/11 times before, 0/15 with the guard. `DFAE_EXPOSED_CHANGES=allow` lifts it (for "upgrade the project as the guide at URL says"). What it does not stop: changes to files the request names, and anything the shell does outside the patterns it recognises — the sandbox remains the boundary
 - append-only audit log, hash-chained per task (`GET /v1/tasks/{id}/audit` reports `chain_valid`)
 - runs as an unprivileged user in a read-only container with all capabilities dropped; API published on loopback only
 
@@ -227,7 +282,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | Key | Action |
 |---|---|
 | `Enter` | submit the request |
-| `Tab` / `Shift+Tab` | **Chat** (home) · Timeline · Plan · Team · Cognition · Tokens · Memory · Tools |
+| `Tab` / `Shift+Tab` | **Chat** (home) · Timeline · Plan · Team · Cognition · Tokens · Memory · Tools · **Board** |
 | `↑`/`↓` | select task (empty input) or recall history |
 | `y` / `n` | approve / deny the pending approval |
 | `Ctrl+A` | jump to a task waiting for approval |
@@ -236,7 +291,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | `PgUp`/`PgDn`/`End` | scroll the timeline |
 | `F1` | help |
 
-Commands: `/mode`, `/team auto|on|off`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/cancel`, `/autoapprove on`, `/quit`.
+Commands: `/mode`, `/team auto|on|off`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/board`, `/routine …` (see *Background work*), `/cancel`, `/autoapprove on`, `/quit`.
 
 ### Conversation and the open web
 
@@ -367,7 +422,7 @@ curl -N localhost:8080/v1/tasks/<id>/events   # SSE: replays history, then live
 
 `/health` (liveness) · `/v1/health` · `/v1/info` · `/v1/tasks` (POST/GET) · `/v1/tasks/{id}` ·
 `/v1/tasks/{id}/cancel` · `/v1/tasks/{id}/approvals/{aid}` · `/v1/tasks/{id}/events` ·
-`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/dispatch` · `/v1/cost` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
+`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/board` · `/v1/routines[/{id}[/run]]` · `/v1/agents[/{name}]` · `/v1/dispatch` · `/v1/cost` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
 Set `DFAE_API_TOKEN` to require `Authorization: Bearer …` (everything except `/health`).
 
 ### Configuration
@@ -376,14 +431,20 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 
 | Variable | Effect |
 |---|---|
-| `DECISION_MODEL` | open-weight decision model pulled into Ollama (`qwen3:4b-instruct-2507-q4_K_M` default); `DECISION_PROVIDER=local` turns it off |
-| `DECISION_KINDS` | which decisions the model makes (default `route_task,select_tools,assess_recovery,assess_escalation,assess_completion`; `all` for every kind). The rest — mode, plan check, team split — use the built-in rules. The model is loaded in the background at start (decisions use the rules until it answers), a failure pauses it for 30 s instead of making every decision wait out a timeout, and tool selection is one multiple-choice question over the tools (and `none`) |
+| `DECISION_PROVIDER` | `decisions` (default with a gateway key): the hosted Decisions API, `DECISION_API_MODEL=openai/gpt-6-luna-decisions` (measured 98% routing accuracy vs 91% for the rules, ≈ $0.0003/task). `local`: built-in rules only. Unset with `DECISION_BASE_URL` set: a self-hosted model (`DECISION_MODEL`, default `qwen3:4b-instruct-2507-q4_K_M` in Ollama with `COMPOSE_PROFILES=local-decisions`) |
+| `DECISION_KINDS` | which decisions the model makes (default `all`; or a list such as `route_task,select_tools,assess_recovery`). The rest use the built-in rules. A failing model is paused for 30 s instead of making every decision wait out a timeout |
 | `PLANNER_API_KEY` / `PLANNER_MODEL` / `PLANNER_PROVIDER` / `PLANNER_BASE_URL` | the planner model (default `gpt-6-luna`; provider `openai` = any OpenAI-compatible endpoint, default base URL `https://ai-gateway.vercel.sh/v1`; or `anthropic`) |
 | `WORKER_API_KEY` / `WORKER_MODEL` / `WORKER_PROVIDER` / `WORKER_BASE_URL` | the worker model, configured exactly like the planner (default `glm-5.3-flash`; with no key of its own it uses the planner's when they share a base URL) |
+| `WORKER_PROVIDERS` | gateway providers allowed to serve the worker (default `baseten,nebius,fireworks`: unquantised, zero data retention; `any`: the gateway chooses) |
 | `PLANNER_MAX_TOKENS` / `WORKER_MAX_TOKENS` / `WORKER_CONTENT_MAX_TOKENS` | output limits: a plan; ordinary worker work (800); a file's content (16000) |
 | `GLAMA_API_KEY` | turns on MCP discovery (see *MCP servers*); `DFAE_MCP_AUTO=off`, `DFAE_MCP_MAX_AUTO`, `DFAE_MCP_TIMEOUT_SECS`, `DFAE_MCP_STATE`, `DFAE_MCP_KEY_<SLUG>`, `DFAE_MCP_SERVERS` tune it |
-| `PLANNER_REASONING` / `WORKER_REASONING` | thinking effort of a hosted model: `off`, `low`, `medium`, `high` (planner default `low`, worker `off`: hidden thinking is billed and eats the output limit; a gateway that rejects the field is asked without it from then on) |
-| `*_TIMEOUT_SECS`, `PLANNER_PROMPT_CACHE` | request timeouts; declare that an OpenAI-compatible endpoint caches repeated prompt prefixes (Anthropic and `api.openai.com` are known to) |
+| `PLANNER_REASONING` / `WORKER_REASONING` | thinking effort of a hosted model: `off`, `low`, `medium`, `high` (both default `low`; GLM-5.3-Flash cannot turn thinking off). `PLANNER_REASONING_HARD` (default `medium`) applies from the second re-plan; `PLANNER_REASONING_ADAPTIVE=on` sets effort from the request's complexity instead (measured worse, off by default) |
+| `*_TIMEOUT_SECS`, `PLANNER_PROMPT_CACHE` | request timeouts; whether an endpoint caches repeated prompt prefixes (known: Anthropic, `api.openai.com`, Vercel AI Gateway; `on` declares another; three misses turn the cacheable prefix off) |
+| `DFAE_EMBEDDINGS` | semantic memory embeddings (default `voyage/voyage-4-lite` through the gateway; `hash` turns them off). `DFAE_FACTS=off` stops durable facts being extracted from verified tasks |
+| `DFAE_REDACT_PII` / `DFAE_PII_NER_URL` | personal data (e-mail, phone, card numbers, IBANs) is redacted before anything is kept (default on); with a GLiNER PII service, names and street addresses too |
+| `DFAE_STEP_AGENT` / `DFAE_STEP_AGENT_STYLE` | the worker fixes a failed step with a short loop before the planner is asked (default on; `script`, one script per action, measured half the actions and −47% cost vs `tools`) |
+| `DFAE_ROUTINES` / `DFAE_TIMEZONE` / `DFAE_ROUTINE_CONCURRENCY` / `DFAE_ROUTINE_MAX_RUNS_PER_DAY` | the routine scheduler (on), the zone of clock times (UTC), runs at once (4), runs started per day (200) |
+| `DFAE_EXPOSED_CHANGES` | `allow` lifts the guard on changing existing files and sending local data out after outside content was read (see *Security*) |
 | `DFAE_API_TOKEN` | bearer token for the API |
 | `DFAE_APPROVALS` | `never` (default): nothing waits for a human. `ask`: risky calls wait for approval |
 | `DFAE_ALLOW_AUTO_APPROVE` | with `ask`: allow `auto_approve` requests (benchmarks only) |
@@ -394,7 +455,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `DFAE_PLAN_PREFIX` | `narrow`/`off`: per-task tool list in the user message; `always`: send the cacheable prefix on every planner call; default: prefix only while the provider's cache is warm |
 | `DFAE_PLAN_REPORT` | `on` lets the planner pre-write the final reply (off: measured to cost more than a worker-written answer) |
 | `DFAE_ANSWER_LOCAL_FIRST` | `off` sends every final answer to the planner instead of the worker model |
-| `DFAE_WORKSPACE_SNAPSHOT`, `DFAE_CONDENSE` | `off` disables the workspace line in plan prompts / local condensation of big outputs |
+| `DFAE_WORKSPACE_SNAPSHOT`, `DFAE_CONDENSE` | `off` disables the workspace line in plan prompts / line-selection condensation of big outputs |
 | `DFAE_DECISION_LOG` | JSONL file of decisions and their outcomes (evaluation / training data) |
 | `DFAE_SHADOW_EVAL` | 0..1: share of requests whose routing the planner also decides, to measure the decision model (spends planner tokens; default 0) |
 | `DFAE_TEAM` | `off` disables automatic delegation |
@@ -402,14 +463,15 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `DFAE_MAX_AGENTS` / `DFAE_ROLE_SLOTS` | subagents running at once (8) / per-role pools (`researcher=4,operator=1,analyst=4,verifier=2`) |
 
 Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `DATABASE_URL` is set), then
-`cargo run --release -p dfae-tui`. NVIDIA GPU for the decision model: add `-f compose.gpu.yaml`.
+`cargo run --release -p dfae-tui`. NVIDIA GPU for a self-hosted decision model: add `-f compose.gpu.yaml`.
 
 ### What works without what
 
 | Missing | Behaviour |
 |---|---|
-| decision model (not pulled yet / unreachable / `DECISION_PROVIDER=local`) | local rule-based decisions (same typed questions, visible in the *Cognition* tab) |
-| GLiNER model (still downloading) | rule extraction (paths, URLs, versions, expressions, constraints, …) |
+| decision model (unreachable, no key, or `DECISION_PROVIDER=local`) | local rule-based decisions (same typed questions, visible in the *Cognition* tab) |
+| GLiNER (not enabled, the default) | rule extraction (paths, URLs, versions, expressions, constraints, …) |
+| semantic embeddings (no key, or `DFAE_EMBEDDINGS=hash`) | hash embeddings only: exact and near-exact wording is found, paraphrases often not |
 | worker model | the planner does its calls (and a task without any model runs only what binds deterministically) |
 | planner model | the worker model plans (concrete steps, as before); with `PLANNER_API_KEY` set and the planner unreachable the task fails with the reason |
 | Postgres | volatile in-memory storage (the compose stack always includes Postgres) |
@@ -417,7 +479,7 @@ Without Docker: `cargo run --release -p dfae-server` (in-memory storage unless `
 ## Development
 
 ```bash
-cargo test --workspace                       # 300 tests, hermetic
+cargo test --workspace                       # ~400 tests, hermetic (live suites are #[ignore]d: see docs/eval)
 DFAE_TEST_DATABASE_URL=postgres://… cargo test -p dfae-memory --test pg
 cd services/gliner-service && pytest tests   # needs fastapi, httpx, pytest
 scripts/bench.sh                             # token/mode table over examples/tasks.txt
@@ -427,30 +489,21 @@ scripts/bench.sh                             # token/mode table over examples/ta
 
 | Area | State |
 |---|---|
-| Rust workspace: build, `clippy -D warnings` clean, 300 unit/integration/e2e tests | verified |
-| Direct / assisted / escalated pipelines, planning repair, replanning, retries, approvals, policy, injection taint, skills, resume, budgets, cancellation | verified with scripted models in `crates/dfae-runtime/tests/e2e.rs` |
-| Teams: decomposition, roles + scopes, dispatcher pools, handoff, supervision/retry, failure isolation, budget slices, shared cache, approvals, cancellation, admission control, resume | verified with content-routed fake models (`crates/dfae-runtime/tests/team.rs`, stable over repeated runs) and with the real server/TUI against a fake OpenAI-compatible server |
-| Token economy: repair (plan-time and runtime, incl. non-guessing rules), budget gate, learned prices, output/tool contracts, lazy context | verified (`crates/dfae-runtime/tests/economy.rs`) and in the real server (misplaced file repaired with 0 model calls; plans priced; cost model learning) |
-| External-token reductions (plan lines, cached prefix, local-first answers, intent skills) | verified by the ablation benchmark with a **scripted** planner and a **simulated** prompt cache (`tests/bench.rs`); real-provider cache-hit rates and real-planner behaviour in the new line format are **unmeasured** |
-| Token economy payoff on a *real* model | **unmeasured** — priors come from the shipped prompts; savings per avoided repair (~300–500 tokens) are estimates; lazy context may cost more than it saves for some workloads |
-| Quality of automatic splits with a *real* worker model/decision model | **untested** — the decomposer and its decision are deterministic and conservative, but how often real requests split well must be measured on your tasks |
-| Conversation (small talk, chat turns, session history, "it"/"that file"/"my city" resolution), file-creation phrasings, planner-slip recovery | verified (`crates/dfae-runtime/tests/chat.rs`) and with the real server |
-| `web_search` / `http_get` | parsers unit-tested on fixtures; **run live from the build sandbox**: DuckDuckGo search + page read worked once and was bot-blocked later (Wikipedia answered instead); `http_get` on `wttr.in/<city>?format=3` returned the weather. Whether a *real worker model* plans weather lookups well is **untested**. Third-party services change — treat as best effort |
-| Postgres store, audit chain | verified against PostgreSQL 16 (`real[]` fallback path) |
-| HTTP API + SSE + auth, TUI rendering and key handling | verified (integration tests; TUI also driven in a real terminal) |
-| GLiNER service with the real model, called by the Rust engine | verified manually (extraction of the blueprint example) |
-| Open decision model | the provider, prompts, probability extraction, fallback and health are tested against a **fake** OpenAI-compatible server returning logprobs; **never run against a real model here** (no Ollama/GPU in the build sandbox). How accurate `qwen3:4b-instruct-2507` is on these questions — and whether it beats the local rules — is **unmeasured**: compare on your own requests (the *Cognition* tab shows each decision and its provider) |
-| OpenAI-compatible / Anthropic providers | wire-format tested against fake servers; not run against real services |
-| Planner and worker models (`gpt-6-luna`, `glm-5.3-flash`) | wire format and the typed plan/patch machinery are tested with scripted and metered models; **never run here against the real hosted models** — `cargo test -p dfae-runtime --test live_worker -- --ignored` runs the worker system against them (and, with `LIVE_PLANNER=1`, the planner too) with your keys |
-| pgvector path | written, **untested** (extension unavailable here); the `real[]` fallback is what was tested |
-| `docker compose up` | `compose config` validates and the Rust build uses `--locked`; images were **not built or run here** (no Docker daemon) |
+| Rust workspace: build, `clippy` clean, ~400 unit/integration/e2e tests | verified |
+| Pipelines, planning repair, replanning, retries, approvals, policy, injection taint, the outside-content guard, skills, resume, budgets, cancellation, teams | verified with scripted models (`crates/dfae-runtime/tests/`) |
+| The whole system against the real hosted models (`gpt-6-luna` planner, `glm-5.3-flash` worker, the hosted Decisions API, `voyage-4-lite` embeddings, Glama MCP discovery) | **run live**: a suite of harder end-to-end tasks with oracles that check the outcome (bug fixes with tests, a Next.js build, served pages, cross-session memory, MCP servers, AgentDojo-style injections), interleaved A/B runs for every change that claims a gain — results and costs in [`docs/eval/validation-2026-11-27.md`](docs/eval/validation-2026-11-27.md), status per item in [`docs/upgrade-plan.md`](docs/upgrade-plan.md) §16 |
+| Postgres store with pgvector (semantic column, backfill), audit chain | verified against PostgreSQL 16 + pgvector |
+| GLiNER and GLiNER-PII services with the real models | verified (PII: held-out set 14/14 names and addresses found, 0/12 lookalikes touched) |
+| Self-hosted open decision model | tested against a **fake** OpenAI-compatible server returning logprobs; not run against a real local model here (no GPU) |
+| Quality of automatic team splits with real models | **unmeasured** |
+| `web_search` | best effort: DuckDuckGo may block automated requests (Wikipedia answers instead); SearXNG or Brave are dependable |
+| `docker compose up` | `compose config` validates; images were **not built or run here** (no Docker daemon) |
 
 ### Not implemented (from the blueprint)
 
-MCP client/server, agent-to-agent messaging, nested teams (agents cannot spawn agents), task priorities / work stealing, browser and microVM/WASM sandboxes (the container is
+an MCP *server* (the client is implemented), agent-to-agent messaging, nested teams (agents cannot spawn agents), task priorities / work stealing, browser and microVM/WASM sandboxes (the container is
 the isolation boundary), OpenTelemetry (Prometheus metrics, structured logs and the audit chain
-instead), distributed workers, trajectory export / fine-tuning pipeline, model-based embeddings
-(a deterministic hash embedder is used; the `Embedder` trait is the seam), multi-user authentication.
+instead), distributed workers, trajectory export / fine-tuning pipeline, multi-user authentication.
 
 ## License
 

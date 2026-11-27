@@ -61,6 +61,9 @@ async fn main() -> anyhow::Result<()> {
     if !resumed.is_empty() {
         tracing::info!(count = resumed.len(), "resumed unfinished tasks");
     }
+    engine.start_routines().await;
+    let routines = engine.routines();
+    tracing::info!(routines = routines.len(), enabled = routines.iter().filter(|r| r.enabled).count(), "routines scheduler started");
     if cfg.api_token.is_none() {
         tracing::warn!("DFAE_API_TOKEN is not set: the API is unauthenticated. Do not expose it beyond a trusted network.");
     }

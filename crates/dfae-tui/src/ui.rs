@@ -141,6 +141,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Tab::Tokens => draw_tokens(f, content, app),
         Tab::Memory => draw_memory(f, content, app),
         Tab::Tools => draw_tools(f, content, app),
+        Tab::Board => draw_board(f, content, app),
     }
     draw_input(f, input, app);
     draw_footer(f, footer, app);
@@ -503,6 +504,7 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 Style::new(),
             ),
             EventKind::Warning { message } => push(badge("warn", WARN), message.clone(), Style::new().fg(WARN)),
+            EventKind::Routine { action, detail, .. } => push(badge("routine", ACCENT), format!("{action}: {detail}"), Style::new()),
         }
     }
     if let Some(ans) = &d.final_answer {
@@ -1249,6 +1251,165 @@ fn draw_tools(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// How long ago (or how far ahead), short: `12s`, `5m`, `3h`, `2d`.
+fn rel(t: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> String {
+    let s = (now - t).num_seconds();
+    let (a, sign) = (s.abs(), if s < 0 { "in " } else { "" });
+    let body = match a {
+        0..=59 => format!("{a}s"),
+        60..=3599 => format!("{}m", a / 60),
+        3600..=172_799 => format!("{}h", a / 3600),
+        _ => format!("{}d", a / 86_400),
+    };
+    if s < 0 { format!("{sign}{body}") } else { format!("{body} ago") }
+}
+
+/// The live board: what the agents are doing now, what waits, what is scheduled, and what just finished.
+fn draw_board(f: &mut Frame, area: Rect, app: &App) {
+    let Some(b) = &app.board else {
+        f.render_widget(Paragraph::new(" waiting for the server…").block(block(" Board ")), area);
+        return;
+    };
+    let now = b.now;
+    let live = b.running.len() + b.waiting.len();
+    let [top, mid, bottom] = Layout::vertical([
+        Constraint::Length((live as u16 + 3).clamp(4, 14)),
+        Constraint::Length((b.routines.len() as u16 + 3).clamp(4, 14)),
+        Constraint::Min(4),
+    ])
+    .areas(area);
+    let w = area.width as usize;
+    let task_row = |t: &dfae_core::routine::BoardTask, waiting: bool| {
+        let state = if waiting {
+            Span::styled("approval", Style::new().fg(WARN))
+        } else {
+            Span::styled(format!("{:?}", t.status).to_lowercase(), Style::new().fg(ACCENT))
+        };
+        let who = match (&t.role, &t.routine_id) {
+            (Some(r), _) => r.clone(),
+            (None, Some(r)) => format!("routine {}", short(r)),
+            _ => "task".into(),
+        };
+        Row::new(vec![
+            Cell::from(short(&t.task_id).to_string()),
+            Cell::from(state),
+            Cell::from(trunc(&who, 17)),
+            Cell::from(format!("{}/{}", t.steps_done, t.steps_total)),
+            Cell::from(trunc(t.doing.as_deref().unwrap_or(&t.goal), w.saturating_sub(61))),
+            Cell::from(format!("${:.4}", t.cost_usd)),
+            Cell::from(rel(t.started, now)),
+        ])
+    };
+    let rows: Vec<Row> = b.running.iter().map(|t| task_row(t, false)).chain(b.waiting.iter().map(|t| task_row(t, true))).collect();
+    let widths = [
+        Constraint::Length(9),
+        Constraint::Length(10),
+        Constraint::Length(18),
+        Constraint::Length(6),
+        Constraint::Min(20),
+        Constraint::Length(9),
+        Constraint::Length(8),
+    ];
+    let title = format!(" Now · {} running · {} waiting for approval · {} queued ", b.running.len(), b.waiting.len(), b.queued);
+    f.render_widget(
+        Table::new(rows, widths)
+            .header(Row::new(["task", "state", "who", "steps", "doing", "cost", "started"]).style(Style::new().fg(DIM)))
+            .block(block(title)),
+        top,
+    );
+    // routines
+    let rows: Vec<Row> = b
+        .routines
+        .iter()
+        .map(|r| {
+            let (state, col) = match (&r.state.ended, r.enabled, &r.proposed, &r.state.running) {
+                (Some(_), ..) => ("ended", DIM),
+                (_, _, _, Some(_)) => ("running", ACCENT),
+                (_, false, Some(_), _) => ("proposed", WARN),
+                (_, false, None, _) => ("paused", DIM),
+                _ => ("scheduled", OK),
+            };
+            let next = match (&r.state.ended, r.state.next_run) {
+                (Some(e), _) => e.clone(),
+                (_, Some(n)) => rel(n, now),
+                _ => "-".into(),
+            };
+            let last = r.history.last().map(|h| {
+                let c = match h.outcome {
+                    dfae_core::routine::RunOutcome::Ok => OK,
+                    dfae_core::routine::RunOutcome::Partial => WARN,
+                    dfae_core::routine::RunOutcome::Failed => BAD,
+                    dfae_core::routine::RunOutcome::Skipped => DIM,
+                };
+                Span::styled(format!("{:?} {}", h.outcome, rel(h.at, now)).to_lowercase(), Style::new().fg(c))
+            });
+            Row::new(vec![
+                Cell::from(short(&r.id).to_string()),
+                Cell::from(Span::styled(state, Style::new().fg(col))),
+                Cell::from(trunc(&r.name, 22)),
+                Cell::from(trunc(&r.when, 22)),
+                Cell::from(trunc(&next, 16)),
+                Cell::from(last.unwrap_or_else(|| Span::raw("-"))),
+                Cell::from(format!("{} · ${:.3}", r.state.runs, r.state.spent_usd)),
+                Cell::from(if r.origin.by == "agent" { "agent" } else { "you" }),
+            ])
+        })
+        .collect();
+    let proposed = b.routines.iter().filter(|r| r.proposed.is_some() && !r.enabled).count();
+    let title = if proposed > 0 {
+        format!(" Routines · {proposed} proposed by an agent: /routine resume <id> to enable · /routine add <when> | <goal> ")
+    } else {
+        " Routines · /routine add <when> | <goal> · pause|resume|run|rm <id> · when <id> <schedule> ".to_string()
+    };
+    f.render_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(9),
+                Constraint::Length(10),
+                Constraint::Length(23),
+                Constraint::Length(23),
+                Constraint::Length(17),
+                Constraint::Length(14),
+                Constraint::Length(12),
+                Constraint::Length(6),
+            ],
+        )
+        .header(Row::new(["id", "state", "name", "when", "next", "last", "runs · spent", "by"]).style(Style::new().fg(DIM)))
+        .block(block(title)),
+        mid,
+    );
+    // recent
+    let rows: Vec<Row> = b
+        .recent
+        .iter()
+        .map(|t| {
+            let col = match t.status {
+                TaskStatus::Completed => OK,
+                TaskStatus::Failed => BAD,
+                _ => DIM,
+            };
+            Row::new(vec![
+                Cell::from(short(&t.task_id).to_string()),
+                Cell::from(Span::styled(format!("{:?}", t.status).to_lowercase(), Style::new().fg(col))),
+                Cell::from(trunc(t.routine_id.as_ref().map(|r| format!("routine {}", short(r))).as_deref().or(t.role.as_deref()).unwrap_or("task"), 14)),
+                Cell::from(trunc(&t.goal, w.saturating_sub(50))),
+                Cell::from(format!("${:.4}", t.cost_usd)),
+                Cell::from(rel(t.updated, now)),
+            ])
+        })
+        .collect();
+    f.render_widget(
+        Table::new(
+            rows,
+            [Constraint::Length(9), Constraint::Length(10), Constraint::Length(15), Constraint::Min(20), Constraint::Length(9), Constraint::Length(8)],
+        )
+        .header(Row::new(["task", "result", "who", "goal", "cost", "ended"]).style(Style::new().fg(DIM)))
+        .block(block(" Recently finished ")),
+        bottom,
+    );
+}
+
 // ----------------------------------------------------------- chrome -----
 
 fn draw_input(f: &mut Frame, area: Rect, app: &App) {
@@ -1663,6 +1824,7 @@ mod tests {
                 upstream: vec![Upstream { label: "c2: check the server".into(), summary: "it is affected".into() }],
                 entities: vec![],
                 inherited_taint: false,
+                profile: None,
             }),
             children: vec![],
             reason: None,
@@ -1719,5 +1881,64 @@ mod tests {
         assert_eq!(fmt_tokens(950), "950");
         assert_eq!(fmt_tokens(1234), "1.23k");
         assert_eq!(fmt_tokens(25_000), "25.0k");
+    }
+
+    #[test]
+    fn the_board_shows_what_runs_what_is_scheduled_and_what_an_agent_proposed() {
+        use dfae_core::routine::*;
+        let now = chrono::Utc::now();
+        let task = BoardTask {
+            task_id: "aaaaaaaa-1".into(),
+            goal: "check the build".into(),
+            status: TaskStatus::Running,
+            mode: Some(ExecMode::Escalated),
+            doing: Some("s2 shell: run the tests".into()),
+            steps_done: 1,
+            steps_total: 3,
+            role: None,
+            parent_id: None,
+            routine_id: Some("rrrrrrrr-1".into()),
+            pending_approvals: 0,
+            cost_usd: 0.0012,
+            started: now,
+            updated: now,
+        };
+        let mk = |id: &str, name: &str, enabled: bool, proposed: Option<&str>| Routine {
+            id: id.into(),
+            name: name.into(),
+            goal: "g".into(),
+            schedule: Schedule::Every { secs: 7200, anchor: now },
+            when: "every 2h".into(),
+            tz: None,
+            enabled,
+            proposed: proposed.map(String::from),
+            max_runs: None,
+            until: None,
+            active_hours: None,
+            if_changed: None,
+            if_ok: None,
+            catch_up: true,
+            max_cost_usd: None,
+            origin: Origin { by: "agent".into(), task_id: None },
+            created_at: now,
+            updated_at: now,
+            state: RoutineState { next_run: enabled.then(|| now + chrono::Duration::minutes(90)), ..Default::default() },
+            history: vec![],
+        };
+        let mut app = App::new("http://x");
+        app.tab = Tab::Board;
+        app.apply_board(Board {
+            now,
+            running: vec![task],
+            waiting: vec![],
+            recent: vec![],
+            routines: vec![mk("rrrrrrrr-1", "build watch", true, None), mk("pppppppp-1", "page job", false, Some("outside content"))],
+            queued: 0,
+        });
+        let screen = render(&app, 160, 40);
+        assert!(screen.contains("s2 shell: run the tests") && screen.contains("1/3"), "{screen}");
+        assert!(screen.contains("build watch") && screen.contains("scheduled") && screen.contains("in 1h"), "{screen}");
+        assert!(screen.contains("proposed") && screen.contains("1 proposed by an agent"), "{screen}");
+        assert!(screen.contains("routine rrrrrrrr"), "a run shows which routine started it: {screen}");
     }
 }

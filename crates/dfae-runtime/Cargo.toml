@@ -12,6 +12,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+chrono-tz = { workspace = true }
 regex = { workspace = true }
 parking_lot = { workspace = true }
 dfae-decision = { workspace = true }

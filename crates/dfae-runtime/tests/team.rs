@@ -575,7 +575,15 @@ async fn an_interrupted_team_adopts_finished_agents_and_never_reruns_unknown_one
         c.final_answer = answer.map(String::from);
         c.team = Some(TeamInfo {
             role: AgentRole::Researcher,
-            link: Some(TeamLink { parent_id: parent.into(), parent_step: step.into(), depth: 1, upstream: vec![], entities: vec![], inherited_taint: false }),
+            link: Some(TeamLink {
+                parent_id: parent.into(),
+                parent_step: step.into(),
+                depth: 1,
+                upstream: vec![],
+                entities: vec![],
+                inherited_taint: false,
+                profile: None,
+            }),
             children: vec![],
             reason: None,
             cache_hits: 0,

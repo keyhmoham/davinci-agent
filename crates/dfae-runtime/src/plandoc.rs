@@ -8,8 +8,9 @@
 //!
 //! Re-planning uses a *patch* ([`PatchDoc`]): edit a step, add steps, drop steps. Only what changes is paid for.
 
+use dfae_core::AgentProfile;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepDoc {
@@ -24,6 +25,8 @@ pub struct StepDoc {
     pub planner: bool,
     /// Arguments the planner volunteered (not part of the schema): kept as hints for the worker, never required.
     pub args: Option<Value>,
+    /// Delegation: a subagent does this step (a saved agent's name, or `{name, instructions, tools, writes}`).
+    pub agent: Option<Value>,
 }
 
 impl StepDoc {
@@ -31,6 +34,10 @@ impl StepDoc {
         let mut v = json!({"id": self.id, "tool": self.tool, "do": self.intent, "after": self.after, "expect": self.expect, "planner": self.planner});
         if let Some(a) = self.args.as_ref().filter(|a| a.as_object().is_some_and(|o| !o.is_empty())) {
             v["args"] = a.clone();
+        }
+        if let Some(a) = &self.agent {
+            v["agent"] = a.clone();
+            v["tool"] = Value::Null;
         }
         v
     }
@@ -189,7 +196,57 @@ fn step_from(v: &Value, position: usize, tools: &[String], r: &mut Reading) -> O
     };
     let expect = first(v, &["expect", "success", "expected"]).and_then(text).filter(|e| !is_nothing(e));
     let planner = first(v, &["planner", "strong", "own"]).and_then(|b| b.as_bool()).unwrap_or(false);
-    Some(StepDoc { id, tool, intent, after, expect, planner, args })
+    let agent = first(v, &["agent", "subagent"]).cloned();
+    if let Some(a) = &agent
+        && let Err(e) = AgentProfile::from_value(a)
+    {
+        r.issues.push(format!("step {id}: {e}"));
+        return None;
+    }
+    Some(StepDoc { id, tool: if agent.is_some() { None } else { tool }, intent, after, expect, planner, args, agent })
+}
+
+/// The steps of a reply, with fan-out expanded.
+fn read_steps(arr: &[Value], tools: &[String], r: &mut Reading) -> Vec<StepDoc> {
+    let read: Vec<(StepDoc, Vec<String>)> = arr.iter().enumerate().filter_map(|(i, v)| step_from(v, i, tools, r).map(|s| (s, items(v)))).collect();
+    fan_out(read, r)
+}
+
+/// The most instances one step may fan out into.
+pub const MAX_INSTANCES: usize = 8;
+
+/// `"each": ["a", "b"]` on a step: one instance per item, run in parallel (`s3` → `s3_1`, `s3_2`), each told its item (`{item}` in the
+/// sentence, or appended). A step that waited for `s3` waits for all of them, so it joins their results.
+fn fan_out(steps: Vec<(StepDoc, Vec<String>)>, r: &mut Reading) -> Vec<StepDoc> {
+    let mut instances: HashMap<String, Vec<String>> = HashMap::new();
+    let mut out = Vec::new();
+    for (s, each) in steps {
+        if each.is_empty() {
+            out.push(s);
+            continue;
+        }
+        let each: Vec<String> = each.into_iter().take(MAX_INSTANCES).collect();
+        let ids: Vec<String> = (1..=each.len()).map(|i| format!("{}_{i}", s.id)).collect();
+        r.repairs.push(format!("step {} runs as {} parallel instances", s.id, ids.len()));
+        for (item, id) in each.iter().zip(&ids) {
+            let mut x = s.clone();
+            x.id = id.clone();
+            x.intent = if s.intent.contains("{item}") { s.intent.replace("{item}", item) } else { format!("{} — this part: {item}", s.intent) };
+            out.push(x);
+        }
+        instances.insert(s.id.clone(), ids);
+    }
+    for s in &mut out {
+        s.after = s.after.iter().flat_map(|d| instances.get(d).cloned().unwrap_or_else(|| vec![d.clone()])).collect();
+    }
+    out
+}
+
+fn items(v: &Value) -> Vec<String> {
+    match first(v, &["each", "for_each", "parts", "instances"]) {
+        Some(Value::Array(a)) => a.iter().filter_map(|x| text(x).or_else(|| x.is_object().then(|| x.to_string()))).filter(|s| !s.is_empty()).collect(),
+        _ => vec![],
+    }
 }
 
 /// The array of steps, wherever a model put it.
@@ -234,7 +291,7 @@ impl PlanDoc {
             r.issues.push("the reply has no \"steps\" array".into());
             return Err(r);
         };
-        let mut steps: Vec<StepDoc> = arr.iter().enumerate().filter_map(|(i, s)| step_from(s, i, tools, &mut r)).collect();
+        let mut steps = read_steps(arr, tools, &mut r);
         if steps.is_empty() && r.issues.is_empty() {
             r.issues.push("the plan has no steps".into());
         }
@@ -249,14 +306,12 @@ impl PatchDoc {
     /// `edit`/`add`/`drop`) is read as `add`: a model that ignores the patch format still gets its steps run.
     pub fn from_value(v: &Value, tools: &[String], existing: &HashSet<String>) -> Result<(PatchDoc, Reading), Reading> {
         let mut r = Reading::default();
-        let list = |key: &str, r: &mut Reading| -> Vec<StepDoc> {
-            v.get(key).and_then(|a| a.as_array()).map(|a| a.iter().enumerate().filter_map(|(i, s)| step_from(s, i, tools, r)).collect()).unwrap_or_default()
-        };
+        let list = |key: &str, r: &mut Reading| -> Vec<StepDoc> { v.get(key).and_then(|a| a.as_array()).map(|a| read_steps(a, tools, r)).unwrap_or_default() };
         let (mut edit, mut add) = (list("edit", &mut r), list("add", &mut r));
         let drop: Vec<String> = v.get("drop").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(text).collect()).unwrap_or_default();
         let has_patch_keys = ["edit", "add", "drop"].iter().any(|k| v.get(*k).is_some());
         if !has_patch_keys && let Some(arr) = step_array(v) {
-            add = arr.iter().enumerate().filter_map(|(i, s)| step_from(s, i, tools, &mut r)).collect();
+            add = read_steps(arr, tools, &mut r);
             r.repairs.push("the reply was a plan, not a patch: its steps are added".into());
         }
         // an "edit" of a step that is not in the plan is an addition
@@ -293,14 +348,25 @@ fn step_schema(tools: &[String]) -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "tool", "do", "after", "expect", "planner"],
+        "required": ["id", "tool", "do", "after", "expect", "planner", "agent", "each"],
         "properties": {
             "id": {"type": "string", "description": "s1, s2, … (a re-plan's new steps: the given prefix + 1, 2, …)"},
             "tool": {"anyOf": [{"type": "string", "enum": tool_values}, {"type": "null"}], "description": "the tool for this step, or null for a step that thinks or writes from earlier results"},
             "do": {"type": "string", "description": "the intent in one sentence, with every concrete value (path, name, pattern, text, command) in it"},
             "after": {"type": "array", "items": {"type": "string"}, "description": "ids of the steps whose output or effect this one needs"},
             "expect": {"anyOf": [{"type": "string"}, {"type": "null"}], "description": "what any correct result shows, e.g. \"site/index.html exists\"; null for exploratory steps"},
-            "planner": {"type": "boolean", "description": "true only if this step needs the planner's own reasoning"}
+            "planner": {"type": "boolean", "description": "true only if this step needs the planner's own reasoning"},
+            "agent": {"anyOf": [
+                {"type": "null"},
+                {"type": "string", "description": "a saved agent's name"},
+                {"type": "object", "additionalProperties": false, "required": ["name", "instructions", "tools", "writes"], "properties": {
+                    "name": {"type": "string"},
+                    "instructions": {"type": "string", "description": "how the agent works and what it returns"},
+                    "tools": {"type": "array", "items": {"type": "string"}},
+                    "writes": {"type": "boolean"}
+                }}
+            ], "description": "null, or the subagent that does this step (breadth work only)"},
+            "each": {"anyOf": [{"type": "null"}, {"type": "array", "items": {"type": "string"}}], "description": "null, or the parts: one parallel instance of this step per part"}
         }
     })
 }
@@ -411,11 +477,37 @@ mod tests {
         let s = plan_schema(&tools(), false);
         assert_eq!(s["additionalProperties"], false);
         let item = &s["properties"]["steps"]["items"];
-        assert_eq!(item["required"].as_array().unwrap().len(), 6);
+        assert_eq!(item["required"].as_array().unwrap().len(), 8, "every property is required in strict mode (agent and each are nullable)");
         let e = item["properties"]["tool"]["anyOf"][0]["enum"].as_array().unwrap();
         assert!(e.contains(&json!("fs_write")) && !e.contains(&json!("teleport")));
         assert!(plan_schema(&tools(), true)["required"].as_array().unwrap().contains(&json!("report")));
         assert_eq!(patch_schema(&tools())["required"], json!(["edit", "add", "drop"]));
+    }
+
+    #[test]
+    fn an_agent_step_fans_out_into_parallel_instances_and_the_join_waits_for_all() {
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_read", "do": "read the module list", "after": [], "expect": null, "planner": false, "agent": null, "each": null},
+            {"id": "s2", "tool": null, "do": "review {item} for bugs", "after": ["s1"], "expect": null, "planner": false,
+             "agent": {"name": "reviewer", "instructions": "read the code, list real bugs with file:line", "tools": ["fs_read"], "writes": false},
+             "each": ["src/a.rs", "src/b.rs", "src/c.rs"]},
+            {"id": "s3", "tool": null, "do": "merge the reviews", "after": ["s2"], "expect": null, "planner": false, "agent": null, "each": null}]});
+        let (doc, r) = PlanDoc::from_value(&v, &tools()).unwrap();
+        let ids: Vec<&str> = doc.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["s1", "s2_1", "s2_2", "s2_3", "s3"]);
+        assert_eq!(doc.steps[2].intent, "review src/b.rs for bugs");
+        assert!(doc.steps[1..4].iter().all(|s| s.agent.is_some() && s.tool.is_none() && s.after == ["s1"]));
+        assert_eq!(doc.steps[4].after, ["s2_1", "s2_2", "s2_3"], "the join waits for every instance");
+        assert!(r.repairs.iter().any(|x| x.contains("3 parallel instances")));
+        // a step without {item} gets its part appended; more than 8 parts are cut
+        let many: Vec<String> = (0..12).map(|i| format!("p{i}")).collect();
+        let v = json!({"steps": [{"id": "s1", "tool": null, "do": "summarise", "after": [], "expect": null, "planner": false, "agent": "researcher-x", "each": many}]});
+        let (doc, _) = PlanDoc::from_value(&v, &tools()).unwrap();
+        assert_eq!(doc.steps.len(), MAX_INSTANCES);
+        assert_eq!(doc.steps[0].intent, "summarise — this part: p0");
+        // a malformed agent is an issue for the planner
+        let v = json!({"steps": [{"id": "s1", "tool": null, "do": "x", "after": [], "expect": null, "planner": false, "agent": {"name": "bad name!"}}]});
+        assert!(PlanDoc::from_value(&v, &tools()).unwrap_err().issues[0].contains("name"));
     }
 
     #[test]
