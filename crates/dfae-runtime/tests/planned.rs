@@ -1034,7 +1034,10 @@ async fn the_planner_thinks_as_hard_as_the_request_needs_and_a_first_replan_keep
     assert_eq!(plan.reasoning.as_deref(), Some("none"), "a one-step request: no thinking");
     // a step that fails: the first re-plan thinks as much as the plan did (same cached prefix)
     r.planner.push(&json!({"steps": [{"id": "s1", "do": "read missing.txt", "tool": "fs_read"}]}).to_string());
-    r.planner.push(&json!({"edit": [], "add": [{"id": "r1_1", "do": "read a.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}], "drop": ["s1"]}).to_string());
+    r.planner.push(
+        &json!({"edit": [], "add": [{"id": "r1_1", "do": "read a.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}], "drop": ["s1"]})
+            .to_string(),
+    );
     run_as(&r, ModeRequest::Escalated, "Read missing.txt").await;
     let reqs = r.planner.requests.lock().clone();
     let plan2 = reqs.iter().filter(|q| q.purpose == "plan").nth(1).unwrap();

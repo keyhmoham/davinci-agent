@@ -348,8 +348,16 @@ async fn harder_tasks_end_to_end() {
                 }
             }
             eprintln!(
-                "  ${:.5} (planner ${:.5} in {} calls, worker ${:.5} in {} calls {:?}, decisions ${:.5} in {})",
-                s.cost_usd, s.planner_cost_usd, s.planner_calls, s.worker_cost_usd, s.worker_calls, s.worker_by_purpose, s.decision_cost_usd, s.decision_calls
+                "  ${:.5} (planner ${:.5} in {} calls, {} reasoning tokens, worker ${:.5} in {} calls {:?}, decisions ${:.5} in {})",
+                s.cost_usd,
+                s.planner_cost_usd,
+                s.planner_calls,
+                s.planner_reasoning_tokens,
+                s.worker_cost_usd,
+                s.worker_calls,
+                s.worker_by_purpose,
+                s.decision_cost_usd,
+                s.decision_calls
             );
             eprintln!("  answer: {}", tokens::truncate_tokens(&answer(&t), 80).replace('\n', " ⏎ "));
             let verdict = if t.status != TaskStatus::Completed { Err(format!("{:?}: {:?}", t.status, t.error)) } else { (c.check)(ws.path(), &t) };
