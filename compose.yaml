@@ -118,6 +118,10 @@ services:
       DFAE_STEP_AGENT_STYLE: ${DFAE_STEP_AGENT_STYLE:-}
       DFAE_STEP_AGENT_TURNS: ${DFAE_STEP_AGENT_TURNS:-}
       DFAE_EXPOSED_CHANGES: ${DFAE_EXPOSED_CHANGES:-}
+      DFAE_ROUTINES: ${DFAE_ROUTINES:-}
+      DFAE_TIMEZONE: ${DFAE_TIMEZONE:-}
+      DFAE_ROUTINE_CONCURRENCY: ${DFAE_ROUTINE_CONCURRENCY:-}
+      DFAE_ROUTINE_MAX_RUNS_PER_DAY: ${DFAE_ROUTINE_MAX_RUNS_PER_DAY:-}
       # decision model: an open-weight model in the ollama service, answering typed questions through
       # token log-probabilities. DECISION_PROVIDER=local => built-in decision rules only.
       DECISION_BASE_URL: ${DECISION_BASE_URL:-}

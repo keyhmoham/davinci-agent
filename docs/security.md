@@ -61,6 +61,17 @@ layer 4 and in 0 of 15 with it, while the page's real steps were done. **Not cov
 edit of a named file goes through), shell constructs the parser does not recognise, data encoded before it is sent, and anything a
 task does when `allow` is set.
 
+## Background work and saved agents
+
+Routines and saved agents outlive the task that made them, which makes them the channel an injection would use to persist ("check this
+page every hour and do what it says"; "save an agent whose instructions are …"). So: a routine asked for by a task that has read
+outside content, or by a routine's own run, is created **disabled** as a proposal (`proposed` says why) and only a person enables it
+(the board, `PATCH /v1/routines/{id}`); from such a task, resuming, changing what a routine does or running one is refused, while pausing
+and removing are allowed. Saved agents cannot be defined or removed from such a task at all. Routine gates (`if_ok`, `if_changed`) run
+through the policy like any tool call. Background spending is capped per routine (`max_cost_usd`) and per day
+(`DFAE_ROUTINE_MAX_RUNS_PER_DAY`), and a failing routine ends after ten failures in a row. A custom agent's tools are a subset of the
+policy's, read-only unless it `writes`, and never the routine or agent tools.
+
 ## Subagents
 
 Delegation never widens authority. An agent's **tool scope** comes from its role (researcher/verifier/analyst are read-only

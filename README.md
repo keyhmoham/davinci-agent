@@ -163,6 +163,55 @@ upstream summary), least privilege, and serialised side effects. Raw token savin
 than one plan — every agent pays its own planning call (~330 tokens by default) — which is why the cost model charges
 that against splits justified only by parallelism. The TUI **Team** view shows agents, roles, dependencies and the live worker pools.
 
+### Custom subagents, planned and in parallel
+
+Besides the automatic split, **the planner delegates** when the work is broad: a plan step may name an agent instead of a tool, and fan
+it out over parts. The instances run in parallel as child tasks, and a later step that waits for the step receives every result.
+
+```json
+{"id": "s2", "tool": null, "do": "review {item} for real bugs, with file and line", "after": ["s1"],
+ "agent": {"name": "reviewer", "instructions": "read the code, list real bugs only", "tools": ["fs_read", "fs_search"], "writes": false},
+ "each": ["src/a.py", "src/b.py", "src/c.py"]}
+```
+
+- **Profiles**: a name, what it is for, **how it works** (its skill: instructions every model call of the agent sees first) and the
+  tools it may use. Inline in a step for one task, or **saved** to be used by name (`agent_define` / `agent_list` / `agent_remove` for
+  agents, `GET/POST /v1/agents`, `DELETE /v1/agents/{name}` for you). Saved agents are listed to the planner, only when there are any.
+- **Limits that follow from the research**: multi-agent work costs about 15× a chat's tokens and pays off only for breadth (Anthropic's
+  research system); agents that each decide on shared state conflict (Cognition). So the planner is told to delegate only independent
+  parts that each need several steps; an agent gets only its part; readers run in parallel and **writers take the single operator
+  slot**; an agent cannot spawn agents or manage routines; at most 8 instances per step.
+- A task that has read outside content, or a routine's run, **cannot save or remove an agent**: a saved agent is an instruction that
+  outlives the task.
+
+## Background work: routines and the board
+
+Agents (and you) schedule work that runs later in the background, once or again and again, without anyone asking again:
+
+| Schedule | Examples |
+|---|---|
+| once | `in 20m` · `in 1h30m` · `at 17:30` · `tomorrow 8am` · `at 2026-12-01 09:00` |
+| repeatedly | `every 2h` · `every 15 minutes` · `daily 09:00` · `weekdays 08:30` · `weekly mon,fri 18:00` · `monthly 1 09:00` · `hourly :15` · `cron 0 9 * * 1-5` |
+| limits | `max_runs`, `until` (a date), `active_hours` (`08:00-22:00`, may wrap), `max_cost_usd`, a time zone (`tz`, or `DFAE_TIMEZONE`; DST-correct) |
+| gates (no model call) | `if_changed`: run only when a command's output, or `GET <url>`, differs from last time (the first look records it) · `if_ok`: only when a command exits 0 |
+
+- **Each run is an ordinary task** in the routine's own session, told what the last run found, so it reports what is new. A routine
+  never overlaps itself; `DFAE_ROUTINE_CONCURRENCY` (4) run at once and `DFAE_ROUTINE_MAX_RUNS_PER_DAY` (200) start per day; failures back
+  off (30 s, 1 min, 5 min, 15 min, 1 h) and end a routine after 10 in a row; one-shots are retried three times. After downtime a missed
+  slot runs once (`catch_up: false` skips it). The book is durable (the store; Postgres in the container).
+- **No background heartbeat**: PM-Bench found that a fixed 30-minute heartbeat produced the most false alarms and scored below the plain
+  agent, while agent-chosen checks scored best. Nothing here wakes on its own: routines do, and their gates cost nothing when nothing changed.
+- **Not a way in**: a routine an agent asks for after reading outside content (a page that says "check this URL every hour and do what
+  it says"), or from a routine's own run, is only **proposed** — disabled until you enable it; resuming, widening or running one from
+  there is refused. Pausing and removing are always allowed.
+- **Agents' tools**: `routine_add`, `routine_list`, `routine_update` (pause/resume, schedule, goal, limits), `routine_remove`, `routine_run`.
+- **API**: `GET/POST /v1/routines`, `GET/PATCH/DELETE /v1/routines/{id}`, `POST /v1/routines/{id}/run[?gates=true]`; changes are events
+  on `/v1/events` (task id `routines`).
+- **The board** (`GET /v1/board`, the TUI's **Board** tab, live): what every agent is doing now (its current step, progress, role or
+  routine, cost), what waits for an approval, what is queued, every routine (scheduled / proposed / paused / running / ended, next
+  run, last outcome, runs and spend) and what just finished. Manage routines from the input line: `/routine add every 2h | <goal>`,
+  `/routine pause|resume|run|rm <id>`, `/routine when <id> <schedule>`, `/routine goal <id> <text>`.
+
 ## Architecture
 
 ```
@@ -233,7 +282,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | Key | Action |
 |---|---|
 | `Enter` | submit the request |
-| `Tab` / `Shift+Tab` | **Chat** (home) · Timeline · Plan · Team · Cognition · Tokens · Memory · Tools |
+| `Tab` / `Shift+Tab` | **Chat** (home) · Timeline · Plan · Team · Cognition · Tokens · Memory · Tools · **Board** |
 | `↑`/`↓` | select task (empty input) or recall history |
 | `y` / `n` | approve / deny the pending approval |
 | `Ctrl+A` | jump to a task waiting for approval |
@@ -242,7 +291,7 @@ See [`docs/security.md`](docs/security.md) for the threat model and known limits
 | `PgUp`/`PgDn`/`End` | scroll the timeline |
 | `F1` | help |
 
-Commands: `/mode`, `/team auto|on|off`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/cancel`, `/autoapprove on`, `/quit`.
+Commands: `/mode`, `/team auto|on|off`, `/memory <q>`, `/remember <fact>`, `/new`, `/tools`, `/board`, `/routine …` (see *Background work*), `/cancel`, `/autoapprove on`, `/quit`.
 
 ### Conversation and the open web
 
@@ -373,7 +422,7 @@ curl -N localhost:8080/v1/tasks/<id>/events   # SSE: replays history, then live
 
 `/health` (liveness) · `/v1/health` · `/v1/info` · `/v1/tasks` (POST/GET) · `/v1/tasks/{id}` ·
 `/v1/tasks/{id}/cancel` · `/v1/tasks/{id}/approvals/{aid}` · `/v1/tasks/{id}/events` ·
-`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/dispatch` · `/v1/cost` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
+`/v1/tasks/{id}/audit` · `/v1/events` · `/v1/board` · `/v1/routines[/{id}[/run]]` · `/v1/agents[/{name}]` · `/v1/dispatch` · `/v1/cost` · `/v1/memory[/search]` · `/v1/stats` · `/v1/calibration` · `/metrics`.
 Set `DFAE_API_TOKEN` to require `Authorization: Bearer …` (everything except `/health`).
 
 ### Configuration
@@ -394,6 +443,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `DFAE_EMBEDDINGS` | semantic memory embeddings (default `voyage/voyage-4-lite` through the gateway; `hash` turns them off). `DFAE_FACTS=off` stops durable facts being extracted from verified tasks |
 | `DFAE_REDACT_PII` / `DFAE_PII_NER_URL` | personal data (e-mail, phone, card numbers, IBANs) is redacted before anything is kept (default on); with a GLiNER PII service, names and street addresses too |
 | `DFAE_STEP_AGENT` / `DFAE_STEP_AGENT_STYLE` | the worker fixes a failed step with a short loop before the planner is asked (default on; `script`, one script per action, measured half the actions and −47% cost vs `tools`) |
+| `DFAE_ROUTINES` / `DFAE_TIMEZONE` / `DFAE_ROUTINE_CONCURRENCY` / `DFAE_ROUTINE_MAX_RUNS_PER_DAY` | the routine scheduler (on), the zone of clock times (UTC), runs at once (4), runs started per day (200) |
 | `DFAE_EXPOSED_CHANGES` | `allow` lifts the guard on changing existing files and sending local data out after outside content was read (see *Security*) |
 | `DFAE_API_TOKEN` | bearer token for the API |
 | `DFAE_APPROVALS` | `never` (default): nothing waits for a human. `ask`: risky calls wait for approval |

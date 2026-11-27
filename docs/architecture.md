@@ -270,6 +270,20 @@ decision: `(raw·6 + successes) / (6 + n)`. The counters persist in the store (`
   (completed steps and outputs are kept, ids are prefixed `rN_`, the merged plan is re-validated). The tool
   set may widen to siblings of the same category, never to unrelated tools.
 
+## Routines and custom agents (`routines.rs`, `profiles.rs`, `dfae_core::routine`)
+
+* **Schedules** are parsed by code from what an agent or a person writes (`parse_when`: relative, absolute, clock, readable recurring,
+  cron through croner with IANA zones) into `At | Every{anchor} | Cron`; `compute_next` applies max runs, until and active hours. All
+  of it is pure (the clock is passed in) and tested across DST.
+* **The scheduler** sleeps until the earliest due routine (at most a minute; woken when the book changes), starts what is due within
+  the concurrency and the daily cap, runs the gates first (no task, no model when they say no), submits the run as a task in session
+  `routine-<id>` with the last run's finding appended, and a watcher records the outcome, cost and summary, backs off failures and
+  ends routines whose limits are reached. The book is one key/value document, written on every change and reloaded at start.
+* **Custom agents**: a plan step's `agent` (a saved name, an inline profile, or both: the inline fields override) and `each`
+  (parallel instances, ids `sN_1…`, dependencies rewritten so a join waits for all). The child's `TeamLink.profile` sets its scope
+  (`profile_scope`), its pool (writer → operator, reader → researcher) and the first line of every prompt it builds.
+* **The board** (`Engine::board`): live tasks from the engine, recent ones from the store, the routine book, the queue length.
+
 ## Memory
 
 | Layer | Content | Where |
