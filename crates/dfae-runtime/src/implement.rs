@@ -776,6 +776,19 @@ impl Inner {
         };
         // A file's content is written as plain text by a model, not squeezed into a JSON string (see `CONTENT_SYSTEM`); the
         // rules have already found the path.
+        // A page or document a planner's step describes ("a contact page for Petal Lane with a title, the address \"12 Market Street\" and
+        // opening hours") is not the one quoted fragment in that sentence: the rules bound the quote as the whole file (seen: a 28-byte
+        // contact page). The content writer writes it. (A request that gives the content itself — `create notes.txt with "hello"` —
+        // says little besides the quote, and keeps it.)
+        if meta.name == "fs_write"
+            && step.brief
+            && let (Some(path), Some(content)) = (args.get("path").and_then(|p| p.as_str()), args.get("content").and_then(|c| c.as_str()))
+            && matches!(path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref(), Some("html" | "htm" | "md" | "markdown"))
+            && step.description.split_whitespace().count() > content.split_whitespace().count() + 12
+            && content.len() < 400
+        {
+            args.remove("content");
+        }
         if meta.name == "fs_write"
             && args.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty() && !p.contains("{{"))
             && args.get("content").and_then(|c| c.as_str()).is_none_or(|c| c.trim().is_empty())

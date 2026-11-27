@@ -1062,3 +1062,19 @@ async fn what_is_kept_for_later_is_kept_without_personal_data() {
         assert!(m.item.text.contains("[EMAIL]") && m.item.text.contains("[PHONE]"), "{}", m.item.text);
     }
 }
+
+#[tokio::test]
+async fn a_page_the_planner_describes_is_written_whole_not_reduced_to_the_fragment_it_quotes() {
+    let r = rig(false, |_| {});
+    std::fs::create_dir_all(r.ws.path().join("shop")).unwrap();
+    r.planner.push(
+        &json!({"steps": [{"id": "s1", "tool": "fs_write", "do": "create shop/contact.html as a Petal Lane contact page with a clear page title, the shop address \"12 Market Street, London, UK\", opening hours from 9 to 5 and a link back to the home page", "after": [], "expect": null, "planner": false}]})
+            .to_string(),
+    );
+    let page = "<!DOCTYPE html><html><head><title>Contact — Petal Lane</title></head><body><h1>Contact Petal Lane</h1><p>12 Market Street, London, UK</p><p>Opening hours: 9 to 5</p><a href=\"index.html\">Home</a></body></html>";
+    r.worker.push(page);
+    let t = run_as(&r, ModeRequest::Escalated, "Add a contact page to the shop site").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let written = std::fs::read_to_string(r.ws.path().join("shop/contact.html")).unwrap();
+    assert_eq!(written, page, "the content writer wrote the page");
+}
