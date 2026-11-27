@@ -153,3 +153,25 @@ task that failed counts `harmful`; a lesson whose harmful count reaches its help
 cannot replay, but the planner sees its plan as a worked example (`A PLAN THAT WORKED FOR A SIMILAR REQUEST …`, slots shown as `<name>`).
 Checked with real embeddings (`tests/memory_live.rs`): a paraphrase of a verified request gets the template, an unrelated request does not.
 Whether templates lower re-plans on real traffic is not measured yet (it needs a long-lived skill store).
+
+## Round 5: the step agent (A1), A/B
+
+**First A/B (invalid).** 18 tasks per arm: the "on" arm looked far better (re-plans 9 → 1, cost −38%, 15/18 → 16/18), but the step
+agent **never fired** (no `_fix` step in any run): the difference was noise. Two near-identical arms differed 9 to 1 in re-plans over
+18 tasks — samples this size cannot show modest effects. Cause of not firing: re-plans in this suite come mostly from **expectation
+misses** (a step runs, its `expect` is not met → checkpoint), not from hard step failures; the step agent was hooked only to the latter.
+Fixed: an expectation miss of a tool step also gets the worker's fix loop, then the step runs again and is judged again.
+
+**Second A/B (valid).** The four cases that re-plan (bug fix, CLI with tests, rename, served site), 5 runs each per arm, arms interleaved
+run by run (drift in the providers hits both), one frozen build:
+
+| Arm | Passed | Re-plans | Planner calls | Fix actions | Cost | Time |
+|---|---:|---:|---:|---:|---:|---:|
+| step agent off | 19/20 | 9 | 31 | 0 | $0.0282 | 377 s |
+| **step agent on** | 19/20 | **3** | **26** | 12 | $0.0302 | 383 s |
+
+* Re-plans −67%, planner calls −16%, total cost +7% (the worker does the fixing), success and time unchanged. CLI with tests: re-plans
+  5 → 0, planner calls 11 → 5.
+* The one failure of the "on" arm was **not** the step agent: the one-file split (round 3) had split an `fs_edit` step that named a test
+  file as a *reference* ("fix stats.py to meet test_stats.py") and the worker edited the test file. The split now applies to `fs_read`
+  only (renames across files are one `fs_edit` on the directory).

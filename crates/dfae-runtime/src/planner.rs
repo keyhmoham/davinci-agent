@@ -505,7 +505,7 @@ pub fn infer_dependencies(steps: &mut [Step], registry: &ToolRegistry) -> Vec<St
     notes
 }
 
-/// A step that reads or edits files with a one-file tool (`fs_read`, `fs_edit`) but names several files that exist ("read stats.py and
+/// A step that reads files with a one-file tool (`fs_read`) but names several files that exist ("read stats.py and
 /// test_stats.py", "rename calcTotal in src/cart.js and src/checkout.js") would be bound to one of them, and the planner would have to
 /// re-plan for the rest. Code splits it into one step per file, each told which file it is about, and whatever waited for the step
 /// waits for all of them. Returns what was split, for the log.
@@ -514,7 +514,9 @@ pub fn split_multi_file_steps(steps: &mut Vec<Step>, workspace: &std::path::Path
     let mut i = 0;
     while i < steps.len() {
         let s = &steps[i];
-        let one_file_tool = matches!(s.tool.as_deref(), Some("fs_read" | "fs_edit"));
+        // only reads: a step that edits one file names others as references ("fix stats.py to meet test_stats.py"), and splitting
+        // it edits the reference (measured: a test file was changed). A rename across files is one fs_edit on the directory.
+        let one_file_tool = s.tool.as_deref() == Some("fs_read");
         let prebound = s.args.get("path").is_some_and(|p| p.as_str().is_some_and(|p| !p.is_empty()));
         // an output another step quotes by id cannot be split without changing what that step receives
         let quoted = steps.iter().any(|o| o.description.contains(&format!("{{{{{}}}}}", s.id)) || o.args.to_string().contains(&format!("{{{{{}}}}}", s.id)));
@@ -726,15 +728,14 @@ mod tests {
         ]});
         let mut steps = parse_brief_plan(&v, "g", PlanSource::Planner, "", &r).unwrap();
         let notes = split_multi_file_steps(&mut steps, ws.path());
-        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert_eq!(notes.len(), 1, "{notes:?}");
         let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["s1_1", "s1_2", "s2_1", "s2_2", "s3", "s4"]);
+        assert_eq!(ids, ["s1_1", "s1_2", "s2", "s3", "s4"]);
         assert_eq!(steps[0].args["path"], "stats.py");
-        assert_eq!(steps[3].args["path"], "src/checkout.js");
-        assert_eq!(steps[2].depends_on, vec!["s1_1", "s1_2"], "each part waits for what the step waited for");
-        assert_eq!(steps[4].depends_on, vec!["s2_1", "s2_2"], "what waited for the step waits for every part");
-        assert!(steps[2].expect.is_none() && steps[3].expect.is_some(), "the expectation is checked after the last part");
-        assert_eq!(steps[5].id, "s4", "a write names a file it reads, not two files to write: never split");
+        assert_eq!(steps[1].args["path"], "test_stats.py");
+        assert_eq!(steps[2].depends_on, vec!["s1_1", "s1_2"], "what waited for the step waits for every part");
+        assert_eq!(steps[2].id, "s2", "an edit names files it only refers to: never split (it would edit the reference)");
+        assert_eq!(steps[4].id, "s4", "a write names a file it reads, not two files to write: never split");
     }
 
     #[test]
