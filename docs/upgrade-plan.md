@@ -604,3 +604,30 @@ work. **What that test could not see:** every other consumer of entities. Traced
 Sources: [Mem0](https://arxiv.org/abs/2504.19413), [Zep](https://arxiv.org/abs/2501.13956),
 [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837), [CaMeL](https://arxiv.org/abs/2503.18813),
 [GLiNER Guard / PII-Bench](https://arxiv.org/abs/2605.05277), [Just Pass Twice](https://arxiv.org/pdf/2604.05158).
+
+---
+
+## 16. Status (2026-11-27): what was done, measured, refuted
+
+Evidence for every line is in `docs/eval/validation-2026-11-27.md`.
+
+| Item | Status | Measured result |
+|---|---|---|
+| E0 real-model evaluation | **done** | `live_worker` (5 cases), `live_e2e` (10 harder cases through the real bootstrap, oracle-checked), `routing_eval`, `embed_eval`, `memory_live`, `semantic_store` |
+| E0.2 / F3 / F6 cost in dollars, reasoning, cache writes | **done** | the gateway reports `usage.cost`; the ledger and the live tests show $ per model |
+| F1 worker reasoning | **done, small** | GLM spent 0–85 reasoning tokens with the repo's prompts; `effort:low` → 0; not the big saving predicted |
+| F2 output limits | **refuted** | no `length` finishes in any run |
+| F4 missing `cached_tokens` | **refuted today** | the gateway reports it on every call |
+| F5 sampling | not done | low priority after F1's result |
+| C1 stable planner prefix | **done** | +1 tool in the schema = full cache miss, 4.7× the call (measured); now one prefix for every task |
+| C2 one effort for plan and patch | **declined** | a re-plan thinks harder on purpose; its own cache line costs ≈ $0.0003 |
+| C3 cache lifetime per model | **done** | 25 min for OpenAI planners |
+| C4 worker provider pinning | **done** | baseten, nebius, fireworks: unquantised, zero data retention |
+| D1 hosted Decisions API | **done, default** | routing on held-out requests: 98.0% vs 91.3% (rules); ≈ $0.0003/task |
+| E1 extraction | **redesigned** | GLiNER on the hot path: no measurable benefit (29/30 vs 28/30) → opt-in; facts extracted after verified tasks instead (E1b, done) |
+| M1 semantic embeddings | **done** | paraphrase recall@1 0.65 → 1.00 (voyage-4-lite); ranking only, the skill gate stays on shape |
+| M3 lessons with outcome counts | **done** | retire a lesson that hurts more than it helps |
+| M4 plan templates | **done** | a paraphrase gets the verified plan as a worked example (checked with real embeddings); effect on re-plans not yet measured |
+| A1 step agent | **done, behind a flag** | A/B on the harder suite pending at the time of writing |
+| Quality fixes found by the suite | **done** | answers to questions, markdown fences, typed computed data, one-file steps naming several files, fs_edit on a directory, patch cycles, served addresses, the cwd of "the X directory", own-server checks |
+| W1 native function calling, W3 deterministic condensation, X1 masking for re-plans, P1 adaptive effort, E1c/E1d | not done | next candidates; each needs its own measurement |
