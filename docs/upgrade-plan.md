@@ -639,6 +639,9 @@ Evidence for every line is in `docs/eval/validation-2026-11-27.md`.
 | GLiNER-PII for names and addresses | **done, optional** (`DFAE_PII_NER_URL`) | held-out: 14/14 found, 0/12 lookalikes touched |
 | CodeAct step agent | **done, default** | 12/12 both arms; fix actions −50%, re-plans 8→2, cost −47% |
 | Memory with 200 distractors (e2e) | **done** | found that simple requests saw no memories at all (fixed); hash embedder misses the answer, semantic finds it |
+| R1 routines (background work on a schedule) | **done** | live 3/3 one-shot runs in the background, 3/3 watches gated; proposals for routines asked for after outside content |
+| R2 live task board | **done** | `/v1/board`, TUI Board tab, `/routine …` commands |
+| A2 custom subagents, planned and fanned out | **done** | live 3/3: three parallel reviewers, every bug found; ≈ $0.003 per review |
 | X1 masking for re-plans | not done | next candidate |
 
 ---
@@ -734,3 +737,28 @@ Sources: [Danger of Overthinking](https://arxiv.org/abs/2502.08235), [Don't Over
 [RECOMP](https://arxiv.org/abs/2310.04408), [Defense via Tool Result Parsing](https://arxiv.org/abs/2601.04795),
 [AgentDyn](https://arxiv.org/pdf/2602.03117), [GLiNER-PII](https://huggingface.co/knowledgator/gliner-pii-base-v1.0),
 [GLiNER2-PII](https://arxiv.org/pdf/2605.09973), [PIIBench](https://arxiv.org/pdf/2604.15776), [OpenAI Privacy Filter eval](https://arxiv.org/pdf/2608.02616).
+
+---
+
+## 18. Autonomy: what long-running agents do, what DFAE now does, what is next (2026-11-27)
+
+Products checked: OpenClaw's scheduler ("Automations"), Grok's Tasks/Automations, OpenAI's Dots, Anthropic's Claude Duet; papers:
+PM-Bench (prospective memory, COLM 2026), Pro-Memory (2026), Magentic-One (Microsoft, 2024), Anthropic's multi-agent research system
+(2025), Cognition's *Don't Build Multi-Agents* (2025).
+
+| Idea (source) | In DFAE | Why / how |
+|---|---|---|
+| Exact-time jobs: one-shot, interval, cron with zones; run history; backoff; catch-up after downtime (OpenClaw) | **built** (R1) | `routine.rs` / `routines.rs`; backoff 30 s → 1 h, ended after 10 failures, one-shot retried 3× |
+| Condition triggers that skip the model when nothing changed (OpenClaw trigger scripts, `skipIfScratchEmpty`) | **built** | `if_changed` / `if_ok`; inferred from a goal about a change |
+| No fixed heartbeat; agent-chosen checks (PM-Bench: a 30-min auto-heartbeat had the most false alarms and scored below baseline; agent-set checks scored best) | **built by omission** | nothing wakes on its own; routines do |
+| Self-scoped management by the agent; a scheduled run may not widen its own powers (OpenClaw grants) | **built** | routine tools; proposals for exposed tasks and routine runs; pausing always allowed |
+| Activity view of what agents do (Dots) | **built** (R2) | `/v1/board`, Board tab |
+| Parallel subagents for breadth, a lead that joins (Anthropic: +90% on breadth research at ~15× tokens) | **built** (A2) | planned `agent` + `each`; readers parallel, writers serialised (Cognition) |
+| Run-to-run continuity: a scratch/summary carried between runs (OpenClaw scratch, Pro-Memory evidence links) | **built (minimal)** | the last run's finding is in the next run's request; the run's session keeps its last turn |
+| **Event triggers** besides time: an inbound webhook, a file change, a task finishing (OpenClaw `on-exit` / `stream`; Grok email triggers) | next | a `POST /v1/routines/{id}/fire` with a token is the small first step; file watches need `notify` |
+| **Delivery of results**: announce to a channel or webhook, only when something changed (OpenClaw announce/webhook, failure alerts with cooldown) | next | today results are on the board and the event stream only |
+| **Autonomy levels**: notify first / act with undo / fully autonomous (Dots) | next | DFAE has `ask` / `never`; "act with undo" needs a workspace checkpoint before changes (git stash / overlay) |
+| **Progress ledger and stall detection** (Magentic-One: re-plan when no progress for N steps) | partly | recovery and re-plans exist; an explicit "no progress in N rounds" stop is not |
+| **Event-based intentions** (Pro-Memory: an intention that waits for a cue in arriving observations, not a time) | next | a routine with an `if_ok` gate approximates it; a cue match on incoming events would be the real form |
+
+The ones marked *next* are the candidates; each should be measured the same way (a live case with an oracle, A/B where it claims a gain).

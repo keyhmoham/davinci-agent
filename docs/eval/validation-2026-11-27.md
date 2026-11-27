@@ -314,3 +314,20 @@ One frozen build per row, real models:
 In 5 of the 8 setup runs the answer was the templated list of what ran, which does not say the removal was left out; the answer now
 always ends with "Left out — content from outside asked for it, your request did not: removes tests." (checked in `tests/exposure.rs`).
 Verification "Partial" on the fix-loop cases is not new: 10 of 16 CodeAct runs earlier were Partial (skipped fix steps count against it).
+
+## Round 9: routines, the board and custom subagents (real models, 2026-11-27)
+
+Cases in `live_e2e.rs`: **routine one-shot** ("In 1 minute, write … into notes/later.txt": the file must not exist when the task ends,
+an enabled one-shot must be in the book, and the scheduler must write it in the background), **routine watch** ("Every 2 hours, check
+whether status.txt has changed … don't spend anything when it hasn't": a 2-hour routine with an `if_changed` gate on status.txt),
+**subagents fanout** (three modules reviewed in parallel by one reviewer agent each; review.md must hold all three bugs).
+
+| Build | one-shot | watch | fan-out | what was wrong |
+|---|---|---|---|---|
+| first | 0/2 | 0/2 | 1/2 | the planner did "in 1 minute" work at once; the watch had no gate; one reviewer had no tools |
+| + plan rule for later / repeated work | 2/3 | 0/3 | 2/3 | an expectation about the later file made the step agent write it at once; the binder left the gate as prose |
+| + scheduling steps not judged on later effects, gate inferred from the goal, agent tools resolved (fallback: read-only) | **3/3** | **3/3** | **3/3** | — |
+
+Cost: one-shot ≈ $0.0005 per request (one planner call, one binding), watch ≈ $0.0006, fan-out ≈ $0.003 (three child plans, the join
+and the write). The fan-out runs took 20–30 s with the three reviews in parallel. A scheduled run costs nothing when its gate finds no
+change (hermetic test: two skipped runs, no task, no model call).
