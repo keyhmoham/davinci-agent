@@ -39,6 +39,8 @@ pub(crate) struct ChildSpec {
     pub entities: Vec<Entity>,
     pub mode: ModeRequest,
     pub budget: Budget,
+    /// A custom agent (from the plan step's `agent`).
+    pub profile: Option<AgentProfile>,
 }
 
 fn status_word(s: VerificationStatus) -> &'static str {
@@ -144,8 +146,15 @@ impl Inner {
     pub(crate) async fn stage_assign_role(self: &Arc<Self>, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity], routing: &Routing) -> Result<(), String> {
         let metas = self.tools.metas();
         let bound: Option<Vec<ToolMetadata>> = bind_direct(&metas, goal, entities).map(|calls| calls.iter().filter_map(|c| self.tools.meta(&c.tool)).collect());
-        let role = team::pick_role(goal, routing, bound.as_deref());
-        let scope = team::role_scope(role, &metas);
+        let profile = ctx.rec.lock().await.team.as_ref().and_then(|t| t.link.as_ref()).and_then(|l| l.profile.clone());
+        let (role, scope) = match &profile {
+            // a custom agent: its own tools; a writer takes the operator slot, a reader a researcher's
+            Some(p) => (if p.writes { AgentRole::Operator } else { AgentRole::Researcher }, Some(self.profile_scope(p))),
+            None => {
+                let role = team::pick_role(goal, routing, bound.as_deref());
+                (role, team::role_scope(role, &metas))
+            }
+        };
         let n_tools = scope.as_ref().map(|s| s.len()).unwrap_or(metas.len());
         *ctx.scope.lock() = scope.map(|v| v.into_iter().collect::<HashSet<_>>());
         let permit = tokio::select! {
@@ -201,9 +210,10 @@ impl Inner {
                 upstream: spec.upstream,
                 entities: spec.entities,
                 inherited_taint: tainted,
+                profile: spec.profile.clone(),
             }),
             children: vec![],
-            reason: None,
+            reason: spec.profile.as_ref().map(|p| format!("agent:{}", p.name)),
             cache_hits: 0,
         });
         let id = rec.task_id.clone();
@@ -237,6 +247,13 @@ impl Inner {
         if ctx.depth > 0 {
             return Err(fail(ErrorKind::Policy, "agents cannot spawn agents".into()));
         }
+        // ---- which agent (before anything is counted: a step naming an agent that does not exist costs nothing) -------
+        let agent_spec = step.args.get("agent").cloned();
+        let profile = match &agent_spec {
+            // a name that resolves to nothing is the same on every retry: it ends the step with the reason
+            Some(v) => Some(self.resolve_profile(v).await.map_err(|e| fail(ErrorKind::Policy, e))?),
+            None => None,
+        };
         // ---- slice the budget -------------------------------------------------
         let (budget, upstream, entities, attempt) = {
             let mut r = ctx.rec.lock().await;
@@ -280,14 +297,27 @@ impl Inner {
             Some("escalated") => ModeRequest::Escalated,
             _ => ModeRequest::Auto,
         };
+        // a plan the planner wrote with agents in it makes this task their coordinator
+        {
+            let mut r = ctx.rec.lock().await;
+            if r.team.is_none() {
+                r.team = Some(TeamInfo::coordinator("the plan delegates to agents"));
+            }
+        }
+        if ctx.shared.get().is_none() {
+            let _ = ctx.shared.set(Arc::new(TeamShared::default()));
+        }
 
         // ---- dispatch ------------------------------------------------------------
         let (child_id, rx) =
-            self.spawn_child(ctx, ChildSpec { step_id: step.id.clone(), goal: step.description.clone(), upstream, entities, mode, budget }).await;
+            self.spawn_child(ctx, ChildSpec { step_id: step.id.clone(), goal: step.description.clone(), upstream, entities, mode, budget, profile }).await;
         {
             let mut r = ctx.rec.lock().await;
             if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(&step.id)) {
                 s.args = json!({"child": child_id, "mode": if mode == ModeRequest::Escalated { "escalated" } else { "auto" }});
+                if let Some(a) = agent_spec {
+                    s.args["agent"] = a; // a retry runs the same agent
+                }
             }
             if let Some(t) = r.team.as_mut() {
                 t.children.push(ChildRef {

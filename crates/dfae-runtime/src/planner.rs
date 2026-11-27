@@ -144,15 +144,22 @@ pub fn parse_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str, regis
         let desc = s.get("do").or_else(|| s.get("description")).or_else(|| s.get("action")).and_then(|d| d.as_str()).unwrap_or("").to_string();
         let args = s.get("args").cloned().unwrap_or_else(|| json!({}));
         let args = if args.is_null() { json!({}) } else { args };
-        let mut step = match tool {
-            Some(t) => {
+        let agent = s.get("agent").filter(|a| !a.is_null()).cloned();
+        let mut step = match (tool, agent) {
+            (_, Some(a)) => {
+                let mut st = Step::reasoning(&id, if desc.is_empty() { "do the delegated part" } else { &desc });
+                st.kind = StepKind::Agent;
+                st.args = json!({"agent": a});
+                st
+            }
+            (Some(t), None) => {
                 let mut st = Step::tool(&id, t, if desc.is_empty() { t } else { &desc }, args);
                 if let Some(m) = registry.meta(t) {
                     st.approval_required = m.requires_approval;
                 }
                 st
             }
-            None => Step::reasoning(&id, if desc.is_empty() { "reason about the inputs" } else { &desc }),
+            (None, None) => Step::reasoning(&id, if desc.is_empty() { "reason about the inputs" } else { &desc }),
         };
         let mut deps: Vec<String> = s
             .get("after")
@@ -191,7 +198,8 @@ pub fn parse_brief_plan(v: &Value, goal: &str, source: PlanSource, prefix: &str,
     let mut steps = parse_plan(v, goal, source, prefix, registry)?;
     let arr = v.get("steps").and_then(|s| s.as_array()).ok_or("missing 'steps' array")?;
     for (s, raw) in steps.iter_mut().zip(arr) {
-        s.brief = true;
+        // an agent step is the agent's to plan: never bound to a tool here
+        s.brief = s.kind != StepKind::Agent;
         s.expect = raw.get("expect").or_else(|| raw.get("success")).and_then(|e| e.as_str()).map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
         s.planner = raw.get("planner").and_then(|b| b.as_bool()).unwrap_or(false);
     }
@@ -240,14 +248,20 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
             issues.push(format!("{} is finished: add a new step instead of editing it", e.id));
             continue;
         }
-        let mut ns = match &e.tool {
-            Some(t) => Step::tool(&e.id, t, &e.intent, json!({})),
-            None => Step::reasoning(&e.id, &e.intent),
+        let mut ns = match (&e.tool, &e.agent) {
+            (_, Some(a)) => {
+                let mut st = Step::reasoning(&e.id, &e.intent);
+                st.kind = StepKind::Agent;
+                st.args = json!({"agent": a});
+                st
+            }
+            (Some(t), None) => Step::tool(&e.id, t, &e.intent, json!({})),
+            (None, None) => Step::reasoning(&e.id, &e.intent),
         };
         if let Some(m) = e.tool.as_deref().and_then(|t| registry.meta(t)) {
             ns.approval_required = m.requires_approval;
         }
-        ns.brief = true;
+        ns.brief = ns.kind != StepKind::Agent;
         ns.expect = e.expect.clone();
         ns.planner = e.planner;
         ns.depends_on = e.after.iter().map(fix_dep).filter(|d| *d != e.id).collect();
@@ -772,6 +786,7 @@ mod tests {
             after: vec!["s1".into()],
             expect: None,
             planner: false,
+            agent: None,
             args: None,
         };
         let adds = PatchDoc { edit: vec![], add: vec![replacement.clone()], drop: vec![] };
@@ -800,6 +815,7 @@ mod tests {
             after: vec!["s3".into()],
             expect: None,
             planner: false,
+            agent: None,
             args: None,
         };
         let tests = StepDoc {
@@ -809,6 +825,7 @@ mod tests {
             after: vec!["x".into()],
             expect: None,
             planner: false,
+            agent: None,
             args: None,
         };
         let patch = PatchDoc { edit: vec![tests], add: vec![fix], drop: vec!["s1".into()] };
@@ -833,8 +850,16 @@ mod tests {
         steps[0].status = StepStatus::Succeeded;
         steps[1].status = StepStatus::Failed;
         steps[2].status = StepStatus::Cancelled;
-        let read =
-            StepDoc { id: "x".into(), tool: Some("fs_read".into()), intent: "read the file".into(), after: vec![], expect: None, planner: false, args: None };
+        let read = StepDoc {
+            id: "x".into(),
+            tool: Some("fs_read".into()),
+            intent: "read the file".into(),
+            after: vec![],
+            expect: None,
+            planner: false,
+            agent: None,
+            args: None,
+        };
         // the planner adds a read, forgets the failed build, and drops the server step
         let patch = PatchDoc { edit: vec![], add: vec![read], drop: vec!["s3".into()] };
         let issues = apply_patch(&steps, &patch, "r1_", &r).unwrap_err();
@@ -862,10 +887,19 @@ mod tests {
             after: vec!["x".into()],
             expect: None,
             planner: false,
+            agent: None,
             args: None,
         };
-        let fix =
-            StepDoc { id: "x".into(), tool: Some("fs_mkdir".into()), intent: "fix".into(), after: vec!["s1".into()], expect: None, planner: false, args: None };
+        let fix = StepDoc {
+            id: "x".into(),
+            tool: Some("fs_mkdir".into()),
+            intent: "fix".into(),
+            after: vec!["s1".into()],
+            expect: None,
+            planner: false,
+            agent: None,
+            args: None,
+        };
         let merged = apply_patch(&steps, &PatchDoc { edit: vec![edit], add: vec![fix], drop: vec![] }, "r1_", &r).unwrap();
         let ids: Vec<&str> = merged.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["s1", "s2", "s3", "r1_1"], "the serving step is still there, waiting for the build");

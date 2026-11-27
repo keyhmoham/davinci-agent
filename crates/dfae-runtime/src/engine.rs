@@ -144,6 +144,7 @@ pub(crate) struct Inner {
     /// The versions of the runtimes the shell has (`node v26…, python 3.13…`), asked once.
     pub runtimes: tokio::sync::OnceCell<String>,
     pub routines: crate::routines::RoutineBook,
+    pub profiles: crate::profiles::ProfileBook,
 }
 
 /// The agent engine. Cheap to clone.
@@ -214,9 +215,11 @@ impl Engine {
                 pii_ner: std::sync::OnceLock::new(),
                 runtimes: tokio::sync::OnceCell::new(),
                 routines: Default::default(),
+                profiles: Default::default(),
             }),
         };
         crate::routines::register_tools(&engine.inner);
+        crate::profiles::register_tools(&engine.inner);
         engine
     }
 
@@ -245,6 +248,7 @@ impl Engine {
         if let Ok(Some(v)) = self.inner.store.kv_get("costmodel").await {
             self.inner.cost.load(&v);
         }
+        let _ = self.inner.list_profiles().await; // saved agents, for the planner's prompt
     }
 
     /// What each kind of model call costs here: priors, observations, the estimate in use.

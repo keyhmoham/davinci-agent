@@ -34,6 +34,8 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/mcp/servers/{name}", axum::routing::delete(mcp_remove))
         .route("/v1/mcp/search", get(mcp_search))
         .route("/v1/board", get(board))
+        .route("/v1/agents", get(list_agents).post(define_agent))
+        .route("/v1/agents/{name}", axum::routing::delete(remove_agent))
         .route("/v1/routines", get(list_routines).post(add_routine))
         .route("/v1/routines/{id}", get(get_routine).patch(update_routine).delete(remove_routine))
         .route("/v1/routines/{id}/run", post(run_routine))
@@ -169,6 +171,19 @@ async fn mcp_remove(State(s): State<AppState>, Path(name): Path<String>) -> ApiR
 }
 
 // Routines and the board. What the API asks for is a person's request: routines it adds are enabled (an agent's may be proposals).
+
+async fn list_agents(State(s): State<AppState>) -> Json<Vec<AgentProfile>> {
+    Json(s.engine.agent_profiles().await)
+}
+
+async fn define_agent(State(s): State<AppState>, Json(v): Json<Value>) -> Result<(StatusCode, Json<AgentProfile>), (StatusCode, Json<Value>)> {
+    let p = AgentProfile::from_value(&v).map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    s.engine.define_agent(p).await.map(|p| (StatusCode::CREATED, Json(p))).map_err(|e| err(StatusCode::BAD_REQUEST, e))
+}
+
+async fn remove_agent(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
+    s.engine.remove_agent(&name).await.map(|p| Json(json!({"removed": p.name}))).map_err(|e| err(StatusCode::NOT_FOUND, e))
+}
 
 async fn board(State(s): State<AppState>) -> Json<dfae_runtime::routines::Board> {
     Json(s.engine.board().await)

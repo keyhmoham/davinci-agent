@@ -946,7 +946,11 @@ impl Inner {
                     let mut r = ctx.rec.lock().await;
                     if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
                         s.status = StepStatus::Pending;
-                        s.args = json!({"mode": "escalated"});
+                        // keep what the step is (its custom agent); only the mode changes
+                        if !s.args.is_object() {
+                            s.args = json!({});
+                        }
+                        s.args["mode"] = json!("escalated");
                     }
                 }
                 self.emit(ctx, EventKind::Warning { message: format!("escalating {label}") }).await;

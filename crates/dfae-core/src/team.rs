@@ -75,6 +75,68 @@ pub struct TeamLink {
     pub entities: Vec<Entity>,
     #[serde(default)]
     pub inherited_taint: bool,
+    /// A custom agent: its instructions and tools (`None`: a role chosen from the sub-task).
+    #[serde(default)]
+    pub profile: Option<AgentProfile>,
+}
+
+/// A custom subagent: what it is for, how it works (its skill, as instructions), which tools it may use. Saved by name to be used
+/// again (`agent_define`, `/v1/agents`), or written into a plan step for one task.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AgentProfile {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// How the agent works: shown to every model call the agent makes, before its task.
+    #[serde(default)]
+    pub instructions: String,
+    /// The tools it may use (empty: every read-only tool, plus the writing ones if `writes`).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// May it change things? Writers take the operator slot (one at a time by default); readers run in parallel.
+    #[serde(default)]
+    pub writes: bool,
+}
+
+impl AgentProfile {
+    pub const MAX_INSTRUCTIONS: usize = 4000;
+
+    /// Read a profile from a plan step's `agent` (a saved name, or an object) or an API body. Errors say what is wrong.
+    pub fn from_value(v: &serde_json::Value) -> Result<AgentProfile, String> {
+        let p: AgentProfile = match v {
+            serde_json::Value::String(name) => AgentProfile { name: name.trim().to_string(), ..Default::default() },
+            serde_json::Value::Object(_) => {
+                let mut p: AgentProfile =
+                    serde_json::from_value(v.clone()).map_err(|e| format!("an agent is {{name, description, instructions, tools, writes}}: {e}"))?;
+                // `tools` as one comma-separated string, too
+                if p.tools.is_empty()
+                    && let Some(s) = v.get("tools").and_then(|t| t.as_str())
+                {
+                    p.tools = s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+                }
+                p
+            }
+            _ => return Err("an agent is a saved agent's name or {name, instructions, tools, writes}".into()),
+        };
+        p.validate()?;
+        Ok(p)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        let ok = !self.name.is_empty() && self.name.len() <= 40 && self.name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'));
+        if !ok {
+            return Err(format!("an agent's name is 1–40 letters, digits, - or _ ('{}')", self.name));
+        }
+        if self.instructions.chars().count() > Self::MAX_INSTRUCTIONS {
+            return Err(format!("an agent's instructions are at most {} characters", Self::MAX_INSTRUCTIONS));
+        }
+        Ok(())
+    }
+
+    /// Is this only a reference to a saved profile (a name and nothing else)?
+    pub fn is_reference(&self) -> bool {
+        self.instructions.is_empty() && self.tools.is_empty() && self.description.is_empty() && !self.writes
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

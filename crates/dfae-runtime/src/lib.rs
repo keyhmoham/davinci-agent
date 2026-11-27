@@ -17,6 +17,7 @@ mod mcp;
 mod pipeline;
 pub mod plandoc;
 pub mod planner;
+mod profiles;
 pub mod prompts;
 pub mod quarantine;
 pub mod routines;

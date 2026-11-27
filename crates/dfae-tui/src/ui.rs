@@ -1824,6 +1824,7 @@ mod tests {
                 upstream: vec![Upstream { label: "c2: check the server".into(), summary: "it is affected".into() }],
                 entities: vec![],
                 inherited_taint: false,
+                profile: None,
             }),
             children: vec![],
             reason: None,

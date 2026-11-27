@@ -622,6 +622,15 @@ impl Inner {
             profile,
         });
         let mut text = pkg.render();
+        // a custom agent works as its instructions say: every model it calls is told first
+        if let Some(p) = r.team.as_ref().and_then(|t| t.link.as_ref()).and_then(|l| l.profile.as_ref()).filter(|p| !p.instructions.is_empty()) {
+            text = format!(
+                "YOU ARE AGENT \"{}\"{}. HOW YOU WORK: {}\n{text}",
+                p.name,
+                if p.description.is_empty() { String::new() } else { format!(" ({})", p.description) },
+                p.instructions
+            );
+        }
         if tier == Tier::Planner
             && let Some(t) = &base.template
         {
@@ -1024,6 +1033,15 @@ impl Inner {
         }
         if !unavailable.is_empty() {
             user.push_str(&format!("\nNOT AVAILABLE IN THIS TASK: {}", unavailable.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        // saved custom agents the plan may delegate to (none: nothing is said, nothing is paid); an agent itself delegates to no one
+        if ctx.depth == 0 {
+            let agents = self.profiles.snapshot();
+            if !agents.is_empty() {
+                let list =
+                    agents.iter().map(|p| format!("{} ({}{})", p.name, p.description, if p.writes { ", writes" } else { "" })).collect::<Vec<_>>().join("; ");
+                user.push_str(&format!("\nSAVED AGENTS: {list}"));
+            }
         }
         let names: Vec<String> = native.iter().chain(extra.iter()).cloned().collect();
         let mut req = self.gen_request(Tier::Planner, &system, user, purpose);
