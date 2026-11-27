@@ -331,3 +331,7 @@ whether status.txt has changed … don't spend anything when it hasn't": a 2-hou
 Cost: one-shot ≈ $0.0005 per request (one planner call, one binding), watch ≈ $0.0006, fan-out ≈ $0.003 (three child plans, the join
 and the write). The fan-out runs took 20–30 s with the three reviews in parallel. A scheduled run costs nothing when its gate finds no
 change (hermetic test: two skipped runs, no task, no model call).
+
+Regression with the new plan schema and rules (every request now carries `agent` / `each` per step and two more prompt rules): bug fix,
+two fix loops, cross-session memory, the four injection pages, the four AgentDojo-style cases, the named guide edit and the Next.js build:
+**14/14**, $0.0235 in all.
