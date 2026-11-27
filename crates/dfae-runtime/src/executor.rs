@@ -1154,6 +1154,12 @@ impl Inner {
         if step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m)) {
             return false;
         }
+        // Nor once the task has read such text at all: the loop's goal is to make the failed step pass, and it works around what
+        // stands in the way (measured: a removal a setup page asked for, refused, was retried by the loop as a move, then as a
+        // script). A re-plan is told why instead; the planner leaves it out.
+        if ctx.rec.lock().await.exposed {
+            return false;
+        }
         let tainted = ctx.rec.lock().await.tainted;
         let mut tools: Vec<String> = ctx
             .allowed
