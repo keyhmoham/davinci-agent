@@ -555,3 +555,52 @@ The report goes in `docs/eval/<item-id>.md`, and negative results are kept (as `
 - Memory: [ReasoningBank (ICLR 2026)](https://arxiv.org/abs/2509.25140), [curating self-written playbooks (ACE discussion)](https://arxiv.org/pdf/2610.18427)
 - Compute and routing: [Ares](https://arxiv.org/pdf/2603.07915), [AgentCollab](https://arxiv.org/html/2603.26034), [zero-shot confidence routing](https://arxiv.org/abs/2605.02241), [UCCI](https://arxiv.org/abs/2605.18796), [Toward Efficient Agents (survey)](https://arxiv.org/html/2601.14192v2), [Token Economics for LLM Agents](https://arxiv.org/pdf/2605.09104)
 - Extraction: [GLiNER](https://arxiv.org/abs/2311.08526), [GLiNER2](https://arxiv.org/abs/2507.18546), [Just Pass Twice](https://arxiv.org/pdf/2604.05158), [GLiNER-Relex](https://arxiv.org/pdf/2605.10108)
+
+---
+
+## 15. Addendum (measured 2026-11-27): where an extraction model belongs in DFAE
+
+**Measured.** On the hot path (extract the request, extract every step sentence, bind arguments from entities) GLiNER made no measurable
+difference: rules only 29/30, rules + GLiNER 28/30 on the harder suite, same cost, +18% wall time (`docs/eval/validation-2026-11-27.md`).
+The planner already writes every concrete value into a step and the worker binds from that sentence, so a span extractor there duplicates
+work. **What that test could not see:** every other consumer of entities. Traced in the code:
+
+| Consumer of entities | Today | Needs a semantic extractor? |
+|---|---|---|
+| argument binding (`implement.rs::step_entities`, `repair::fix_args`) | rules + GLiNER on every step | **no** (measured) |
+| routing state (`decision_state`) | entities listed for the decision model | no: the Decisions API reads the request itself (98% routing) |
+| memory ranking (`rank_memories`: 0.15 × entity overlap) | entity overlap as a tie-breaker | marginal: real embeddings (M1) matter far more |
+| **fact promotion** (`pipeline.rs::learn`, step 3) | verified `server` / `database` / `repository` entities, corroborated by tool output, become semantic memory | **yes: only GLiNER produces those labels. Rules-only silently turns this learning off** |
+| **cross-turn references** (`session::resolve`: "that server", "the project") | entities of finished tasks, newest wins | **yes for names** (a service, a project, a host); rules cover paths and URLs |
+| team decomposition (`team::decompose`) | sub-goals inherit entities | no (no extractor call there) |
+
+**Where the literature puts extraction in agent systems, and how each maps here:**
+
+1. **The memory write path, off the hot path** — Mem0 extracts candidate facts from each exchange and then decides how they update the
+   store (91% lower p95 latency and >90% fewer tokens than full context, +26% on LOCOMO's judge metric); Zep/Graphiti extracts entities and
+   relations into a temporal knowledge graph whose facts carry validity windows. In DFAE: after a task is **verified**, extract typed
+   facts (hosts, ports, services, project directories, versions, user preferences) from the request **and the tool evidence**, keep only
+   spans that occur verbatim in tool output (the existing corroboration rule), and store them with `valid_from` / `superseded_by`. Latency
+   does not matter there (it runs after the answer), so a hosted model is fine. **This is the one place a better extractor pays off.**
+2. **Quarantined extraction of untrusted content** — the dual-LLM / CaMeL pattern (Design Patterns for Securing LLM Agents, CaMeL) has
+   untrusted text read by a component with no tools whose output is data, never instructions. A *non-generative span extractor*
+   (`scaledown/extract-1`: schema in, verbatim spans with offsets and confidence out, no free text) is the strongest form of that: it cannot
+   paraphrase an injected instruction into its output. In DFAE: for web pages and MCP results the planner must reason about, extract the
+   fields the step asks for instead of having the worker summarise the page (W3). Security benefit first, tokens second.
+3. **Redaction before anything is kept** — `DFAE_DECISION_LOG` (training data), episodic memory and the audit log keep request text.
+   `safety::redact_secrets` catches keys; names, e-mail addresses and phone numbers need a PII span model (GLiNER-style PII models exist
+   for exactly this). Compliance benefit, not task success.
+
+**Recommended design (replaces E1):**
+* **E1a** — take GLiNER off the hot path: rules-only extraction for routing and binding (`GLINER_URL` unset by default; the service
+  behind a compose profile).
+* **E1b** — a post-task **fact extractor** for semantic memory: the worker model through the gateway with a JSON schema (or
+  `scaledown/extract-1` through a small AI-SDK sidecar, compared on a labelled set), facts kept only when corroborated verbatim by tool
+  output, with supersession instead of duplicates. Measured on multi-turn and cross-session e2e cases ("restart that server", "add a page
+  to the project we built"), which the current suite does not have.
+* **E1c** (with step-agent mode, A1) — quarantined span extraction for untrusted web/MCP content.
+* **E1d** (optional) — PII redaction before the decision log and memory.
+
+Sources: [Mem0](https://arxiv.org/abs/2504.19413), [Zep](https://arxiv.org/abs/2501.13956),
+[Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837), [CaMeL](https://arxiv.org/abs/2503.18813),
+[GLiNER Guard / PII-Bench](https://arxiv.org/abs/2605.05277), [Just Pass Twice](https://arxiv.org/pdf/2604.05158).
