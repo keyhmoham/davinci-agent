@@ -189,10 +189,10 @@ impl Tool for FsEdit {
     fn metadata(&self) -> ToolMetadata {
         let mut m = meta(
             "fs_edit",
-            "change part of an existing file: replace old_string (copied exactly from fs_read, including indentation) with new_string. Fails if old_string is missing or occurs more than once (add surrounding lines, or set replace_all=true). Prefer it to rewriting the file with fs_write",
+            "change part of an existing file: replace old_string (copied exactly from fs_read, including indentation) with new_string. Fails if old_string is missing or occurs more than once (add surrounding lines, or set replace_all=true). Prefer it to rewriting the file with fs_write. With a DIRECTORY as path, every occurrence in every file under it is replaced (a rename across a project: path=src, old_string=calcTotal)",
             "filesystem",
             vec![
-                ParamSpec::new("path", ParamType::String, true, "file to edit").hints(&["file path"]),
+                ParamSpec::new("path", ParamType::String, true, "file to edit, or a directory: every file under it").hints(&["file path"]),
                 ParamSpec::new("old_string", ParamType::String, true, "exact text to replace"),
                 ParamSpec::new("new_string", ParamType::String, true, "replacement text"),
                 ParamSpec::new("replace_all", ParamType::Boolean, false, "replace every occurrence (default: must be unique)"),
@@ -262,6 +262,9 @@ impl Tool for FsEdit {
             return Err(ToolError::args("old_string and new_string are identical: nothing to change"));
         }
         let p = self.policy.guard().write_path(raw)?;
+        if p.is_dir() {
+            return self.edit_tree(raw, &p, old, new);
+        }
         let text = tokio::fs::read_to_string(&p).await.map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => ToolError::new(ErrorKind::NotFound, format!("no such file: {raw} (create it with fs_write)")),
             _ => ToolError::io(format!("{raw}: {e}")),
@@ -285,11 +288,61 @@ impl Tool for FsEdit {
     async fn verify(&self, input: &Value, _o: &ToolOutput, _c: &ToolContext) -> Option<Result<String, String>> {
         let (raw, new) = (input.get("path")?.as_str()?, input.get("new_string")?.as_str()?);
         let p = self.policy.guard().read_path(raw).ok()?;
+        if p.is_dir() {
+            // a tree edit: no file under it may still hold the old text
+            let old = input.get("old_string")?.as_str()?;
+            let mut left = Vec::new();
+            walk_files(&self.policy.guard(), &p, 12, 20_000, |f, _| {
+                if std::fs::read_to_string(f).is_ok_and(|t| t.contains(old)) {
+                    left.push(f.to_string_lossy().into_owned());
+                }
+                true
+            });
+            return Some(if left.is_empty() {
+                Ok(format!("no file under {raw} still contains the old text"))
+            } else {
+                Err(format!("still contains the old text: {}", left.join(", ")))
+            });
+        }
         Some(match tokio::fs::read_to_string(&p).await {
             Ok(t) if new.is_empty() || t.contains(new) => Ok(format!("{raw} contains the new text")),
             Ok(_) => Err(format!("{raw} does not contain the new text after the edit")),
             Err(e) => Err(format!("read-back failed: {e}")),
         })
+    }
+}
+
+impl FsEdit {
+    /// Replace every occurrence of `old` with `new` in each text file under `dir` that contains it (vendored and build directories
+    /// are skipped; every file is checked by the policy as a write).
+    fn edit_tree(&self, raw: &str, dir: &Path, old: &str, new: &str) -> Result<ToolOutput, ToolError> {
+        let guard = self.policy.guard();
+        let mut hits: Vec<(std::path::PathBuf, String, usize)> = Vec::new();
+        walk_files(&guard, dir, 12, 20_000, |f, md| {
+            if md.len() <= 2_000_000
+                && let Ok(t) = std::fs::read_to_string(f)
+            {
+                let n = t.matches(old).count();
+                if n > 0 {
+                    hits.push((f.to_path_buf(), t, n));
+                }
+            }
+            true
+        });
+        if hits.is_empty() {
+            return Err(ToolError::args(format!("old_string was not found in any file under {raw}")));
+        }
+        if hits.len() > 200 {
+            return Err(ToolError::args(format!("old_string occurs in {} files under {raw}: narrow the directory", hits.len())));
+        }
+        let mut done = Vec::new();
+        for (f, text, n) in &hits {
+            let w = guard.write_path(&f.to_string_lossy())?;
+            std::fs::write(&w, text.replace(old, new)).map_err(|e| ToolError::io(format!("{}: {e}", f.display())))?;
+            done.push(format!("{} ({n})", rel(&guard.workspace, f)));
+        }
+        let total: usize = hits.iter().map(|h| h.2).sum();
+        Ok(ToolOutput::ok(format!("edited {} file(s) under {raw}, {total} replacement(s): {}", hits.len(), done.join(", "))))
     }
 }
 

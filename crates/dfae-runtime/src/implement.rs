@@ -136,8 +136,12 @@ pub(crate) fn directory_named(step: &str, command: &str, workspace: &std::path::
     if command.trim_start().starts_with("cd ") || command.contains(" cd ") || command.contains("&& cd") {
         return None;
     }
+    // "the site directory", "the app folder": the name before the word
+    static NAMED_DIR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)[`"']?([A-Za-z0-9_][A-Za-z0-9_./-]*)[`"']?\s+(?:directory|folder|dir)\b"#).unwrap());
     IN_DIR
         .captures_iter(step)
+        .chain(NAMED_DIR.captures_iter(step))
         .map(|c| c[1].trim_end_matches(['.', '/']).to_string())
         .find(|d| !d.is_empty() && !d.starts_with("..") && workspace.join(d).is_dir() && !command.contains(d.as_str()))
 }
@@ -150,9 +154,6 @@ pub(crate) fn strip_tool_markup(text: &str) -> String {
     text[..cut].trim_end().to_string()
 }
 
-/// A long text stuck in a loop: one substantial line over and over (`*.egg-info` a hundred times), or a text that is mostly copies of
-/// its own lines. Structural lines every real page and program repeats (`}`, `</div>`, `end`) are not evidence: only lines of 12
-/// characters or more count (8 for a run of identical lines).
 /// The names a step gives (a product, a person, a place, a quoted title) that a prose or page file about them must mention: a README
 /// for "a tool called Brewster" that never says Brewster was written about something else, or is an empty shell. Only for prose and
 /// pages; code and config files name things in their own ways.
@@ -222,6 +223,9 @@ pub(crate) fn missing_names(step: &str, path: &str, text: &str) -> Vec<String> {
     names.into_iter().filter(|n| !lower.contains(&n.to_lowercase())).take(3).collect()
 }
 
+/// A long text stuck in a loop: one substantial line over and over (`*.egg-info` a hundred times), or a text that is mostly copies of
+/// its own lines. Structural lines every real page and program repeats (`}`, `</div>`, `end`) are not evidence: only lines of 12
+/// characters or more count (8 for a run of identical lines).
 pub(crate) fn degenerate(text: &str) -> bool {
     // the same line (of 8 characters or more) forty times in a row: a starfield of 30 `<div class="star"></div>` is a page, a
     // loop goes on until the token limit
@@ -806,6 +810,10 @@ impl Inner {
         }
 
         // "…in proj": a command that does not say where it runs, for a step that names a directory that exists, runs there
+        // (a cwd of "." says nothing: it is where a command runs anyway)
+        if tool == "shell" && args.get("cwd").and_then(|c| c.as_str()).is_some_and(|c| matches!(c.trim(), "" | "." | "./")) {
+            args.remove("cwd");
+        }
         if tool == "shell" && args.get("cwd").is_none() && meta.params.iter().any(|p| p.name == "cwd") {
             let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
             if let Some(dir) = directory_named(&step.description, command, self.policy.workspace()) {
@@ -1018,6 +1026,12 @@ mod content_tests {
         assert_eq!(d("show the log in proj", "git -C proj log"), None);
         assert_eq!(d("run in the workspace root", "ls"), None);
         assert_eq!(d("list files in nowhere", "ls"), None, "a directory that is not there is no cwd");
+        assert_eq!(
+            d("Start a static HTTP server for the proj directory on 0.0.0.0 port 8000", "python3 -m http.server 8000").as_deref(),
+            Some("proj"),
+            "the name before the word"
+        );
+        assert_eq!(d("serve the workspace directory", "python3 -m http.server"), None);
     }
 
     #[test]

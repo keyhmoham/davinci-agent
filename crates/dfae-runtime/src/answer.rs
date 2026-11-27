@@ -127,6 +127,23 @@ fn compact_args(v: &serde_json::Value) -> String {
     }
 }
 
+/// The local addresses of servers that steps started (`python3 -m http.server 8000`, `npm run dev -- --port 8003`).
+pub(crate) fn served_addresses(plan: &Plan) -> String {
+    static PORT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[\s:=])(\d{4,5})\b").unwrap());
+    let mut out = String::new();
+    for s in plan.steps.iter().filter(|s| s.status == StepStatus::Succeeded && s.tool.as_deref() == Some("shell")) {
+        let cmd = s.args.get("command").and_then(|c| c.as_str()).unwrap_or("");
+        if !crate::implement::implies_background(&s.description, cmd) {
+            continue;
+        }
+        for c in PORT.captures_iter(cmd) {
+            let p = &c[1];
+            out.push_str(&format!("\nhttp://localhost:{p} http://127.0.0.1:{p} http://0.0.0.0:{p}"));
+        }
+    }
+    out
+}
+
 static NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b\d[\d,]*(?:\.\d+)?\b").unwrap());
 static PATHLIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:/[\w.\-]+){2,}|https?://[^\s)\]]+").unwrap());
 static BACKTICK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`([^`\n]{2,80})`").unwrap());
@@ -152,7 +169,18 @@ pub fn ungrounded_claims(answer: &str, evidence: &str, goal: &str) -> Vec<String
         }
     }
     for m in PATHLIKE.find_iter(answer) {
-        check(m.as_str().trim_end_matches(['.', ',', ')']));
+        // markdown around an address (`**http://…/**`, a trailing slash or period) is not part of it
+        let tok = m.as_str().trim_end_matches(['.', ',', ')', '*', '_', '`', '/']);
+        // a page under an address the evidence has (`http://localhost:8000/about.html`, with about.html written) is grounded
+        if let Some(rest) = tok.strip_prefix("http://").or_else(|| tok.strip_prefix("https://"))
+            && let Some((host, path)) = rest.split_once('/')
+            && ev.contains(&tok[..tok.len() - path.len() - 1])
+            && path.rsplit('/').next().is_some_and(|last| !last.is_empty() && ev.contains(last))
+            && !host.is_empty()
+        {
+            continue;
+        }
+        check(tok);
     }
     for c in BACKTICK.captures_iter(answer) {
         check(&c[1]);
@@ -220,12 +248,18 @@ impl Inner {
         };
 
         // only tool output is ground truth: a model's own prose must never vouch for itself
-        let evidence_full: String = plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
+        let mut evidence_full: String =
+            plan.steps.iter().filter(|s| s.kind != StepKind::Reasoning).filter_map(|s| s.output.clone()).collect::<Vec<_>>().join("\n");
+        // the address of a server a step started is as much a fact as its output: the command said where it listens
+        evidence_full.push_str(&served_addresses(&plan));
         let mut from_model = false;
         // a question answered by tool steps alone (the planner left out the step that states the answer) still needs its answer written
-        let asks = snapshot.route.as_ref().is_some_and(|r| r.asks && !r.changes)
-            && matches!(plan.source, PlanSource::Planner | PlanSource::Worker | PlanSource::Replan);
-        let text = if exec_err.is_some() || (!plan.has_reasoning() && !self.data_needs_composing(&plan) && !asks) {
+        // (also when the request changes something too: "write totals.csv, and which region is highest?" still asks)
+        let asks = snapshot.route.as_ref().is_some_and(|r| r.asks) && matches!(plan.source, PlanSource::Planner | PlanSource::Worker | PlanSource::Replan);
+        // a request that started a server is answered with where to reach it, not with a list of every step (a server started and then
+        // replaced on another port would otherwise be listed too)
+        let served = !served_addresses(&plan).is_empty() && matches!(plan.source, PlanSource::Planner | PlanSource::Worker | PlanSource::Replan);
+        let text = if exec_err.is_some() || (!plan.has_reasoning() && !self.data_needs_composing(&plan) && !asks && !served) {
             templated_answer(&snapshot, exec_err)
         } else if let Some(t) = single_leaf {
             from_model = true;
@@ -307,6 +341,14 @@ mod tests {
         let evidence = "load: 0.52 0.40 0.31 (cpus: 4)\nmem: total 15.6G";
         let goal = "check system status";
         assert!(ungrounded_claims("The load is 0.52 with 4 cpus and 15.6G of memory.", evidence, goal).is_empty());
+        assert!(
+            ungrounded_claims("See **http://localhost:8000/about.html** and http://localhost:8000/.", "http://localhost:8000 wrote site/about.html", "")
+                .is_empty()
+        );
+        assert_eq!(
+            ungrounded_claims("See http://localhost:8000/secret.html", "http://localhost:8000 wrote site/about.html", ""),
+            vec!["http://localhost:8000/secret.html"]
+        );
         let bad = ungrounded_claims("The load is 0.99 and /var/log/app/errors.log is full", evidence, goal);
         assert!(bad.contains(&"0.99".to_string()));
         assert!(bad.contains(&"/var/log/app/errors.log".to_string()));

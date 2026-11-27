@@ -956,6 +956,10 @@ impl Inner {
     async fn finish_plan(&self, ctx: &Arc<TaskCtx>, mut steps: Vec<Step>, goal: &str, expect_effect: bool) -> Result<Vec<Step>, Vec<String>> {
         self.repair_plan_args(ctx, &mut steps, goal).await;
         self.admit_readonly_tools(ctx, &steps).await;
+        let split = planner::split_multi_file_steps(&mut steps, self.policy.workspace());
+        if !split.is_empty() {
+            self.emit(ctx, EventKind::Repaired { step_id: "plan".into(), note: split.join("; ") }).await;
+        }
         let mut dropped = planner::prune_unknown_deps(&mut steps);
         // what the planner forgot to order, code knows: a step that uses a file waits for the step that writes it
         let ordered = planner::infer_dependencies(&mut steps, &self.tools);
