@@ -284,6 +284,44 @@ fn cases() -> Vec<Case> {
             check: written_up_check,
         },
         Case {
+            name: "mcp wikipedia",
+            goal: "Using a Wikipedia MCP server, find out in which year the Rust programming language first appeared.",
+            then: &[],
+            between: None,
+            files: |_| {},
+            check: |_, t| {
+                let tool = used_mcp(t).ok_or("no MCP tool ran")?;
+                let a = answer(t);
+                if ["2015", "2010", "2006"].iter().any(|y| a.contains(y)) { Ok(()) } else { Err(format!("{tool}: {a}")) }
+            },
+        },
+        Case {
+            name: "mcp github",
+            goal: "Using a GitHub MCP server, tell me the official description of the GitHub repository rust-lang/rust.",
+            then: &[],
+            between: None,
+            files: |_| {},
+            check: |_, t| {
+                let tool = used_mcp(t).ok_or("no MCP tool ran")?;
+                let a = answer(t).to_lowercase();
+                if a.contains("reliable") && a.contains("efficient") { Ok(()) } else { Err(format!("{tool}: {a}")) }
+            },
+        },
+        Case {
+            name: "mcp hacker news unprompted",
+            goal: "What are the top 3 stories on Hacker News right now?",
+            then: &[],
+            between: None,
+            files: |_| {},
+            check: |_, t| {
+                let a = answer(t);
+                let items = a.lines().filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '•' || c == '*')).count();
+                let via = used_mcp(t).unwrap_or_else(|| "web".into());
+                eprintln!("  (served by: {via})");
+                if items >= 3 { Ok(()) } else { Err(format!("fewer than 3 stories ({via}): {a}")) }
+            },
+        },
+        Case {
             name: "nextjs scaffold and build",
             goal: "Create a Next.js app in the directory notes-app whose home page lists three example notes, and make sure `npm run build` succeeds.",
             then: &[],
@@ -358,6 +396,16 @@ fn written_up_check(ws: &Path, t: &TaskRecord) -> Result<(), String> {
     if md.contains("49.90") { Ok(()) } else { Err(format!("the write-up lacks the price: {md}")) }
 }
 
+/// Did a tool of an MCP server (one the task found and connected) run and succeed?
+fn used_mcp(t: &TaskRecord) -> Option<String> {
+    t.plan
+        .as_ref()?
+        .steps
+        .iter()
+        .find(|s| s.status == StepStatus::Succeeded && s.tool.as_deref().is_some_and(|n| n.starts_with("mcp__")))
+        .and_then(|s| s.tool.clone())
+}
+
 /// Stop servers a case started (they keep the ports for the next one).
 fn free_ports() {
     for p in 8000..=8010 {
@@ -385,7 +433,8 @@ async fn harder_tasks_end_to_end() {
             cfg.policy_path = Some(policy.into());
             cfg.approvals = ApprovalMode::Never;
             cfg.database_url = None;
-            cfg.mcp.auto = false;
+            // LIVE_MCP=1: the Glama directory is searched for servers a request needs (GLAMA_API_KEY)
+            cfg.mcp.auto = std::env::var("LIVE_MCP").is_ok();
             let e = build_engine(cfg).await.expect("engine");
             let started = std::time::Instant::now();
             let session = format!("e2e-{}-{run_no}", c.name.replace(' ', "-"));
@@ -449,6 +498,15 @@ async fn harder_tasks_end_to_end() {
                 s.decision_calls
             );
             eprintln!("  answer: {}", tokens::truncate_tokens(&answer(&t), 80).replace('\n', " ⏎ "));
+            // LIVE_EVENTS=1: what the task was told along the way (MCP servers found and connected, warnings, repairs)
+            if std::env::var("LIVE_EVENTS").is_ok() {
+                for ev in e.backlog(&t.task_id) {
+                    let line = serde_json::to_string(&ev.kind).unwrap_or_default();
+                    if ["Mcp", "Warning", "Repaired", "mcp", "warning", "repaired"].iter().any(|k| line.contains(k)) {
+                        eprintln!("    event: {}", line.chars().take(400).collect::<String>());
+                    }
+                }
+            }
             let verdict = if t.status != TaskStatus::Completed { Err(format!("{:?}: {:?}", t.status, t.error)) } else { (c.check)(ws.path(), &t) };
             match verdict {
                 Ok(()) => eprintln!("  PASS"),

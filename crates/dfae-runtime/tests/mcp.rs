@@ -81,8 +81,15 @@ impl DecisionProvider for Oracle {
     }
     async fn decide(&self, req: DecisionRequest) -> Result<DecisionResponse, DecisionError> {
         let mut r = self.0.decide(req.clone()).await?;
-        if req.kind == DecisionKind::RouteTask && req.state.request.contains("weather") {
+        if req.kind == DecisionKind::RouteTask && (req.state.request.contains("weather") || req.state.request.contains("rain")) {
             r.answers.insert("external_service".into(), Answer::noul(0.95));
+        }
+        // does a known server fit the request? only a weather server fits a weather request
+        for (k, q) in &req.questions {
+            if let (true, Question::Noul { instructions, .. }) = (k.starts_with("server_"), q) {
+                let fits = instructions.contains("weather") && req.state.request.contains("weather");
+                r.answers.insert(k.clone(), Answer::noul(if fits { 0.9 } else { 0.1 }));
+            }
         }
         Ok(r)
     }
@@ -219,4 +226,22 @@ async fn data_an_mcp_tool_returns_is_turned_into_an_answer_not_shown_raw() {
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     let answer = t.final_answer.unwrap();
     assert!(answer.contains("snow in Oslo") && !answer.contains("temp_c"), "{answer}");
+}
+
+#[tokio::test]
+async fn a_known_server_that_only_shares_words_with_a_request_is_not_attached() {
+    let r = rig(true).await;
+    r.worker.push("weather forecast");
+    r.planner.push(PLAN);
+    r.worker.push(r#"{"city": "Paris"}"#);
+    run(&r, "what is the weather forecast for Paris").await;
+    // the weather server is known now; this request shares its words ("forecast", "city") but is about something else
+    r.planner.push(r#"{"steps":[{"id":"s1","tool":"calc","do":"calculate 1200 * 1.1","after":[],"expect":null,"planner":false}]}"#);
+    r.worker.push(r#"{"expression": "1200 * 1.1"}"#);
+    let t = run(&r, "forecast the revenue of each city: calculate 1200 * 1.1").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let attached = r.engine.backlog(&t.task_id).into_iter().any(|e| matches!(e.kind, EventKind::McpConnected { .. }));
+    assert!(!attached, "the decision model said the weather server does not fit");
+    let plan_req = r.planner.requests.lock().iter().filter(|q| q.purpose == "plan").last().cloned().unwrap();
+    assert!(!plan_req.messages[0].content.contains("mcp__open_weather"), "the planner is not offered its tools");
 }

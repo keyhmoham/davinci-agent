@@ -213,3 +213,20 @@ Luhn-valid card numbers and IBANs; a fact whose value is personal data is not ke
 are kept as written. First held-out set: 82% recall, 4/15 lookalikes changed (a git remote, matches inside an id, a UUID, a time
 range) → whole-token matching, SSH remotes, national numbers. **Second fresh held-out set (never used to change a rule): 18/18 found,
 15/15 lookalikes untouched.** Names and street addresses are not caught (they need a model).
+
+## Round 7: MCP discovery through the Glama directory, end to end
+
+`LIVE_MCP=1` (with `GLAMA_API_KEY`) lets the e2e harness search the directory; three cases need an outside service: Wikipedia (the year
+Rust first appeared), GitHub (the official description of rust-lang/rust) and Hacker News's top three stories — the last one **without**
+saying "MCP".
+
+* First run: Wikipedia 2/2 (two different directory servers found and used), Hacker News 2/2 (the system chose an MCP server by itself),
+  **GitHub 0/2**: no directory search happened. Servers connected by earlier tasks are remembered (registry) and attached when the
+  request shares two words with their tool documentation; a Hacker News and a Wikipedia server "fitted" the GitHub request on common
+  words ("description", "repository", "official"), so nothing was searched and the planner fell back to the web.
+* Fix: the word match is only the first cut; the decision model answers, per candidate, whether the service is the one the request is
+  about and can do what it needs (one Decisions API call for all candidates; without a decision model the word match stands). A
+  scripted test fails without the check and passes with it.
+* After the fix: **6/6** (Wikipedia 2/2, GitHub 2/2 via a directory GitHub server, Hacker News 2/2), no re-plans, $0.0068 in all.
+* Seen on the way: this sandbox's own network proxy answers 403 for github.com ("GitHub access … not enabled for this session") — an
+  environment limit, not the system's.
