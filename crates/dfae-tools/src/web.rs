@@ -61,6 +61,11 @@ pub(crate) async fn fetch(
         .map_err(|e| ToolError::other(e.to_string()))?;
     let mut url = url.to_string();
     for hop in 0..4 {
+        // the agent's own server (loopback, a serving port, the sandbox shell) may be asked directly — never reached by a redirect
+        let own = !trusted && policy.own_server(&url);
+        if own && hop > 0 {
+            return Err(ToolError::policy("a redirect to a local address is blocked"));
+        }
         if trusted {
             policy.public_host(&url).map_err(ToolError::policy)?;
         } else if let crate::policy::PolicyDecision::Deny(m) = policy.check(meta, &json!({"url": url}), false) {
@@ -73,7 +78,7 @@ pub(crate) async fn fetch(
             .await
             .map_err(|e| ToolError::new(ErrorKind::Transient, format!("DNS lookup failed for {host}: {e}")))?
             .collect();
-        if addrs.is_empty() || addrs.iter().any(|a| is_private_ip(&a.ip())) {
+        if addrs.is_empty() || (!own && addrs.iter().any(|a| is_private_ip(&a.ip()))) {
             return Err(ToolError::policy(format!("{host} resolves to a private or loopback address")));
         }
         let mut rb = client.get(parsed.clone());

@@ -500,6 +500,32 @@ impl Inner {
                 ));
             }
         }
+        // files the step or the request names that already exist (the sample a test counts the words of, the data a script reads): the
+        // content must agree with them, and a model that has not seen them guesses
+        let (goal, step_text) = {
+            let r = ctx.rec.lock().await;
+            (r.goal.clone(), r.plan.as_ref().and_then(|p| p.step(this_step)).map(|s| s.description.clone()).unwrap_or_default())
+        };
+        let mut named: Vec<String> = Vec::new();
+        for w in step_text.split_whitespace().chain(goal.split_whitespace()) {
+            let w = w.trim_matches(['`', '"', '\'', ',', '.', ':', ';', '(', ')']);
+            if w.contains('.') && !w.contains("..") && w != target && !paths.iter().any(|p| p == w) && !named.iter().any(|n| n == w) {
+                named.push(w.to_string());
+            }
+        }
+        for p in named.iter().filter(|p| self.policy.guard().read_path(p).is_ok_and(|f| f.is_file())).take(2) {
+            if let Ok(full) = self.policy.guard().read_path(p)
+                && std::fs::metadata(&full).is_ok_and(|m| m.len() <= 20_000)
+                && let Ok(text) = std::fs::read_to_string(full)
+                && !text.is_empty()
+            {
+                let cut: String = text.chars().take(1500).collect();
+                shown.push(dfae_core::safety::wrap_untrusted(
+                    &format!("file {p} (exists)"),
+                    &if cut.len() < text.len() { format!("{cut}\n… [file continues]") } else { cut },
+                ));
+            }
+        }
         if shown.is_empty() { String::new() } else { format!("RELATED FILES:\n{}", shown.join("\n")) }
     }
 

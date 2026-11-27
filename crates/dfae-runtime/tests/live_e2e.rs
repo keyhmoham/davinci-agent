@@ -19,6 +19,8 @@ use std::time::Duration;
 struct Case {
     name: &'static str,
     goal: &'static str,
+    /// Follow-up requests in the same session and workspace, after the goal (the oracle checks the state after the last).
+    then: &'static [&'static str],
     files: fn(&Path),
     check: fn(&Path, &TaskRecord) -> Result<(), String>,
 }
@@ -42,6 +44,7 @@ fn cases() -> Vec<Case> {
     vec![
         Case {
             name: "bugfix with failing tests",
+            then: &[],
             goal: "The tests in test_stats.py fail. Fix stats.py so that all of them pass.",
             files: |ws| {
                 write(ws, "stats.py", "def median(xs):\n    xs.sort()\n    return xs[len(xs) // 2]\n\n\ndef mean(xs):\n    return sum(xs) / len(xs)\n");
@@ -62,6 +65,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "cli with tests",
+            then: &[],
             goal: "Write a Python command-line tool wordcount.py that prints the number of words in the file given as its argument, \
                    write pytest tests for it in test_wordcount.py, and run the tests.",
             files: |ws| write(ws, "sample.txt", "the quick brown fox\njumps over the lazy dog\n"),
@@ -76,6 +80,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "csv analysis",
+            then: &[],
             goal: "sales.csv has one row per order. Which region had the highest total revenue? Also write the total revenue per region \
                    to totals.csv with the columns region,revenue.",
             files: |ws| {
@@ -117,6 +122,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "rename across a js project",
+            then: &[],
             goal: "Rename the function calcTotal to computeTotal everywhere in src/, and make sure `node test.js` still passes.",
             files: |ws| {
                 write(
@@ -150,6 +156,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "static site served",
+            then: &[],
             goal: "Create a small static website for a bakery called Crumb & Co in the site directory, with a home page and an about page \
                    linked from each other, and serve it on a free port from 8000 to 8010. Tell me the address.",
             files: |_| {},
@@ -169,6 +176,7 @@ fn cases() -> Vec<Case> {
         },
         Case {
             name: "question about the code",
+            then: &[],
             goal: "What does the function apply_discount in shop/pricing.py do, and what does it return for a price of 80 with the code SAVE10?",
             files: |ws| {
                 write(
@@ -181,6 +189,55 @@ fn cases() -> Vec<Case> {
             check: |_, t| {
                 let a = answer(t);
                 if a.contains("72") { Ok(()) } else { Err(format!("the answer does not say 72: {a}")) }
+            },
+        },
+        Case {
+            name: "web lookup",
+            goal: "What is the latest stable release of Python? Look it up on the web and give me the version number.",
+            then: &[],
+            files: |_| {},
+            check: |_, t| {
+                let a = answer(t);
+                let web = t
+                    .plan
+                    .as_ref()
+                    .is_some_and(|p| p.steps.iter().any(|s| matches!(s.tool.as_deref(), Some("web_search" | "http_get")) && s.status == StepStatus::Succeeded));
+                let version = regex::Regex::new(r"\b3\.1[3-9]\.\d+\b").unwrap();
+                if web && version.is_match(&a) { Ok(()) } else { Err(format!("web used: {web}; answer: {a}")) }
+            },
+        },
+        Case {
+            name: "follow-up in a session",
+            goal: "Create a one-page website for a florist called Petal Lane in the shop directory.",
+            then: &["Now add a contact page to it, with an address and opening hours, and link it from the home page."],
+            files: |_| {},
+            check: |ws, _| {
+                let (_, found) = run(ws, "ls shop");
+                let contact = found.split_whitespace().find(|f| f.to_lowercase().contains("contact")).ok_or(format!("no contact page in shop/: {found}"))?;
+                let c = std::fs::read_to_string(ws.join("shop").join(contact)).unwrap_or_default();
+                let home = std::fs::read_to_string(ws.join("shop/index.html")).map_err(|e| format!("shop/index.html: {e}"))?;
+                if !home.contains(contact) {
+                    return Err(format!("the home page does not link to {contact}"));
+                }
+                if c.contains("Petal Lane") && c.to_lowercase().contains("hours") {
+                    Ok(())
+                } else {
+                    Err(format!("{contact}: {}", c.chars().take(300).collect::<String>()))
+                }
+            },
+        },
+        Case {
+            name: "nextjs scaffold and build",
+            goal: "Create a Next.js app in the directory notes-app whose home page lists three example notes, and make sure `npm run build` succeeds.",
+            then: &[],
+            files: |_| {},
+            check: |ws, _| {
+                let pkg = std::fs::read_to_string(ws.join("notes-app/package.json")).map_err(|e| format!("notes-app/package.json: {e}"))?;
+                if !pkg.contains("\"next\"") {
+                    return Err("not a Next.js project".into());
+                }
+                let (ok, out) = run(&ws.join("notes-app"), "npm run build 2>&1 | tail -15");
+                if ok && !out.to_lowercase().contains("error") { Ok(()) } else { Err(format!("npm run build: {out}")) }
             },
         },
     ]
@@ -216,8 +273,19 @@ async fn harder_tasks_end_to_end() {
             cfg.mcp.auto = false;
             let e = build_engine(cfg).await.expect("engine");
             let started = std::time::Instant::now();
-            let id = e.submit(TaskRequest { goal: c.goal.into(), ..Default::default() }).await.unwrap();
-            let t = e.wait(&id, Duration::from_secs(900)).await.expect("the task did not finish in 15 minutes");
+            let session = format!("e2e-{}-{run_no}", c.name.replace(' ', "-"));
+            let id = e.submit(TaskRequest { goal: c.goal.into(), session_id: Some(session.clone()), ..Default::default() }).await.unwrap();
+            let mut t = e.wait(&id, Duration::from_secs(900)).await.expect("the task did not finish in 15 minutes");
+            for follow in c.then {
+                if t.status != TaskStatus::Completed {
+                    break;
+                }
+                let first = t.ledger.summary().cost_usd;
+                let id = e.submit(TaskRequest { goal: (*follow).into(), session_id: Some(session.clone()), ..Default::default() }).await.unwrap();
+                t = e.wait(&id, Duration::from_secs(900)).await.expect("the follow-up did not finish in 15 minutes");
+                cost += first;
+                eprintln!("  (follow-up: {follow})");
+            }
             let s = t.ledger.summary();
             cost += s.cost_usd;
             eprintln!(
