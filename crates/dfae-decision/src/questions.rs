@@ -43,7 +43,11 @@ pub fn route_request(state: DecisionState) -> DecisionRequest {
     );
     q.insert(
         "fresh_data".into(),
-        Question::noul("Does a correct answer depend on information that changes over time or happened recently — a price, a rate, the weather, news, a score, the latest version of something — which the assistant cannot know without looking it up on the web or in a system?"),
+        Question::noul("Does a correct answer depend on information about the outside world that changes over time or happened recently — a price, a rate, the weather, news, a score, the latest version of a product — which has to be looked up on the web or in an outside service? The state of this machine, its files, processes or ports does not count: tools read that directly."),
+    );
+    q.insert(
+        "asks_answer".into(),
+        Question::noul("Does the request ask a question, or for information that has to be worked out or stated from what is read or found (what changed, which files, how many, why, what it is about, a summary or explanation)? Only showing something as it is (list, show, find, check or run something), small talk, or making a change does not count."),
     );
     q.insert(
         "external_service".into(),

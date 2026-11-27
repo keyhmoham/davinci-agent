@@ -280,6 +280,32 @@ pub fn apply_patch(current: &[Step], patch: &crate::plandoc::PatchDoc, prefix: &
             s.depends_on.retain(|d| !failed.contains(d));
         }
     }
+    // A patch that edits a waiting step to run after the new ones ("run the tests after the fix") and has the new ones wait for that
+    // same step closes a cycle, and the task would fail on it. The edit is the intent: a new step drops a wait on a step that waits for it.
+    let new_ids: HashSet<String> = renumber.values().cloned().collect();
+    let waits_on = |steps: &[Step], from: &str, target: &str| -> bool {
+        let mut stack = vec![from.to_string()];
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if id == target {
+                return true;
+            }
+            if seen.insert(id.clone())
+                && let Some(s) = steps.iter().find(|s| s.id == id)
+            {
+                stack.extend(s.depends_on.iter().cloned());
+            }
+        }
+        false
+    };
+    for i in 0..steps.len() {
+        if !new_ids.contains(&steps[i].id) {
+            continue;
+        }
+        let me = steps[i].id.clone();
+        let back: Vec<String> = steps[i].depends_on.iter().filter(|d| !new_ids.contains(*d) && waits_on(&steps, d, &me)).cloned().collect();
+        steps[i].depends_on.retain(|d| !back.contains(d));
+    }
     for s in &steps {
         if s.status == StepStatus::Failed {
             issues.push(format!("{} failed ({}) and is neither edited nor dropped", s.id, tokens::truncate_tokens(s.error.as_deref().unwrap_or("error"), 20)));
@@ -479,6 +505,61 @@ pub fn infer_dependencies(steps: &mut [Step], registry: &ToolRegistry) -> Vec<St
     notes
 }
 
+/// A step that reads files with a one-file tool (`fs_read`) but names several files that exist ("read stats.py and
+/// test_stats.py", "rename calcTotal in src/cart.js and src/checkout.js") would be bound to one of them, and the planner would have to
+/// re-plan for the rest. Code splits it into one step per file, each told which file it is about, and whatever waited for the step
+/// waits for all of them. Returns what was split, for the log.
+pub fn split_multi_file_steps(steps: &mut Vec<Step>, workspace: &std::path::Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut i = 0;
+    while i < steps.len() {
+        let s = &steps[i];
+        // only reads: a step that edits one file names others as references ("fix stats.py to meet test_stats.py"), and splitting
+        // it edits the reference (measured: a test file was changed). A rename across files is one fs_edit on the directory.
+        let one_file_tool = s.tool.as_deref() == Some("fs_read");
+        let prebound = s.args.get("path").is_some_and(|p| p.as_str().is_some_and(|p| !p.is_empty()));
+        // an output another step quotes by id cannot be split without changing what that step receives
+        let quoted = steps.iter().any(|o| o.description.contains(&format!("{{{{{}}}}}", s.id)) || o.args.to_string().contains(&format!("{{{{{}}}}}", s.id)));
+        let mut files: Vec<String> = Vec::new();
+        if s.brief && one_file_tool && !prebound && !quoted {
+            for p in path_tokens(&s.description) {
+                if workspace.join(&p).is_file() && !files.contains(&p) {
+                    files.push(p);
+                }
+            }
+        }
+        if files.len() < 2 || files.len() > 8 {
+            i += 1;
+            continue;
+        }
+        let orig = steps.remove(i);
+        let ids: Vec<String> = (1..=files.len()).map(|k| format!("{}_{k}", orig.id)).collect();
+        for (k, f) in files.iter().enumerate() {
+            let mut part = orig.clone();
+            part.id = ids[k].clone();
+            part.description = format!("{} (this step: only {f})", orig.description);
+            part.args = serde_json::json!({ "path": f });
+            // what was expected of the whole step is checked once the last part has run
+            if k + 1 < files.len() {
+                part.checks.clear();
+                part.expect = None;
+            }
+            steps.insert(i + k, part);
+        }
+        for o in steps.iter_mut() {
+            if let Some(at) = o.depends_on.iter().position(|d| *d == orig.id) {
+                o.depends_on.remove(at);
+                for id in ids.iter().rev() {
+                    o.depends_on.insert(at, id.clone());
+                }
+            }
+        }
+        notes.push(format!("{} names {} files: one step per file ({})", orig.id, files.len(), ids.join(", ")));
+        i += files.len();
+    }
+    notes
+}
+
 /// Drop dependencies on steps that do not exist (a model's slip, e.g. `after: ["r1_2"]` with no such step).
 /// Data still flows only through `{{id}}` templates, which are checked when the step runs.
 pub fn prune_unknown_deps(steps: &mut [Step]) -> Vec<String> {
@@ -632,6 +713,32 @@ mod tests {
     }
 
     #[test]
+    fn a_one_file_step_that_names_several_files_becomes_one_step_per_file() {
+        let r = registry();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join("src")).unwrap();
+        for f in ["stats.py", "test_stats.py", "src/cart.js", "src/checkout.js"] {
+            std::fs::write(ws.path().join(f), "x").unwrap();
+        }
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_read", "do": "read `stats.py` and `test_stats.py`", "after": [], "expect": null, "planner": false},
+            {"id": "s2", "tool": "fs_edit", "do": "rename calcTotal to computeTotal in src/cart.js and src/checkout.js", "after": ["s1"], "expect": "src/checkout.js contains computeTotal", "planner": false},
+            {"id": "s3", "tool": "shell", "do": "run `node test.js`", "after": ["s2"], "expect": null, "planner": false},
+            {"id": "s4", "tool": "fs_write", "do": "write wordcount.py that counts the words of sample.txt", "after": [], "expect": null, "planner": false}
+        ]});
+        let mut steps = parse_brief_plan(&v, "g", PlanSource::Planner, "", &r).unwrap();
+        let notes = split_multi_file_steps(&mut steps, ws.path());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["s1_1", "s1_2", "s2", "s3", "s4"]);
+        assert_eq!(steps[0].args["path"], "stats.py");
+        assert_eq!(steps[1].args["path"], "test_stats.py");
+        assert_eq!(steps[2].depends_on, vec!["s1_1", "s1_2"], "what waited for the step waits for every part");
+        assert_eq!(steps[2].id, "s2", "an edit names files it only refers to: never split (it would edit the reference)");
+        assert_eq!(steps[4].id, "s4", "a write names a file it reads, not two files to write: never split");
+    }
+
+    #[test]
     fn parses_and_validates_a_good_plan() {
         let r = registry();
         let v = json!({"steps": [
@@ -673,6 +780,44 @@ mod tests {
         // with nothing added, a failed step that nobody handles is still a problem to hand back to the planner
         let nothing = PatchDoc { edit: vec![], add: vec![], drop: vec![] };
         assert!(apply_patch(&steps, &nothing, "r1_", &r).unwrap_err()[0].contains("neither edited nor dropped"));
+    }
+
+    #[test]
+    fn a_patch_that_would_close_a_cycle_keeps_the_edit_and_drops_the_back_edge() {
+        use crate::plandoc::{PatchDoc, StepDoc};
+        let r = registry();
+        let v = json!({"steps": [
+            {"id": "s1", "tool": "fs_edit", "do": "rename", "args": {"path": "src", "old_string": "a", "new_string": "b"}},
+            {"id": "s3", "tool": "shell", "do": "run the tests", "args": {"command": "true"}, "after": ["s1"]}
+        ]});
+        let mut steps = parse_plan(&v, "g", PlanSource::Worker, "", &r).unwrap();
+        steps[0].status = StepStatus::Failed;
+        steps[1].status = StepStatus::Cancelled;
+        let fix = StepDoc {
+            id: "x".into(),
+            tool: Some("fs_edit".into()),
+            intent: "rename in src/cart.js".into(),
+            after: vec!["s3".into()],
+            expect: None,
+            planner: false,
+            args: None,
+        };
+        let tests = StepDoc {
+            id: "s3".into(),
+            tool: Some("shell".into()),
+            intent: "run the tests".into(),
+            after: vec!["x".into()],
+            expect: None,
+            planner: false,
+            args: None,
+        };
+        let patch = PatchDoc { edit: vec![tests], add: vec![fix], drop: vec!["s1".into()] };
+        let merged = apply_patch(&steps, &patch, "r1_", &r).expect("no cycle is left");
+        let s3 = merged.iter().find(|s| s.id == "s3").unwrap();
+        let new = merged.iter().find(|s| s.id == "r1_1").unwrap();
+        assert_eq!(s3.depends_on, vec!["r1_1"], "the tests run after the fix, as the edit says");
+        assert!(new.depends_on.is_empty(), "the fix no longer waits for the tests that wait for it");
+        validate_plan(&merged, &r, &allowed(&r), &Budget::default()).expect("a valid plan");
     }
 
     #[test]

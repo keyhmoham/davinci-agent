@@ -54,6 +54,7 @@ fn cfg(base: String) -> DecisionConfig {
         timeout_ms: 3000,
         parallel: 1,
         kinds: vec![],
+        hosted: None,
     }
 }
 
@@ -77,8 +78,8 @@ async fn typed_answers_come_from_the_probability_mass_of_single_tokens() {
     let calls = seen.lock().unwrap().clone();
     assert_eq!(
         calls.len(),
-        11,
-        "task_type, complexity, needs_tools, risk, fresh_data, external_service, changes_state, conditional_change, smalltalk, feedback, role"
+        12,
+        "task_type, complexity, needs_tools, risk, fresh_data, asks_answer, external_service, changes_state, conditional_change, smalltalk, feedback, role"
     );
     let (auth, body) = &calls[0];
     assert_eq!(auth.as_deref(), Some("Bearer k1"));
@@ -89,7 +90,7 @@ async fn typed_answers_come_from_the_probability_mass_of_single_tokens() {
     assert!(calls.iter().all(|(_, b)| b["messages"][1]["content"].as_str().unwrap().starts_with("REQUEST: calculate 2 + 2\n\nQUESTION:")));
     // the decision is accounted as decision-model tokens
     let e = out.entry.expect("a ledger entry");
-    assert_eq!((e.component, e.prompt_tokens, e.completion_tokens), (Component::Decision, 550, 11));
+    assert_eq!((e.component, e.prompt_tokens, e.completion_tokens), (Component::Decision, 600, 12));
     assert_eq!(e.model, "qwen3:4b-instruct-2507-q4_K_M");
 }
 
@@ -163,7 +164,7 @@ async fn decisions_the_model_does_not_make_never_reach_it() {
     let d = Decider::new(Some(p), Arc::new(Calibrator::new()), Config::default().thresholds).with_model_kinds(&["route_task".to_string()]);
     d.route_task(DecisionState { request: "calculate 2+2".into(), ..Default::default() }).await;
     let before = seen.lock().unwrap().len();
-    assert_eq!(before, 11);
+    assert_eq!(before, 12);
     let m = d.select_mode(DecisionState { request: "x".into(), ..Default::default() }, ModeRequest::Auto).await;
     assert_eq!(m.record.provider, "local");
     assert_eq!(seen.lock().unwrap().len(), before);

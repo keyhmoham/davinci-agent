@@ -143,17 +143,18 @@ async fn a_big_output_is_read_locally_and_the_external_model_gets_what_matters()
     let r = rig_with(true);
     big_file(&r);
     r.planner.push(&brief("big.log"));
-    // the self-hosted model condenses the 600-line log for the planner's later steps
-    r.worker.push("line number 3 of the log with some words in it");
+    // the worker selects the lines of the 600-line log the planner's later steps need (by number: the lines go on verbatim)
+    r.worker.push(r#"{"lines": [3]}"#);
     r.planner.push("done");
     let t = run(&r, "Read big.log and summarise it", ModeRequest::Escalated).await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     let step = t.plan.as_ref().unwrap().step("s1").unwrap().clone();
     assert!(step.summary.as_deref().unwrap().starts_with("[condensed]"), "{:?}", step.summary);
-    assert!(r.worker.requests.lock().iter().any(|q| q.purpose == "condense"));
+    assert!(r.worker.requests.lock().iter().any(|q| q.purpose == "select"));
+    assert!(step.summary.as_deref().unwrap().contains("line number 3 "), "the selected line itself: {:?}", step.summary);
     // the paid reasoning step read the condensed text, not 600 lines
     let paid = r.planner.requests.lock().iter().find(|q| q.purpose == "step").unwrap().messages[0].content.clone();
     assert!(paid.matches("line number").count() <= 2, "{paid}");
-    // and a made-up number would have been refused: an answer that invents values is not a summary
+    // one call; and nothing in the summary that the log does not say
     assert_eq!(t.ledger.summary().worker_calls, 1);
 }

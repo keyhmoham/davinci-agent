@@ -39,12 +39,26 @@ fn majority(candidates: Vec<Map<String, Value>>) -> Option<Map<String, Value>> {
 /// A model that was told to reply with the file alone still wraps it in a code fence, or adds a sentence in front.
 pub(crate) fn strip_fences(text: &str) -> String {
     let t = text.trim();
-    if let Some(start) = t.find("```") {
-        let after = &t[start + 3..];
-        // skip the language tag on the fence line
-        let body = after.split_once('\n').map(|(_, b)| b).unwrap_or(after);
-        let inner = body.rsplit_once("```").map(|(b, _)| b).unwrap_or(body);
-        return inner.trim_matches('\n').to_string();
+    // Only a reply that IS one fenced block (optionally after a one-line "here is the file:" and before a one-line sign-off) is
+    // unwrapped. Fences inside the content — a README's code samples, a doc's examples — are the content, and are kept.
+    let lines: Vec<&str> = t.lines().collect();
+    let fences: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.trim_start().starts_with("```")).map(|(i, _)| i).collect();
+    if let (Some(&first), Some(&last)) = (fences.first(), fences.last())
+        && last > first
+    {
+        let before: Vec<&str> = lines[..first].iter().copied().filter(|l| !l.trim().is_empty()).collect();
+        let after: Vec<&str> = lines[last + 1..].iter().copied().filter(|l| !l.trim().is_empty()).collect();
+        let is_preamble = |l: &str| {
+            let l = l.trim();
+            let w = l.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+            !l.starts_with('#') && l.len() <= 160 && (l.ends_with(':') || matches!(w.as_str(), "here" | "sure" | "certainly" | "below" | "okay" | "ok"))
+        };
+        let wrapped_start = before.is_empty() || (before.len() <= 2 && before.iter().all(|l| is_preamble(l)));
+        let wrapped_end = after.is_empty() || (after.len() <= 2 && after.iter().all(|l| l.len() <= 160 && !l.trim_start().starts_with('#')));
+        if wrapped_start && wrapped_end {
+            return lines[first + 1..last].join("\n").trim_matches('\n').to_string();
+        }
+        return t.to_string();
     }
     // a sentence before a bare HTML document
     let lower = t.to_ascii_lowercase();
@@ -122,10 +136,58 @@ pub(crate) fn directory_named(step: &str, command: &str, workspace: &std::path::
     if command.trim_start().starts_with("cd ") || command.contains(" cd ") || command.contains("&& cd") {
         return None;
     }
+    // "the site directory", "the app folder": the name before the word
+    static NAMED_DIR: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r#"(?i)[`"']?([A-Za-z0-9_][A-Za-z0-9_./-]*)[`"']?\s+(?:directory|folder|dir)\b"#).unwrap());
     IN_DIR
         .captures_iter(step)
+        .chain(NAMED_DIR.captures_iter(step))
         .map(|c| c[1].trim_end_matches(['.', '/']).to_string())
         .find(|d| !d.is_empty() && !d.starts_with("..") && workspace.join(d).is_dir() && !command.contains(d.as_str()))
+}
+
+/// The numbers of a data file (`.csv`, `.tsv`) that appear in none of `sources`: values a model made up while "writing" data that had to
+/// be computed. Only numbers of three digits or more (or with decimals) count; two such numbers make it a finding.
+pub(crate) fn invented_numbers(path: &str, content: &str, sources: &[&str]) -> Vec<String> {
+    static NUM: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\b\d+(?:\.\d+)?\b").unwrap());
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "csv" | "tsv") {
+        return vec![];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for m in NUM.find_iter(content) {
+        let n = m.as_str();
+        let digits = n.chars().filter(|c| c.is_ascii_digit()).count();
+        if (digits >= 3 || n.contains('.')) && !sources.iter().any(|s| s.contains(n)) && !out.iter().any(|o| o == n) {
+            out.push(n.to_string());
+        }
+    }
+    if out.len() >= 2 {
+        out.truncate(5);
+        out
+    } else {
+        vec![]
+    }
+}
+
+/// `DFAE_EXTRACT_AUDIT=<file>`: for every string argument a step was bound with, one JSON line saying which extractor's entities hold
+/// the value (`gliner`, `rules`, `both`, `none`). It answers whether the semantic extractor earns its keep: how often it is the only
+/// source of a value that ends up in a tool call.
+fn audit_extraction(task: &str, step: &str, tool: &str, args: &Map<String, Value>, entities: &[Entity]) {
+    let Ok(path) = std::env::var("DFAE_EXTRACT_AUDIT") else { return };
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    for (k, v) in args {
+        let Some(v) = v.as_str().filter(|v| !v.is_empty() && v.len() <= 300) else { continue };
+        let holds = |src: &str| entities.iter().any(|e| e.source.contains(src) && !e.text.is_empty() && (v == e.text || v.contains(e.text.as_str())));
+        let source = match (holds("gliner"), holds("rules")) {
+            (true, true) => "both",
+            (true, false) => "gliner",
+            (false, true) => "rules",
+            _ => "none",
+        };
+        let _ = writeln!(f, "{}", serde_json::json!({"task": task, "step": step, "tool": tool, "arg": k, "value": v, "source": source}));
+    }
 }
 
 /// Some models end a reply with their own tool-call syntax (`</arg_value><arg_key>path</arg_key>…</tool_call>`): it is never part
@@ -134,6 +196,75 @@ pub(crate) fn strip_tool_markup(text: &str) -> String {
     const MARKS: [&str; 5] = ["</arg_value>", "<arg_key>", "<tool_call>", "</tool_call>", "<arg_value>"];
     let cut = MARKS.iter().filter_map(|m| text.find(m)).min().unwrap_or(text.len());
     text[..cut].trim_end().to_string()
+}
+
+/// The names a step gives (a product, a person, a place, a quoted title) that a prose or page file about them must mention: a README
+/// for "a tool called Brewster" that never says Brewster was written about something else, or is an empty shell. Only for prose and
+/// pages; code and config files name things in their own ways.
+pub(crate) fn missing_names(step: &str, path: &str, text: &str) -> Vec<String> {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if !matches!(ext.as_str(), "md" | "markdown" | "html" | "htm" | "txt" | "rst") || path.ends_with(".gitignore") {
+        return vec![];
+    }
+    const COMMON: &[&str] = &[
+        "README",
+        "Markdown",
+        "HTML",
+        "CSS",
+        "JSON",
+        "YAML",
+        "TOML",
+        "URL",
+        "API",
+        "UI",
+        "UX",
+        "SEO",
+        "FAQ",
+        "I",
+        "A",
+        "An",
+        "The",
+        "It",
+        "Write",
+        "Create",
+        "Add",
+        "Make",
+        "Use",
+        "Include",
+        "Python",
+        "JavaScript",
+        "TypeScript",
+        "Rust",
+        "Go",
+        "Node",
+        "React",
+        "Next",
+        "Tailwind",
+    ];
+    let lower = text.to_lowercase();
+    let mut names: Vec<String> = Vec::new();
+    // quoted titles
+    for part in step.split('"').skip(1).step_by(2) {
+        let p = part.trim();
+        if !p.is_empty() && p.len() <= 60 && !p.contains('/') && !p.contains('.') {
+            names.push(p.to_string());
+        }
+    }
+    // proper nouns: capitalised words that do not start a sentence
+    let unquoted: String = step.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+    let mut sentence_start = true;
+    for raw in unquoted.split_whitespace() {
+        let w = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        let starts = sentence_start;
+        sentence_start = raw.ends_with(['.', ':', '!', '?']);
+        if starts || w.len() < 3 || w.contains(['/', '.', '_']) || COMMON.contains(&w) {
+            continue;
+        }
+        if w.chars().next().is_some_and(|c| c.is_uppercase()) && w.chars().skip(1).any(|c| c.is_lowercase()) && !names.iter().any(|n| n == w) {
+            names.push(w.to_string());
+        }
+    }
+    names.into_iter().filter(|n| !lower.contains(&n.to_lowercase())).take(3).collect()
 }
 
 /// A long text stuck in a loop: one substantial line over and over (`*.egg-info` a hundred times), or a text that is mostly copies of
@@ -215,6 +346,9 @@ impl Inner {
                         latency_ms: res.latency_ms,
                         cached: res.cached,
                         origin: None,
+                        reasoning_tokens: 0,
+                        cache_write_tokens: 0,
+                        cost_usd: None,
                     },
                 )
                 .await;
@@ -366,6 +500,32 @@ impl Inner {
                 ));
             }
         }
+        // files the step or the request names that already exist (the sample a test counts the words of, the data a script reads): the
+        // content must agree with them, and a model that has not seen them guesses
+        let (goal, step_text) = {
+            let r = ctx.rec.lock().await;
+            (r.goal.clone(), r.plan.as_ref().and_then(|p| p.step(this_step)).map(|s| s.description.clone()).unwrap_or_default())
+        };
+        let mut named: Vec<String> = Vec::new();
+        for w in step_text.split_whitespace().chain(goal.split_whitespace()) {
+            let w = w.trim_matches(['`', '"', '\'', ',', '.', ':', ';', '(', ')']);
+            if w.contains('.') && !w.contains("..") && w != target && !paths.iter().any(|p| p == w) && !named.iter().any(|n| n == w) {
+                named.push(w.to_string());
+            }
+        }
+        for p in named.iter().filter(|p| self.policy.guard().read_path(p).is_ok_and(|f| f.is_file())).take(2) {
+            if let Ok(full) = self.policy.guard().read_path(p)
+                && std::fs::metadata(&full).is_ok_and(|m| m.len() <= 20_000)
+                && let Ok(text) = std::fs::read_to_string(full)
+                && !text.is_empty()
+            {
+                let cut: String = text.chars().take(1500).collect();
+                shown.push(dfae_core::safety::wrap_untrusted(
+                    &format!("file {p} (exists)"),
+                    &if cut.len() < text.len() { format!("{cut}\n… [file continues]") } else { cut },
+                ));
+            }
+        }
         if shown.is_empty() { String::new() } else { format!("RELATED FILES:\n{}", shown.join("\n")) }
     }
 
@@ -459,8 +619,11 @@ impl Inner {
         req.temperature = 0.2;
         let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
+        let missing = missing_names(&step.description, path, &text);
         let why = if degenerate(&text) {
             Some("it repeated the same lines".to_string())
+        } else if !missing.is_empty() {
+            Some(format!("it does not mention {}, which the step names: the file is about that", missing.join(", ")))
         } else {
             crate::syntax::problem(&self.policy.workspace().join(path), &text).await
         };
@@ -613,12 +776,41 @@ impl Inner {
         };
         // A file's content is written as plain text by a model, not squeezed into a JSON string (see `CONTENT_SYSTEM`); the
         // rules have already found the path.
+        // A page or document a planner's step describes ("a contact page for Petal Lane with a title, the address \"12 Market Street\" and
+        // opening hours") is not the one quoted fragment in that sentence: the rules bound the quote as the whole file (seen: a 28-byte
+        // contact page). The content writer writes it. (A request that gives the content itself — `create notes.txt with "hello"` —
+        // says little besides the quote, and keeps it.)
+        if meta.name == "fs_write"
+            && step.brief
+            && let (Some(path), Some(content)) = (args.get("path").and_then(|p| p.as_str()), args.get("content").and_then(|c| c.as_str()))
+            && matches!(path.rsplit('.').next().map(|e| e.to_ascii_lowercase()).as_deref(), Some("html" | "htm" | "md" | "markdown"))
+            && step.description.split_whitespace().count() > content.split_whitespace().count() + 12
+            && content.len() < 400
+        {
+            args.remove("content");
+        }
         if meta.name == "fs_write"
             && args.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty() && !p.contains("{{"))
             && args.get("content").and_then(|c| c.as_str()).is_none_or(|c| c.trim().is_empty())
             && !self.names_an_earlier_value(ctx, step)
             && let Some(text) = self.write_content(ctx, step, &args, deps, feedback).await
         {
+            // a data file whose numbers come from nowhere was typed, not computed: a model cannot add up 200 rows in its head
+            let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            let goal = ctx.rec.lock().await.goal.clone();
+            let mut sources: Vec<&str> = deps.iter().flat_map(|(_, _, summary, full)| [summary.as_str(), full.as_str()]).collect();
+            sources.extend([goal.as_str(), step.description.as_str()]);
+            let invented = invented_numbers(path, &text, &sources);
+            if !invented.is_empty() {
+                return Err(fail(
+                    ErrorKind::Other,
+                    format!(
+                        "the values written to {path} ({}) are in none of the step's inputs: values that have to be computed (totals, counts, \
+                         aggregates) are computed by a script — a shell step that reads the data and writes {path} — never typed",
+                        invented.join(", ")
+                    ),
+                ));
+            }
             args.insert("content".into(), Value::String(text));
             how.push(if self.step_tier_for_content(step) == Tier::Planner { "planner" } else { "worker" });
         }
@@ -717,6 +909,10 @@ impl Inner {
         }
 
         // "…in proj": a command that does not say where it runs, for a step that names a directory that exists, runs there
+        // (a cwd of "." says nothing: it is where a command runs anyway)
+        if tool == "shell" && args.get("cwd").and_then(|c| c.as_str()).is_some_and(|c| matches!(c.trim(), "" | "." | "./")) {
+            args.remove("cwd");
+        }
         if tool == "shell" && args.get("cwd").is_none() && meta.params.iter().any(|p| p.name == "cwd") {
             let command = args.get("command").and_then(|c| c.as_str()).unwrap_or("");
             if let Some(dir) = directory_named(&step.description, command, self.policy.workspace()) {
@@ -734,6 +930,7 @@ impl Inner {
                 how.push("rules");
             }
         }
+        audit_extraction(&ctx.id, &step.id, &tool, &args, &entities);
         done.kind = StepKind::Tool;
         done.tool = Some(tool.clone());
         done.args = Value::Object(args.clone());
@@ -820,6 +1017,27 @@ mod tests {
     }
 
     #[test]
+    fn computed_data_that_was_typed_is_caught() {
+        use super::invented_numbers;
+        let src = "order_id,region,units,unit_price\n1000,north,1,5\n1001,west,5,36";
+        assert_eq!(invented_numbers("totals.csv", "region,revenue\nnorth,2914\nwest,3068\n", &[src]), vec!["2914", "3068"]);
+        assert!(invented_numbers("copy.csv", "order_id,region\n1000,north\n1001,west\n", &[src]).is_empty(), "copied values are in the input");
+        assert!(invented_numbers("notes.md", "north 2914, west 3068", &[src]).is_empty(), "only data files");
+        assert!(invented_numbers("t.csv", "a,b\n1,2\n3,4\n", &[src]).is_empty(), "small numbers are not evidence");
+    }
+
+    #[test]
+    fn a_page_about_a_named_thing_must_name_it() {
+        let step = "Create README.md at the workspace root with a concise project description for Brewster, a tool that tracks coffee orders.";
+        assert_eq!(missing_names(step, "README.md", "git clone <repository-url>\ncd repo"), vec!["Brewster".to_string()]);
+        assert!(missing_names(step, "README.md", "# Brewster\nTracks coffee orders.").is_empty());
+        assert!(missing_names("write .gitignore for a Python project", ".gitignore", "__pycache__/").is_empty(), "config files are not checked");
+        assert!(missing_names("write src/main.rs that prints Hello", "src/main.rs", "fn main(){}").is_empty(), "code is not checked");
+        assert!(missing_names("Write site/index.html, a landing page about planet Earth", "site/index.html", "<html>earth</html>").is_empty());
+        assert_eq!(missing_names("write about.html titled \"Our Story\"", "about.html", "<h1>About</h1>"), vec!["Our Story".to_string()]);
+    }
+
+    #[test]
     fn the_answer_most_samples_agree_on_wins_and_ties_go_to_the_first() {
         let a = m(json!({"path": "a.txt"}));
         let b = m(json!({"path": "b.txt"}));
@@ -842,6 +1060,14 @@ mod content_tests {
         assert_eq!(strip_fences(&format!("Here is the page you asked for:\n{page}")), page);
         assert_eq!(strip_fences("```\nport = 1\n```"), "port = 1");
         assert_eq!(strip_fences("plain text file"), "plain text file");
+        // a README's own code samples are content, not a wrapper
+        let readme = "# Brewster\n\nTracks coffee orders.\n\n## Usage\n\n```bash\ngit clone https://example.com/brewster.git\ncd brewster\n```\n\nThen run it.";
+        assert_eq!(strip_fences(readme), readme);
+        let short = "# Brewster\nTracks orders.\n```bash\npip install brewster\n```";
+        assert_eq!(strip_fences(short), short, "a heading is content, never a preamble");
+        // a markdown file sent inside a fence keeps its own inner fences
+        assert_eq!(strip_fences(&format!("```markdown\n{readme}\n```")), readme);
+        assert_eq!(strip_fences(&format!("Here is README.md:\n```markdown\n{readme}\n```")), readme);
     }
 
     #[test]
@@ -910,6 +1136,12 @@ mod content_tests {
         assert_eq!(d("show the log in proj", "git -C proj log"), None);
         assert_eq!(d("run in the workspace root", "ls"), None);
         assert_eq!(d("list files in nowhere", "ls"), None, "a directory that is not there is no cwd");
+        assert_eq!(
+            d("Start a static HTTP server for the proj directory on 0.0.0.0 port 8000", "python3 -m http.server 8000").as_deref(),
+            Some("proj"),
+            "the name before the word"
+        );
+        assert_eq!(d("serve the workspace directory", "python3 -m http.server"), None);
     }
 
     #[test]

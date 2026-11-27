@@ -42,6 +42,77 @@ pub struct DecisionConfig {
     pub parallel: usize,
     /// Which decisions the model makes (`all` or a list of kinds); the rest use the built-in rules.
     pub kinds: Vec<String>,
+    /// A hosted Decisions API (`<base>/decisions`): `DECISION_PROVIDER=decisions`, or by default when no self-hosted model is
+    /// configured and the planner's key reaches Vercel AI Gateway. `None`: not used.
+    #[serde(default)]
+    pub hosted: Option<HostedDecisionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedDecisionConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+}
+
+/// The hosted Decisions API, if it is to be used: asked for (`DECISION_PROVIDER=decisions`), or the default when no self-hosted
+/// decision model is configured (`DECISION_BASE_URL` unset, `DECISION_PROVIDER` not `local`) and the planner's key reaches Vercel AI
+/// Gateway, which serves `openai/gpt-6-luna-decisions`. `DECISION_API_BASE_URL` / `DECISION_API_MODEL` / `DECISION_API_KEY` override.
+fn hosted_decisions(planner: &ModelConfig) -> Option<HostedDecisionConfig> {
+    let provider = env("DECISION_PROVIDER").map(|p| p.to_ascii_lowercase());
+    let asked = provider.as_deref() == Some("decisions");
+    let by_default = provider.is_none() && env("DECISION_BASE_URL").is_none() && planner.base_url.contains("ai-gateway.vercel.sh") && planner.api_key.is_some();
+    if !(asked || by_default) {
+        return None;
+    }
+    let base_url = env("DECISION_API_BASE_URL").unwrap_or_else(|| planner.base_url.clone());
+    let api_key = env("DECISION_API_KEY").or_else(|| (base_url == planner.base_url).then(|| planner.api_key.clone()).flatten());
+    Some(HostedDecisionConfig {
+        base_url,
+        model: env_or("DECISION_API_MODEL", "openai/gpt-6-luna-decisions"),
+        api_key,
+        timeout_ms: env_parse("DECISION_API_TIMEOUT_MS", 10_000),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+    pub dim: usize,
+}
+
+/// Measured on paraphrase retrieval (`dfae-memory/tests/embed_eval.rs`): recall@1 0.65 for the hash embedder, 0.95 for
+/// `text-embedding-3-small`, 1.00 for `voyage-4-lite` and `qwen3-embedding-0.6b` (the fastest of the two: 0.3 s against 5 s).
+fn embeddings(planner: &ModelConfig) -> Option<EmbeddingConfig> {
+    let model = env("DFAE_EMBEDDINGS");
+    if model.as_deref().is_some_and(|m| matches!(m.to_ascii_lowercase().as_str(), "hash" | "off" | "none")) {
+        return None;
+    }
+    let base_url = env("DFAE_EMBEDDINGS_BASE_URL").unwrap_or_else(|| planner.base_url.clone());
+    let api_key = env("DFAE_EMBEDDINGS_API_KEY").or_else(|| (base_url == planner.base_url).then(|| planner.api_key.clone()).flatten());
+    if model.is_none() && !(base_url.contains("ai-gateway.vercel.sh") && api_key.is_some()) {
+        return None;
+    }
+    let model = model.unwrap_or_else(|| "voyage/voyage-4-lite".into());
+    let known = match model.rsplit('/').next().unwrap_or("") {
+        "voyage-4-lite" | "voyage-4" | "voyage-4-large" | "voyage-3.5" | "voyage-3.5-lite" | "qwen3-embedding-0.6b" => Some(1024),
+        "text-embedding-3-small" | "text-embedding-ada-002" => Some(1536),
+        "text-embedding-3-large" => Some(3072),
+        "qwen3-embedding-4b" => Some(2560),
+        "qwen3-embedding-8b" => Some(4096),
+        _ => None,
+    };
+    let dim = env_parse("DFAE_EMBEDDINGS_DIM", known.unwrap_or(0));
+    if dim == 0 {
+        eprintln!("warning: DFAE_EMBEDDINGS_DIM is not set for {model}: semantic embeddings are off");
+        return None;
+    }
+    Some(EmbeddingConfig { base_url, model, api_key, dim })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +137,17 @@ pub struct ModelConfig {
     /// `<PREFIX>_REASONING_HARD`: the thinking effort when the model repairs something (a plan that hit a failure): debugging is the one
     /// job where thinking longer pays for itself. Default `medium` for the planner; unset for the worker (it keeps `reasoning`).
     pub reasoning_hard: Option<String>,
+    /// `<PREFIX>_PROVIDERS=a,b,c`: on Vercel AI Gateway, the upstream providers that may serve this model, in order of preference
+    /// (`providerOptions.gateway.order` and `only`). Keeps every call on providers with known weights (no quantised copies),
+    /// retention terms and latency, and on one provider's prompt cache. Empty: the gateway chooses. `any` clears a default.
+    #[serde(default)]
+    pub providers: Vec<String>,
+    /// `<PREFIX>_REASONING_SIMPLE` / `_COMPLEX`: the effort for a request the decision model scores simple (complexity < 0.25) or
+    /// complex (> 0.75); `_REASONING` is the effort in between. Planner only; `PLANNER_REASONING_ADAPTIVE=off` uses `_REASONING` always.
+    #[serde(default)]
+    pub reasoning_simple: Option<String>,
+    #[serde(default)]
+    pub reasoning_complex: Option<String>,
 }
 
 /// Where hosted models are reached unless a deployment says otherwise (an OpenAI-compatible gateway).
@@ -77,7 +159,17 @@ impl ModelConfig {
     /// A hosted model from `<PREFIX>_PROVIDER` (`openai` | `anthropic` | `none`; default `openai` once a key is set),
     /// `_BASE_URL`, `_MODEL`, `_API_KEY`, `_MAX_TOKENS`, `_CONTENT_MAX_TOKENS`, `_TIMEOUT_SECS`. The planner and the worker
     /// model are configured the same way.
-    fn from_env(prefix: &str, default_model: &str, max_tokens: u32, content_max_tokens: u32, timeout_secs: u64, reasoning: &str, hard: &str) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn from_env(
+        prefix: &str,
+        default_model: &str,
+        max_tokens: u32,
+        content_max_tokens: u32,
+        timeout_secs: u64,
+        reasoning: &str,
+        hard: &str,
+        providers: &str,
+    ) -> Self {
         let var = |k: &str| env(&format!("{prefix}_{k}"));
         let provider = var("PROVIDER").unwrap_or_else(|| if var("API_KEY").is_some() { "openai".into() } else { "none".into() });
         Self {
@@ -94,6 +186,19 @@ impl ModelConfig {
                 .map(|r| r.to_ascii_lowercase())
                 .filter(|r| r != "default" && !r.is_empty()),
             prompt_cache: var("PROMPT_CACHE").map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")),
+            reasoning_simple: None,
+            reasoning_complex: None,
+            providers: {
+                let model = var("MODEL").unwrap_or_else(|| default_model.into());
+                // the default list belongs to the default model: another model has other providers
+                let fallback = if model == default_model { providers } else { "" };
+                var("PROVIDERS")
+                    .unwrap_or_else(|| fallback.into())
+                    .split(',')
+                    .map(|p| p.trim().to_ascii_lowercase())
+                    .filter(|p| !p.is_empty() && p != "any")
+                    .collect()
+            },
         }
     }
 }
@@ -143,6 +248,24 @@ pub struct EconomyConfig {
     /// A big tool output is condensed by the self-hosted model into what matters for the task before the external
     /// model reads it (`DFAE_CONDENSE=off` keeps the mechanical summary).
     pub condense: bool,
+    /// After a verified task, the worker model names its durable facts for semantic memory (`DFAE_FACTS=off` disables it).
+    #[serde(default)]
+    pub facts: bool,
+    /// A failed step, or one whose result missed its expectation, gets one short tool loop by the worker model (the step agent) before
+    /// the planner is asked to patch the plan (`DFAE_STEP_AGENT=off` disables it; turns: `DFAE_STEP_AGENT_TURNS`, default 6). Measured:
+    /// re-plans -67%, planner calls -16%, total cost +7%, same success.
+    #[serde(default)]
+    pub step_agent: bool,
+    #[serde(default)]
+    pub step_agent_turns: u32,
+    /// The step agent prefers one script action over several tool actions (CodeAct; `DFAE_STEP_AGENT_STYLE=tools` turns it off).
+    /// Measured: same success (12/12), fix actions -50%, re-plans 8 -> 2, planner calls -45%, cost -47%.
+    #[serde(default)]
+    pub step_agent_script: bool,
+    /// Personal data (e-mail addresses, phone numbers, card numbers, IBANs) is replaced before text is kept for later — long-term
+    /// memory and the decision log (`DFAE_REDACT_PII=off` keeps it). What a user asks to remember explicitly is kept as said.
+    #[serde(default)]
+    pub redact_pii: bool,
 }
 
 /// Team orchestration and dispatch limits.
@@ -182,6 +305,15 @@ pub struct Config {
     pub workspace: PathBuf,
     pub policy_path: Option<PathBuf>,
     pub gliner_url: Option<String>,
+    /// The semantic embedding model of the memory (`DFAE_EMBEDDINGS`), next to the hash embedding every item has. Default: Voyage's
+    /// `voyage/voyage-4-lite` through Vercel AI Gateway when the planner's key reaches it; `hash` turns it off.
+    #[serde(default)]
+    pub embeddings: Option<EmbeddingConfig>,
+    /// A GLiNER service with a PII model (`DFAE_PII_NER_URL`, e.g. `urchade/gliner_multi_pii-v1`): person names and street addresses are
+    /// redacted from what is kept for later, besides the rule-based redaction. Measured on a held-out set at threshold 0.6: 14/14 found,
+    /// 0/12 lookalikes (products, companies, cities) touched.
+    #[serde(default)]
+    pub pii_ner_url: Option<String>,
     pub decision: DecisionConfig,
     pub worker: ModelConfig,
     pub planner: ModelConfig,
@@ -238,8 +370,17 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
-        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium");
-        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "off", "");
+        let mut planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium", "");
+        // the planner thinks as hard as the request needs (Ares-style adaptive effort); off: one effort for every plan
+        // off by default: measured, thinking less on simple requests made plans worse (14/20 vs 19/20, more re-plans, more planner tokens)
+        if matches!(env("PLANNER_REASONING_ADAPTIVE").as_deref(), Some("on" | "true" | "1")) {
+            let level = |k: &str, d: &str| Some(env(k).unwrap_or_else(|| d.into()).to_ascii_lowercase()).filter(|v| v != "default" && !v.is_empty());
+            planner.reasoning_simple = level("PLANNER_REASONING_SIMPLE", "none");
+            planner.reasoning_complex = level("PLANNER_REASONING_COMPLEX", "medium");
+        }
+        // GLM-5.3-Flash always thinks (it cannot be switched off): `low` is its least effort. Its providers: unquantised weights, zero data
+        // retention and no training on the data, the best tail latency (measured 2026-11-27 on the gateway's endpoint list).
+        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "low", "", "baseten,nebius,fireworks");
         // one gateway, one key: a worker with no key of its own uses the planner's when they share an endpoint
         if worker.api_key.is_none() && worker.base_url == planner.base_url && planner.api_key.is_some() {
             worker.api_key = planner.api_key.clone();
@@ -265,6 +406,8 @@ impl Config {
             workspace: PathBuf::from(env_or("DFAE_WORKSPACE", "./workspace")),
             policy_path: env("DFAE_POLICY").map(PathBuf::from),
             gliner_url: env("GLINER_URL"),
+            embeddings: embeddings(&planner),
+            pii_ner_url: env("DFAE_PII_NER_URL"),
             decision: DecisionConfig {
                 // `DECISION_PROVIDER=local` switches the model off even when a URL is set
                 base_url: env("DECISION_BASE_URL").filter(|_| env("DECISION_PROVIDER").map(|p| p != "local").unwrap_or(true)),
@@ -274,6 +417,7 @@ impl Config {
                 parallel: env_parse("DECISION_PARALLEL", 3),
                 // the model is self-hosted and free per token, so it makes every decision; narrow it to save latency
                 kinds: env_or("DECISION_KINDS", "all").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                hosted: hosted_decisions(&planner),
             },
             worker,
             planner,
@@ -303,6 +447,11 @@ impl Config {
                 answer_local_first: !matches!(env("DFAE_ANSWER_LOCAL_FIRST").as_deref(), Some("off" | "false" | "0")),
                 workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
                 condense: !matches!(env("DFAE_CONDENSE").as_deref(), Some("off" | "false" | "0")),
+                facts: !matches!(env("DFAE_FACTS").as_deref(), Some("off" | "false" | "0")),
+                step_agent: !matches!(env("DFAE_STEP_AGENT").as_deref(), Some("off" | "false" | "0")),
+                step_agent_turns: env_parse("DFAE_STEP_AGENT_TURNS", 6u32).clamp(1, 12),
+                step_agent_script: !matches!(env("DFAE_STEP_AGENT_STYLE").as_deref(), Some("tools" | "json")),
+                redact_pii: !matches!(env("DFAE_REDACT_PII").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),
@@ -327,7 +476,13 @@ impl Default for Config {
         let mut c = Self::from_env();
         c.database_url = None;
         c.gliner_url = None;
+        c.embeddings = None;
+        c.pii_ner_url = None;
+        // scripted models answer in order: a post-task call would take a reply meant for a later step
+        c.economy.facts = false;
+        c.economy.step_agent = false;
         c.decision.base_url = None;
+        c.decision.hosted = None;
         c.approvals = ApprovalMode::Ask; // the approval machinery is what the hermetic tests exercise
         c.worker.provider = "none".into();
         c.planner.provider = "none".into();

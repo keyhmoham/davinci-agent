@@ -10,11 +10,13 @@ mod context;
 mod embed;
 mod inmem;
 mod pg;
+mod remote;
 
 pub use context::*;
 pub use embed::{HashEmbedder, cosine};
 pub use inmem::InMemoryStore;
 pub use pg::PgStore;
+pub use remote::RemoteEmbedder;
 
 use dfae_core::*;
 use sha2::{Digest, Sha256};

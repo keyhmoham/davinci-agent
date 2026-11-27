@@ -269,7 +269,9 @@ async fn a_result_that_misses_the_planners_expectation_goes_back_to_the_external
     assert!(problem.contains("Re-plan with a patch"), "the re-plan rules are in the message, so one cached system prompt serves both: {problem}");
     assert!(problem.contains("does not meet what was expected") && problem.contains("status = BAD"), "the planner is told what was actually found: {problem}");
     assert_eq!(t.plan.as_ref().unwrap().step("s1").unwrap().status, StepStatus::Succeeded, "the result is kept, not thrown away");
-    assert!(t.final_answer.as_deref().unwrap().contains("status = fine"), "{:?}", t.final_answer);
+    // the request asks for a report: the answer is written from the evidence, not the raw file
+    let a = t.final_answer.as_deref().unwrap();
+    assert!(a.contains("fine") && a.contains("backup.toml"), "{a:?}");
 }
 
 #[tokio::test]
@@ -320,10 +322,13 @@ async fn when_the_decision_model_says_it_needs_planning_the_external_model_plans
     let r = oracle_rig_with_strong(vec![oracle("escalated")]);
     std::fs::write(r.ws.path().join("notes.txt"), "first line\nsecond line\n").unwrap();
     r.planner.push(&json!({"steps": [{"id": "s1", "do": "read notes.txt", "tool": "fs_read"}]}).to_string());
+    // the plan reads the file but has no step that states the answer: the worker writes it from the evidence
+    r.worker.push("The first line is: first line");
     let t = say(&r, "p", "tell me the first line of notes.txt").await;
     assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
     assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Planner);
     assert_eq!(r.planner.calls(), 1);
+    assert_eq!(t.final_answer.as_deref(), Some("The first line is: first line"));
 }
 
 #[tokio::test]
@@ -899,4 +904,177 @@ async fn an_answer_that_depends_on_what_the_world_looks_like_now_is_looked_up_ne
     let plan = t.plan.as_ref().expect("a plan");
     assert_eq!(plan.source, PlanSource::Quick, "not a chat reply");
     assert_eq!(plan.steps[0].tool.as_deref(), Some("web_search"), "{:?}", plan.steps);
+}
+
+#[tokio::test]
+async fn every_plan_request_shares_one_cacheable_prefix() {
+    // the system prompt and the schema are the provider's cached prefix: they must not change from task to task (a tool more or less,
+    // a step limit in a description, ... each is a full cache miss)
+    let r = rig(true, |_| {});
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read a.txt", "tool": "fs_read"}]}).to_string());
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "create the directory out", "tool": "fs_mkdir"}]}).to_string());
+    run_as(&r, ModeRequest::Escalated, "Read a.txt").await;
+    run_as(&r, ModeRequest::Escalated, "Create a directory called out").await;
+    let reqs: Vec<GenerationRequest> = r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("plan")).cloned().collect();
+    assert!(reqs.len() >= 2, "{} plan requests", reqs.len());
+    assert_eq!(reqs[0].system, reqs[1].system, "one system prompt for every task");
+    assert_eq!(reqs[0].schema, reqs[1].schema, "one schema for every task");
+    assert!(!reqs[0].schema.as_ref().unwrap().to_string().contains("at most 12"), "no per-task limit inside the schema");
+}
+
+#[tokio::test]
+async fn a_verified_task_leaves_its_durable_facts_and_a_newer_value_supersedes_the_old() {
+    let r = rig(true, |c| c.economy.facts = true);
+    let ask = |r: &Rig, port: &str| {
+        std::fs::write(r.ws.path().join("app.toml"), format!("[server]\nhost = \"app-3.internal\"\nport = {port}\n")).unwrap();
+        r.planner.push(&json!({"steps": [{"id": "s1", "do": "read app.toml", "tool": "fs_read"}]}).to_string());
+        // the worker's facts: one the file states, one it does not (never kept)
+        r.worker.push(
+            &json!({"facts": [
+                {"kind": "port", "subject": "app server", "value": port, "quote": format!("port = {port}")},
+                {"kind": "host", "subject": "app server", "value": "app-9.internal", "quote": "host = \"app-9.internal\""}
+            ]})
+            .to_string(),
+        );
+    };
+    ask(&r, "8443");
+    let t = run_as(&r, ModeRequest::Escalated, "Read app.toml").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let facts = |r: &Rig| {
+        let store = r.engine.store();
+        async move {
+            store
+                .retrieve(MemoryQuery { text: "port of app server".into(), kinds: vec![MemoryKind::Semantic], limit: 10, session_id: None })
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|m| m.item.metadata["source"] == "fact")
+                .collect::<Vec<_>>()
+        }
+    };
+    let mut first = Vec::new();
+    for _ in 0..50 {
+        first = facts(&r).await;
+        if !first.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(first.len(), 1, "only the fact the file states: {:?}", first.iter().map(|m| &m.item.text).collect::<Vec<_>>());
+    assert_eq!(first[0].item.text, "port of app server: 8443");
+    // the port changes: the newer fact supersedes the older
+    ask(&r, "9443");
+    run_as(&r, ModeRequest::Escalated, "Read app.toml").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let all = facts(&r).await;
+    let current: Vec<&String> = all.iter().filter(|m| m.item.metadata.get("superseded_by").is_none()).map(|m| &m.item.text).collect();
+    assert_eq!(current, vec!["port of app server: 9443"]);
+    assert!(all.iter().any(|m| m.item.text.ends_with("8443") && m.item.metadata.get("superseded_by").is_some()), "the old one is kept as history");
+}
+
+#[tokio::test]
+async fn a_failed_step_is_fixed_by_the_worker_with_tools_before_the_planner_is_asked() {
+    let r = rig(false, |c| c.economy.step_agent = true);
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "read data/input.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    // the step agent: write the missing file, then say it is fixed
+    r.worker.push(&json!({"action": "tool", "tool": "fs_write", "args": {"path": "data/input.txt", "content": "hello\n"}, "why": "create the missing input", "summary": null, "reason": null}).to_string());
+    r.worker.push(&json!({"action": "done", "tool": null, "args": null, "why": null, "summary": "created data/input.txt", "reason": null}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let plan = t.plan.as_ref().unwrap();
+    let ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["s1_fix1", "s1"], "the fix is recorded in the plan, before the step it fixed");
+    assert_eq!(plan.step("s1_fix1").unwrap().how.as_deref(), Some("step-agent"));
+    assert_eq!(plan.step("s1").unwrap().status, StepStatus::Succeeded);
+    assert_eq!(r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("replan")).count(), 0, "no planning round");
+    assert_eq!(t.usage.replans, 0);
+}
+
+#[tokio::test]
+async fn a_step_the_worker_cannot_fix_still_goes_to_the_planner() {
+    let r = rig(false, |c| c.economy.step_agent = true);
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "read data/input.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    r.worker
+        .push(&json!({"action": "give_up", "tool": null, "args": null, "why": null, "summary": null, "reason": "the file is not mine to create"}).to_string());
+    r.planner.push(&json!({"edit": [], "add": [{"id": "r1_1", "do": "list the workspace", "tool": "fs_list", "after": [], "expect": null, "planner": false}], "drop": ["s1"]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
+    assert_eq!(r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("replan")).count(), 1, "{:?}", t.error);
+}
+
+#[tokio::test]
+async fn a_result_that_misses_its_expectation_is_fixed_by_the_worker_before_the_planner_revisits() {
+    let r = rig(false, |c| c.economy.step_agent = true);
+    std::fs::create_dir_all(r.ws.path().join("site")).unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "list the directory site", "tool": "fs_list", "after": [], "expect": "site/index.html exists", "planner": false}]}).to_string());
+    r.worker.push(&json!({"action": "tool", "tool": "fs_write", "args": {"path": "site/index.html", "content": "<html><body>hi</body></html>"}, "why": "write the missing page", "summary": null, "reason": null}).to_string());
+    r.worker.push(&json!({"action": "done", "tool": null, "args": null, "why": null, "summary": "wrote site/index.html", "reason": null}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "List the site directory").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert!(t.plan.as_ref().unwrap().step("s1_fix1").is_some(), "the fix is in the plan");
+    assert_eq!(t.usage.replans, 0, "the expectation is met after the fix: no planning round");
+    assert!(r.ws.path().join("site/index.html").exists());
+}
+
+#[tokio::test]
+async fn the_planner_thinks_as_hard_as_the_request_needs_and_a_first_replan_keeps_the_plans_effort() {
+    let r = rig(false, |c| {
+        c.planner.reasoning = Some("low".into());
+        c.planner.reasoning_simple = Some("none".into());
+        c.planner.reasoning_complex = Some("medium".into());
+        c.planner.reasoning_hard = Some("high".into());
+    });
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read a.txt", "tool": "fs_read"}]}).to_string());
+    run_as(&r, ModeRequest::Escalated, "Read a.txt").await;
+    let reqs = r.planner.requests.lock().clone();
+    let plan = reqs.iter().find(|q| q.purpose == "plan").unwrap();
+    assert_eq!(plan.reasoning.as_deref(), Some("none"), "a one-step request: no thinking");
+    // a step that fails: the first re-plan thinks as much as the plan did (same cached prefix)
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read missing.txt", "tool": "fs_read"}]}).to_string());
+    r.planner.push(
+        &json!({"edit": [], "add": [{"id": "r1_1", "do": "read a.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}], "drop": ["s1"]})
+            .to_string(),
+    );
+    run_as(&r, ModeRequest::Escalated, "Read missing.txt").await;
+    let reqs = r.planner.requests.lock().clone();
+    let plan2 = reqs.iter().filter(|q| q.purpose == "plan").nth(1).unwrap();
+    let replan = reqs.iter().find(|q| q.purpose == "replan").expect("a re-plan");
+    assert_eq!(replan.reasoning, plan2.reasoning, "the first re-plan keeps the plan's effort");
+}
+
+#[tokio::test]
+async fn what_is_kept_for_later_is_kept_without_personal_data() {
+    let r = rig(false, |c| c.economy.redact_pii = true);
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read a.txt", "tool": "fs_read"}]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read a.txt and mail it to ana.lopez@example.com or call +44 20 7946 0958").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert!(t.goal.contains("ana.lopez@example.com"), "the task's own record keeps the request as the user wrote it");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let kept =
+        r.engine.store().retrieve(MemoryQuery { text: "read a.txt mail".into(), kinds: vec![MemoryKind::Episodic], limit: 5, session_id: None }).await.unwrap();
+    assert!(!kept.is_empty(), "the task left an episode");
+    for m in &kept {
+        assert!(!m.item.text.contains("ana.lopez") && !m.item.text.contains("7946"), "{}", m.item.text);
+        assert!(m.item.text.contains("[EMAIL]") && m.item.text.contains("[PHONE]"), "{}", m.item.text);
+    }
+}
+
+#[tokio::test]
+async fn a_page_the_planner_describes_is_written_whole_not_reduced_to_the_fragment_it_quotes() {
+    let r = rig(false, |_| {});
+    std::fs::create_dir_all(r.ws.path().join("shop")).unwrap();
+    r.planner.push(
+        &json!({"steps": [{"id": "s1", "tool": "fs_write", "do": "create shop/contact.html as a Petal Lane contact page with a clear page title, the shop address \"12 Market Street, London, UK\", opening hours from 9 to 5 and a link back to the home page", "after": [], "expect": null, "planner": false}]})
+            .to_string(),
+    );
+    let page = "<!DOCTYPE html><html><head><title>Contact — Petal Lane</title></head><body><h1>Contact Petal Lane</h1><p>12 Market Street, London, UK</p><p>Opening hours: 9 to 5</p><a href=\"index.html\">Home</a></body></html>";
+    r.worker.push(page);
+    let t = run_as(&r, ModeRequest::Escalated, "Add a contact page to the shop site").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let written = std::fs::read_to_string(r.ws.path().join("shop/contact.html")).unwrap();
+    assert_eq!(written, page, "the content writer wrote the page");
 }

@@ -20,9 +20,28 @@ static SCRIPT_STYLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>|<!--.*?-->").unwrap()
 });
 static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
+/// Elements a browser never shows: a page's hidden text is where an injection aimed at a model hides (a person reading the page
+/// never sees it, so it is never part of what the page says).
+static HIDDEN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    let hidden = r#"(?:display\s*:\s*none|visibility\s*:\s*hidden|\shidden\b|aria-hidden\s*=\s*["']?true|font-size\s*:\s*0(?:px)?\s*[;"'])"#;
+    let mut v: Vec<Regex> = ["p", "div", "span", "section", "li", "a", "td", "small", "font", "label", "article", "aside"]
+        .iter()
+        .map(|t| Regex::new(&format!(r"(?is)<{t}\b[^>]*{hidden}[^>]*>.*?</{t}\s*>")).unwrap())
+        .collect();
+    v.push(Regex::new(r"(?is)<template\b[^>]*>.*?</template\s*>").unwrap());
+    v
+});
+/// Block boundaries stay line breaks, so a reader (and a span selector) sees the page's lines.
+static BLOCKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)</?(?:p|div|h[1-6]|li|ul|ol|tr|table|section|article|header|footer|nav|main|aside|blockquote|pre|dt|dd)\b[^>]*>|<br\s*/?>").unwrap()
+});
 
 pub(crate) fn html_to_text(html: &str) -> String {
-    let t = SCRIPT_STYLE.replace_all(html, " ");
+    let mut t = SCRIPT_STYLE.replace_all(html, " ").into_owned();
+    for re in HIDDEN.iter() {
+        t = re.replace_all(&t, " ").into_owned();
+    }
+    let t = BLOCKS.replace_all(&t, "\n");
     let t = TAGS.replace_all(&t, " ");
     let t = t
         .replace("&nbsp;", " ")
@@ -32,7 +51,7 @@ pub(crate) fn html_to_text(html: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&#x27;", "'");
-    t.split_whitespace().collect::<Vec<_>>().join(" ")
+    t.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 pub(crate) struct Fetched {
@@ -61,6 +80,11 @@ pub(crate) async fn fetch(
         .map_err(|e| ToolError::other(e.to_string()))?;
     let mut url = url.to_string();
     for hop in 0..4 {
+        // the agent's own server (loopback, a serving port, the sandbox shell) may be asked directly — never reached by a redirect
+        let own = !trusted && policy.own_server(&url);
+        if own && hop > 0 {
+            return Err(ToolError::policy("a redirect to a local address is blocked"));
+        }
         if trusted {
             policy.public_host(&url).map_err(ToolError::policy)?;
         } else if let crate::policy::PolicyDecision::Deny(m) = policy.check(meta, &json!({"url": url}), false) {
@@ -73,7 +97,7 @@ pub(crate) async fn fetch(
             .await
             .map_err(|e| ToolError::new(ErrorKind::Transient, format!("DNS lookup failed for {host}: {e}")))?
             .collect();
-        if addrs.is_empty() || addrs.iter().any(|a| is_private_ip(&a.ip())) {
+        if addrs.is_empty() || (!own && addrs.iter().any(|a| is_private_ip(&a.ip()))) {
             return Err(ToolError::policy(format!("{host} resolves to a private or loopback address")));
         }
         let mut rb = client.get(parsed.clone());

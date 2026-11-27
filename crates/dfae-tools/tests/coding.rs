@@ -224,3 +224,21 @@ async fn the_default_shell_stays_a_restricted_allowlist() {
     let denied = e.run("shell", json!({"command": "echo hi | tr a-z A-Z"})).await;
     assert!(denied.is_err() || !denied.unwrap().content.contains("HI"), "no pipes without the sandbox mode");
 }
+
+#[tokio::test]
+async fn fs_edit_on_a_directory_renames_across_every_file_under_it() {
+    let e = sandbox();
+    e.write("src/cart.js", "function calcTotal(items) {}\nmodule.exports = { calcTotal };\n");
+    e.write("src/checkout.js", "const { calcTotal } = require('./cart');\nconst t = calcTotal([]);\n");
+    e.write("src/other.js", "nothing here\n");
+    e.write("src/node_modules/dep/index.js", "calcTotal\n");
+    e.write("test.js", "calcTotal outside src is not touched\n");
+    let ok = e.run("fs_edit", json!({"path": "src", "old_string": "calcTotal", "new_string": "computeTotal"})).await.unwrap();
+    assert!(ok.content.contains("2 file(s)") && ok.content.contains("4 replacement(s)"), "{}", ok.content);
+    assert!(!e.read("src/cart.js").contains("calcTotal") && !e.read("src/checkout.js").contains("calcTotal"));
+    assert_eq!(e.read("src/other.js"), "nothing here\n");
+    assert_eq!(e.read("src/node_modules/dep/index.js"), "calcTotal\n", "vendored code is skipped");
+    assert!(e.read("test.js").contains("calcTotal"), "only the directory given is changed");
+    let none = e.run("fs_edit", json!({"path": "src", "old_string": "calcTotal", "new_string": "x"})).await.unwrap_err();
+    assert!(none.message.contains("not found in any file"), "{}", none.message);
+}

@@ -57,6 +57,13 @@ pub(crate) struct TaskCtx {
     pub mcp_hidden: Mutex<HashSet<String>>,
     /// A conversational reply said the request needs a task (a lookup, a command): the pipeline then runs it as one.
     pub reroute: std::sync::atomic::AtomicBool,
+    /// Steps the step agent has already tried to fix (one loop per step).
+    pub fixed: Mutex<HashSet<String>>,
+    /// How hard the planner thinks for this task (from the request's complexity), and how many re-planning rounds it has had.
+    pub planner_effort: Mutex<Option<String>>,
+    pub planner_rounds: std::sync::atomic::AtomicU32,
+    /// How many actions were held back for the user (`ErrorKind::Withheld`).
+    pub withheld: std::sync::atomic::AtomicU32,
 }
 
 impl TaskCtx {
@@ -78,6 +85,10 @@ impl TaskCtx {
             mcp: Mutex::new(HashSet::new()),
             mcp_hidden: Mutex::new(HashSet::new()),
             reroute: std::sync::atomic::AtomicBool::new(false),
+            fixed: Mutex::new(HashSet::new()),
+            planner_effort: Mutex::new(None),
+            planner_rounds: std::sync::atomic::AtomicU32::new(0),
+            withheld: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -102,6 +113,9 @@ pub(crate) struct ContextBase {
     pub artifacts: Vec<(String, String, String)>,
     /// Results of the agents this one depends on `(label, summary)`.
     pub upstream: Vec<(String, String)>,
+    /// A verified plan for a request like this one in meaning but not in shape (so it cannot replay): shown to the planner as a worked
+    /// example to adapt (cf. agentic plan caching).
+    pub template: Option<String>,
 }
 
 pub(crate) struct Inner {
@@ -123,6 +137,9 @@ pub(crate) struct Inner {
     pub shadow: [std::sync::atomic::AtomicU64; 3],
     /// MCP servers: set once at startup, when any are configured or discoverable.
     pub mcp: std::sync::OnceLock<Arc<dfae_mcp::McpHub>>,
+    /// A span model for personal data (a GLiNER service with a PII model, `DFAE_PII_NER_URL`): names and street addresses, which no
+    /// rule catches, are taken out of what is kept for later.
+    pub pii_ner: std::sync::OnceLock<Arc<dyn EntityExtractor>>,
     /// The versions of the runtimes the shell has (`node v26…, python 3.13…`), asked once.
     pub runtimes: tokio::sync::OnceCell<String>,
 }
@@ -174,6 +191,7 @@ pub struct StatsReport {
 
 impl Engine {
     pub fn new(deps: EngineDeps) -> Self {
+        let prefix_policy = crate::economy::prefix::PrefixPolicy::for_model(&deps.config.planner.model);
         Self {
             inner: Arc::new(Inner {
                 dispatcher: Dispatcher::new(&deps.config.team),
@@ -188,15 +206,20 @@ impl Engine {
                 bus: EventBus::new(),
                 live: Mutex::new(HashMap::new()),
                 prefix_misses: std::sync::atomic::AtomicU32::new(0),
-                prefix_policy: Mutex::new(Default::default()),
+                prefix_policy: Mutex::new(prefix_policy),
                 shadow: Default::default(),
                 mcp: std::sync::OnceLock::new(),
+                pii_ner: std::sync::OnceLock::new(),
                 runtimes: tokio::sync::OnceCell::new(),
             }),
         }
     }
 
     /// Give the engine its MCP servers (once).
+    pub fn set_pii_ner(&self, ner: Arc<dyn EntityExtractor>) {
+        let _ = self.inner.pii_ner.set(ner);
+    }
+
     pub fn set_mcp(&self, hub: Arc<dfae_mcp::McpHub>) {
         let _ = self.inner.mcp.set(hub);
     }
@@ -644,9 +667,22 @@ impl Inner {
 
     /// Generate text on a tier with budget + ledger accounting. A worker model that cannot be reached (after the provider layer's
     /// own retries) does not stop the task: the planner model does the work instead, and the log says so.
+    /// How long the task may still run: a model call never outlives the task's time budget (a provider that stalls, retried three
+    /// times, would otherwise hold a task far past it — seen: 900 s in `Recovering` with every step done).
+    pub(crate) async fn time_left(&self, ctx: &Arc<TaskCtx>) -> std::time::Duration {
+        let r = ctx.rec.lock().await;
+        let elapsed = (Utc::now() - r.created_at).num_seconds().max(0) as u64;
+        std::time::Duration::from_secs(r.budget.max_seconds.saturating_sub(elapsed).max(5))
+    }
+
     pub(crate) async fn generate_text(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<String, String> {
         self.take_model_call(ctx, tier, 1).await?;
-        match self.models.generate(tier, req.clone()).await {
+        let left = self.time_left(ctx).await;
+        let first = match tokio::time::timeout(left, self.models.generate(tier, req.clone())).await {
+            Ok(r) => r,
+            Err(_) => return Err(format!("time budget exceeded during a {tier:?} call")),
+        };
+        match first {
             Ok(g) => {
                 self.add_ledger(ctx, g.entry.clone()).await;
                 Ok(g.text)
@@ -664,7 +700,10 @@ impl Inner {
 
     pub(crate) async fn gen_json(&self, ctx: &Arc<TaskCtx>, tier: Tier, req: GenerationRequest) -> Result<Value, String> {
         self.take_model_call(ctx, tier, 1).await?;
-        let (result, calls) = self.models.generate_json(tier, req).await;
+        let left = self.time_left(ctx).await;
+        let Ok((result, calls)) = tokio::time::timeout(left, self.models.generate_json(tier, req)).await else {
+            return Err(format!("time budget exceeded during a {tier:?} call"));
+        };
         if calls.len() > 1 {
             self.take_model_call(ctx, tier, (calls.len() - 1) as u32).await.ok();
         }

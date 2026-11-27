@@ -17,6 +17,8 @@ pub struct OpenAiCompat {
     /// Cleared the first time the server rejects the non-standard request fields (`reasoning`, `frequency_penalty`): later calls omit them.
     extras_ok: std::sync::atomic::AtomicBool,
     pinged_ok: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Vercel AI Gateway: the upstream providers allowed to serve the model, in order (`providerOptions.gateway`).
+    providers: Vec<String>,
 }
 
 impl OpenAiCompat {
@@ -35,7 +37,16 @@ impl OpenAiCompat {
             schema_ok: true.into(),
             extras_ok: true.into(),
             pinged_ok: Default::default(),
+            providers: Vec::new(),
         }
+    }
+
+    /// On Vercel AI Gateway, serve the model only from these upstream providers, in this order. Ignored by other servers.
+    pub fn with_providers(mut self, providers: &[String]) -> Self {
+        if self.base.contains("ai-gateway.vercel.sh") {
+            self.providers = providers.to_vec();
+        }
+        self
     }
 
     /// Declare whether this server bills a repeated prompt prefix at a fraction.
@@ -67,6 +78,9 @@ impl LanguageModel for OpenAiCompat {
             "temperature": req.temperature,
             "stream": false,
         });
+        if !self.providers.is_empty() {
+            body["providerOptions"] = json!({"gateway": {"order": self.providers, "only": self.providers}});
+        }
         let extras = self.extras_ok.load(std::sync::atomic::Ordering::Relaxed);
         if extras && req.frequency_penalty > 0.0 {
             body["frequency_penalty"] = json!(req.frequency_penalty);
@@ -151,6 +165,11 @@ impl LanguageModel for OpenAiCompat {
                 prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
                 cached_tokens: v["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+                cached_reported: v["usage"]["prompt_tokens_details"]["cached_tokens"].is_u64(),
+                // Vercel AI Gateway reports cache writes, reasoning and the call's cost in USD; OpenAI reports reasoning
+                cache_write_tokens: v["usage"]["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                reasoning_tokens: v["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+                cost_usd: v["usage"]["cost"].as_f64(),
             };
             return Ok(GenerationResponse { text, usage, model: v["model"].as_str().unwrap_or(&self.model).to_string() });
         }
@@ -227,5 +246,19 @@ impl LanguageModel for OpenAiCompat {
             }
             None => Ok(()), // not a listing we understand: do not guess
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_pinning_is_sent_only_to_vercel_ai_gateway() {
+        let p = vec!["baseten".to_string(), "nebius".to_string()];
+        let gw = OpenAiCompat::new("https://ai-gateway.vercel.sh/v1", "glm-5.3-flash", None, Duration::from_secs(5)).with_providers(&p);
+        assert_eq!(gw.providers, p);
+        let other = OpenAiCompat::new("http://localhost:11434/v1", "qwen3", None, Duration::from_secs(5)).with_providers(&p);
+        assert!(other.providers.is_empty(), "another server would reject the unknown field");
     }
 }

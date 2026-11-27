@@ -78,6 +78,10 @@ pub struct NetworkPolicy {
     pub open_web: bool,
     pub max_response_bytes: usize,
     pub timeout_secs: u64,
+    /// Ports on this machine where the agent's own servers run (the ones its plans start a server on). With the sandbox shell,
+    /// `http_get` may ask `localhost` / `127.0.0.1` on these ports and no others: checking a site it built is not SSRF, the engine's
+    /// API, the database and every other local service stay out of reach. Empty: loopback is always blocked.
+    pub own_server_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -180,6 +184,7 @@ impl Default for NetworkPolicy {
             open_web: false,
             max_response_bytes: 256 * 1024,
             timeout_secs: 15,
+            own_server_ports: (8000..=8010).collect(),
         }
     }
 }
@@ -390,7 +395,25 @@ impl PolicyEngine {
         Ok(host)
     }
 
+    /// A URL of one of the agent's own servers: loopback, on a port where its plans serve, with the sandbox shell (where those
+    /// servers run). Only plain `http`, no credentials.
+    pub fn own_server(&self, url: &str) -> bool {
+        if self.cfg.shell.mode != ShellMode::Sandbox {
+            return false;
+        }
+        let Some(rest) = url.strip_prefix("http://") else { return false };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        if authority.contains('@') {
+            return false;
+        }
+        let Some((host, port)) = authority.rsplit_once(':') else { return false };
+        matches!(host, "localhost" | "127.0.0.1" | "0.0.0.0") && port.parse::<u16>().is_ok_and(|p| self.cfg.network.own_server_ports.contains(&p))
+    }
+
     fn check_url(&self, url: &str, tainted: bool) -> PolicyDecision {
+        if self.own_server(url) {
+            return PolicyDecision::Allow;
+        }
         let host = match self.public_host(url) {
             Ok(h) => h,
             Err(e) => return PolicyDecision::Deny(e),
@@ -587,6 +610,32 @@ mod tests {
             assert!(matches!(e.check(&meta("fs_read"), &serde_json::json!({"path": p}), false), PolicyDecision::Deny(_)), "{p}");
         }
         assert_eq!(e.check(&meta("fs_read"), &serde_json::json!({"path": "notes/a.txt"}), false), PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn the_agents_own_servers_may_be_asked_and_nothing_else_on_this_machine() {
+        let mut cfg = PolicyConfig::default();
+        cfg.network.open_web = true;
+        let allowlist = PolicyEngine::new(cfg.clone(), std::env::temp_dir());
+        assert!(!allowlist.own_server("http://localhost:8000/"), "only with the sandbox shell, where the agent's servers run");
+        cfg.shell.mode = ShellMode::Sandbox;
+        let p = PolicyEngine::new(cfg, std::env::temp_dir());
+        for ok in ["http://localhost:8000/", "http://127.0.0.1:8010/about.html", "http://0.0.0.0:8003"] {
+            assert!(p.own_server(ok), "{ok}");
+        }
+        for no in [
+            "http://localhost:8080/v1/tasks",
+            "http://127.0.0.1:5432",
+            "http://localhost/",
+            "https://localhost:8000/",
+            "http://u:p@localhost:8000/",
+            "http://10.0.0.5:8000/",
+        ] {
+            assert!(!p.own_server(no), "{no}");
+        }
+        let get = |u: &str| p.check(&meta("http_get"), &serde_json::json!({"url": u}), false);
+        assert_eq!(get("http://localhost:8001/"), PolicyDecision::Allow);
+        assert!(matches!(get("http://localhost:8080/"), PolicyDecision::Deny(_)), "the engine's own API stays out of reach");
     }
 
     #[test]

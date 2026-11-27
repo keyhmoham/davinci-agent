@@ -418,6 +418,9 @@ impl Inner {
                     latency_ms: latency,
                     cached,
                     origin: None,
+                    reasoning_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost_usd: None,
                 },
             )
             .await;
@@ -518,7 +521,10 @@ impl Inner {
             })
             .await
             .unwrap_or_default();
-        let ranked: Vec<_> = dedupe_memories(rank_memories(cands, entities)).into_iter().filter(|m| m.similarity >= 0.2).take(6).collect();
+        // a fact a newer one replaced is history, not knowledge; a lesson that has hurt more than it helped is retired
+        let retired = |md: &serde_json::Value| md["harmful"].as_u64().unwrap_or(0) >= md["helpful"].as_u64().unwrap_or(0) + 2;
+        let cands: Vec<ScoredMemory> = cands.into_iter().filter(|c| c.item.metadata.get("superseded_by").is_none() && !retired(&c.item.metadata)).collect();
+        let ranked: Vec<_> = dedupe_memories(rank_memories(cands, entities)).into_iter().filter(|m| m.relevant()).take(6).collect();
         let refs: Vec<RetrievedRef> = ranked
             .iter()
             .map(|m| RetrievedRef {
@@ -550,7 +556,7 @@ impl Inner {
             .map(|l| l.upstream.iter().map(|u| (u.label.clone(), u.summary.clone())).collect())
             .unwrap_or_default();
         let artifacts = session::artifacts_from(history);
-        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, artifacts, upstream };
+        *ctx.base_ctx.lock() = ContextBase { memories: ranked, prior_turns: prior, turns, artifacts, upstream, template: None };
         if profile != ContextProfile::Minimal {
             ctx.rec.lock().await.retrieved = refs.clone();
             self.emit(ctx, EventKind::Retrieval { items: refs }).await;
@@ -583,7 +589,6 @@ impl Inner {
             vec![]
         };
         // every context token is billed (planner and worker alike): the profile follows the request's complexity
-        let _ = tier;
         let profile = r.request.profile.unwrap_or(match r.route.as_ref().map(|x| x.complexity).unwrap_or(0.3) {
             c if c >= 0.65 => ContextProfile::Reasoning,
             c if c < 0.25 => ContextProfile::Minimal,
@@ -599,6 +604,12 @@ impl Inner {
             profile,
         });
         let mut text = pkg.render();
+        if tier == Tier::Planner
+            && let Some(t) = &base.template
+        {
+            text.push('\n');
+            text.push_str(t);
+        }
         // what "it", "that code" and "the page above" can refer to, by name: a step uses `{{prev_code}}`, nobody copies the code
         if !base.artifacts.is_empty() {
             let list = base.artifacts.iter().map(|(n, _, d)| format!("{n} = {d}")).collect::<Vec<_>>().join("; ");
@@ -607,13 +618,49 @@ impl Inner {
         text
     }
 
+    /// A verified plan for a request close in meaning but not in shape (a paraphrase, the same job on other things): it cannot replay,
+    /// but the planner is shown it as a worked example to adapt (cf. agentic plan caching). Only a skill that has worked more often
+    /// than not, and only a close semantic match (measured: right matches 0.54-1.0, wrong ones up to 0.62).
+    async fn find_template(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) {
+        if ctx.base_ctx.lock().template.is_some() {
+            return;
+        }
+        let masked = skills::mask_request(goal, &skills::slot_values(goal, entities));
+        let Ok(cands) = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 3, session_id: None }).await else {
+            return;
+        };
+        for c in cands.into_iter().filter(|c| c.semantic && c.similarity >= 0.65) {
+            let Some(skill) = c.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) else { continue };
+            if skill.successes <= skill.failures {
+                continue;
+            }
+            let steps: Vec<String> = skill
+                .template
+                .steps
+                .iter()
+                // a slot is shown as <name>: `{{slot:x}}` looks like a value the plan could use by name
+                .map(|s| {
+                    let d = tokens::truncate_tokens(&s.description, 40).replace("{{slot:", "<").replace("}}", ">");
+                    format!("{} {}: {d}", s.id, s.tool.as_deref().unwrap_or("reasoning"))
+                })
+                .collect();
+            ctx.base_ctx.lock().template = Some(format!(
+                "A PLAN THAT WORKED FOR A SIMILAR REQUEST (\"{}\"; adapt it to this request — its values are not this request's): {}",
+                tokens::truncate_tokens(&skill.masked_request, 40),
+                steps.join("; ")
+            ));
+            return;
+        }
+    }
+
     async fn find_skill(&self, ctx: &Arc<TaskCtx>, goal: &str, entities: &[Entity]) -> Option<SkillMatch> {
         let slots = skills::slot_values(goal, entities);
         let masked = skills::mask_request(goal, &slots);
         let masked_now = masked.clone();
         let cands = self.store.retrieve(MemoryQuery { text: masked, kinds: vec![MemoryKind::Procedural], limit: 3, session_id: None }).await.ok()?;
         for c in cands {
-            if c.similarity < self.cfg.thresholds.skill_min_similarity {
+            // a skill replays on a request of the same shape: the wording, not only the meaning (the candidates are found by meaning)
+            if c.shape_similarity < self.cfg.thresholds.skill_min_similarity {
                 continue;
             }
             let Some(skill) = c.item.metadata.get("skill").and_then(|v| serde_json::from_value::<skills::Skill>(v.clone()).ok()) else { continue };
@@ -648,6 +695,20 @@ impl Inner {
         // writes files with shell heredocs. The decision layer picks tools only for what the worker system does alone.
         let quick = mode == ExecMode::Assisted && has_planner && !is_member;
         let planner_plans = has_planner && !quick;
+        if planner_plans {
+            self.find_template(ctx, goal, entities).await;
+            // how hard the planner thinks: as hard as the request is (the decision model's complexity score)
+            let complexity = ctx.rec.lock().await.route.as_ref().map(|r| r.complexity).unwrap_or(0.5);
+            let p = &self.cfg.planner;
+            let effort = if complexity < 0.25 {
+                p.reasoning_simple.clone().or_else(|| p.reasoning.clone())
+            } else if complexity > 0.75 {
+                p.reasoning_complex.clone().or_else(|| p.reasoning.clone())
+            } else {
+                p.reasoning.clone()
+            };
+            *ctx.planner_effort.lock() = effort;
+        }
         let (allowed, top_tool): (Vec<String>, Option<String>) = if planner_plans {
             (self.scoped_metas(ctx).into_iter().map(|m| m.name).collect(), None)
         } else {
@@ -925,25 +986,40 @@ impl Inner {
         purpose: &str,
     ) -> GenerationRequest {
         let eco = &self.cfg.economy;
-        let mut names: Vec<String> = self.tools.names().into_iter().filter(|n| ctx.in_scope(n)).collect();
-        names.sort();
-        // the whole catalogue is always in the system prompt; with a provider that caches prompts and traffic that keeps the cache
-        // warm, the worked examples ride along too and the prompt is marked cacheable
+        // The system prompt and the schema are the provider's cached prefix: they list every native tool, whatever this task's scope,
+        // so every task shares one cache line (one tool more or less in either is a full cache miss: measured 4.7x the cost of the call).
+        // What differs — an MCP server's tools attached to this task, native tools outside its scope — is said in the request.
+        let mut native: Vec<String> = self.tools.names().into_iter().filter(|n| dfae_mcp::server_of(n).is_none()).collect();
+        native.sort();
+        let mut extra: Vec<String> = self.tools.names().into_iter().filter(|n| dfae_mcp::server_of(n).is_some() && ctx.in_scope(n)).collect();
+        extra.sort();
+        let unavailable: Vec<&String> = native.iter().filter(|n| !ctx.in_scope(n)).collect();
+        // with a provider that caches prompts and traffic that keeps the cache warm, the worked examples ride along too
         let cached = self.prefix_enabled();
-        let system = prompts::brief_system(eco.plan_report, self.shell_environment(false), &self.tools.catalog_lines(&names), cached);
-        let user = match replan {
+        let system = prompts::brief_system(eco.plan_report, self.shell_environment(false), &self.tools.catalog_lines(&native), cached);
+        let mut user = match replan {
             None => prompts::plan_request(ctx_text, max_steps),
             Some((state, problem, prefix)) => prompts::patch_request(ctx_text, state, problem, prefix, max_steps),
         };
+        if !extra.is_empty() {
+            user.push_str(&format!("\nEXTRA TOOLS (this task only):\n{}", self.tools.catalog_lines(&extra)));
+        }
+        if !unavailable.is_empty() {
+            user.push_str(&format!("\nNOT AVAILABLE IN THIS TASK: {}", unavailable.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")));
+        }
+        let names: Vec<String> = native.iter().chain(extra.iter()).cloned().collect();
         let mut req = self.gen_request(Tier::Planner, &system, user, purpose);
         req.json = true;
-        req.schema = Some(if replan.is_some() {
-            crate::plandoc::patch_schema(&names, max_steps)
-        } else {
-            crate::plandoc::plan_schema(&names, max_steps, eco.plan_report)
-        });
+        req.schema = Some(if replan.is_some() { crate::plandoc::patch_schema(&names) } else { crate::plandoc::plan_schema(&names, eco.plan_report) });
         req.schema_strict = true;
         req.cache = cached;
+        // the plan thinks as hard as the request needs; the first re-plan thinks the same (it shares the plan's cache line: effort is
+        // part of the cached prefix), a second one harder
+        let chosen = ctx.planner_effort.lock().clone();
+        if let Some(effort) = chosen {
+            let rounds = ctx.planner_rounds.load(std::sync::atomic::Ordering::Relaxed);
+            req.reasoning = if replan.is_some() && rounds >= 2 { self.cfg.planner.reasoning_hard.clone().or(Some(effort)) } else { Some(effort) };
+        }
         req
     }
 
@@ -953,6 +1029,10 @@ impl Inner {
     async fn finish_plan(&self, ctx: &Arc<TaskCtx>, mut steps: Vec<Step>, goal: &str, expect_effect: bool) -> Result<Vec<Step>, Vec<String>> {
         self.repair_plan_args(ctx, &mut steps, goal).await;
         self.admit_readonly_tools(ctx, &steps).await;
+        let split = planner::split_multi_file_steps(&mut steps, self.policy.workspace());
+        if !split.is_empty() {
+            self.emit(ctx, EventKind::Repaired { step_id: "plan".into(), note: split.join("; ") }).await;
+        }
         let mut dropped = planner::prune_unknown_deps(&mut steps);
         // what the planner forgot to order, code knows: a step that uses a file waits for the step that writes it
         let ordered = planner::infer_dependencies(&mut steps, &self.tools);
@@ -1162,7 +1242,8 @@ impl Inner {
             && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
         {
             use std::io::Write;
-            let _ = writeln!(f, "{}", crate::shadow::log_line(&ctx.id, &state.request, agree, total, &diffs));
+            let request = if self.cfg.economy.redact_pii { dfae_core::safety::redact_pii(&state.request) } else { state.request.clone() };
+            let _ = writeln!(f, "{}", crate::shadow::log_line(&ctx.id, &request, agree, total, &diffs));
         }
     }
 
@@ -1220,10 +1301,43 @@ impl Inner {
             );
             let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.8);
             it.metadata = json!({"source": "lesson", "task_id": prev.task_id, "feedback": "negative"});
-            let _ = self.store.store(it).await;
+            let _ = self.store.store(self.keep(it).await).await;
         }
         let _ = self.store.kv_set("calibration", self.decider.calibrator.snapshot()).await;
         self.export_decisions(prev, if good { "confirmed_by_user" } else { "rejected_by_user" });
+    }
+
+    /// What is kept for later is kept without personal data (`EconomyConfig::redact_pii`).
+    async fn keep(&self, mut it: MemoryItem) -> MemoryItem {
+        if self.cfg.economy.redact_pii {
+            it.text = self.redact(&it.text).await;
+            for e in &mut it.entities {
+                e.text = dfae_core::safety::redact_pii(&e.text);
+            }
+        }
+        it
+    }
+
+    /// Personal data out of a text: the rules (e-mail addresses, phone numbers, cards, IBANs), then — with a PII span model —
+    /// person names and street addresses. A model that cannot be reached leaves the rules' result.
+    pub(crate) async fn redact(&self, text: &str) -> String {
+        let mut out = dfae_core::safety::redact_pii(text);
+        if let Some(ner) = self.pii_ner.get()
+            && let Ok(res) = ner.extract(ExtractionRequest { text: out.clone(), labels: vec!["person".into(), "street address".into()], threshold: 0.6 }).await
+        {
+            let mut spans: Vec<(String, &str)> = res
+                .entities
+                .iter()
+                .filter(|e| e.text.chars().count() >= 2)
+                .map(|e| (e.text.clone(), if e.label == "person" { "[NAME]" } else { "[ADDRESS]" }))
+                .collect();
+            // longest first, so "Anna Becker" goes before "Anna"
+            spans.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+            for (t, placeholder) in spans {
+                out = out.replace(&t, placeholder);
+            }
+        }
+        out
     }
 
     /// One JSON line per decision of a task, with what became of it (when a log file is configured).
@@ -1232,11 +1346,64 @@ impl Inner {
         let Some(path) = &self.cfg.decision_log else { return };
         let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
         for d in &rec.decisions {
+            let goal = if self.cfg.economy.redact_pii { dfae_core::safety::redact_pii(&rec.goal) } else { rec.goal.clone() };
             let line = json!({
-                "task_id": rec.task_id, "goal": rec.goal, "kind": d.kind, "provider": d.provider, "answers": d.answers,
+                "task_id": rec.task_id, "goal": goal, "kind": d.kind, "provider": d.provider, "answers": d.answers,
                 "outcome": outcome, "status": rec.status, "mode": rec.mode, "ts": d.ts,
             });
             let _ = writeln!(f, "{line}");
+        }
+    }
+
+    /// The memory write path: facts of a verified task, verified against its evidence, a newer value superseding an older one.
+    async fn learn_facts(&self, rec: &TaskRecord) {
+        let sources = crate::facts::sources(rec, 2500);
+        let user = dfae_core::safety::wrap_untrusted("task", &tokens::truncate_tokens(&sources, 3000));
+        let mut req = self.gen_request(Tier::Worker, crate::facts::FACTS_SYSTEM, user, "facts");
+        req.json = true;
+        req.schema = Some(crate::facts::schema());
+        req.schema_strict = true;
+        let (reply, calls) = self.models.generate_json(Tier::Worker, req).await;
+        // the task has finished: its cost goes into the stored record, so the ledger stays the whole bill
+        if !calls.is_empty()
+            && let Ok(Some(mut stored)) = self.store.get_task(&rec.task_id).await
+        {
+            for c in &calls {
+                stored.ledger.record(c.entry.clone());
+            }
+            let _ = self.store.put_task(&stored).await;
+        }
+        let Ok(reply) = reply else { return };
+        for fact in crate::facts::verified(&reply, &sources) {
+            // a fact whose value is personal data is not kept at all (a redacted value is no fact)
+            if self.cfg.economy.redact_pii && dfae_core::safety::redact_pii(&fact.value) != fact.value {
+                continue;
+            }
+            let text = fact.text();
+            let same: Vec<ScoredMemory> = self
+                .store
+                .retrieve(MemoryQuery { text: text.clone(), kinds: vec![MemoryKind::Semantic], limit: 5, session_id: None })
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|m| {
+                    let md = &m.item.metadata;
+                    md["source"] == "fact" && md["kind"] == fact.kind.as_str() && md["subject"] == fact.subject.as_str() && md.get("superseded_by").is_none()
+                })
+                .collect();
+            if same.iter().any(|m| m.item.metadata["value"] == fact.value.as_str()) {
+                continue; // already known
+            }
+            let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.65);
+            it.metadata = json!({"source": "fact", "kind": fact.kind, "subject": fact.subject, "value": fact.value, "task_id": rec.task_id});
+            let new_id = it.id.clone();
+            if self.store.store(self.keep(it).await).await.is_ok() {
+                for old in same {
+                    let mut md = old.item.metadata.clone();
+                    md["superseded_by"] = json!(new_id);
+                    let _ = self.store.update_metadata(&old.item.id, md).await;
+                }
+            }
         }
     }
 
@@ -1277,7 +1444,7 @@ impl Inner {
         item.entities = rec.entities.clone();
         item.session_id = Some(rec.session_id.clone());
         item.metadata = json!({"task_id": rec.task_id, "success": success, "mode": rec.mode});
-        let _ = self.store.store(item).await;
+        let _ = self.store.store(self.keep(item).await).await;
 
         // 2b. reflection: a task that went wrong and then worked leaves a one-line lesson for requests like it
         if success && let Some(lesson) = self.lesson_from(rec) {
@@ -1287,12 +1454,12 @@ impl Inner {
                 .await
                 .ok()
                 .and_then(|r| r.into_iter().next())
-                .map(|r| r.similarity > 0.9)
+                .map(|r| r.shape_similarity > 0.9)
                 .unwrap_or(false);
             if !dup {
                 let mut it = MemoryItem::new(MemoryKind::Semantic, lesson, 0.75);
                 it.metadata = json!({"source": "lesson", "task_id": rec.task_id});
-                let _ = self.store.store(it).await;
+                let _ = self.store.store(self.keep(it).await).await;
             }
         }
 
@@ -1314,16 +1481,42 @@ impl Inner {
                         .await
                         .ok()
                         .and_then(|r| r.into_iter().next())
-                        .map(|r| r.similarity > 0.95)
+                        .map(|r| r.shape_similarity > 0.95)
                         .unwrap_or(false);
                     if !dup {
                         let mut it = MemoryItem::new(MemoryKind::Semantic, fact, 0.6);
                         it.entities = vec![e.clone()];
                         it.metadata = json!({"source": "promoted-entity", "task_id": rec.task_id});
-                        let _ = self.store.store(it).await;
+                        let _ = self.store.store(self.keep(it).await).await;
                     }
                 }
             }
+        }
+
+        // 3a. lessons learn from their own use (cf. ACE's helpful/harmful counts): a lesson shown to a task that then went smoothly
+        //     helped; one shown to a task that failed did not. One that hurts more than it helps is retired (no longer shown).
+        let smooth = success && rec.usage.replans == 0;
+        if smooth || !success {
+            for r in rec.retrieved.iter().filter(|r| r.kind == "semantic") {
+                let found = self
+                    .store
+                    .retrieve(MemoryQuery { text: r.preview.clone(), kinds: vec![MemoryKind::Semantic], limit: 3, session_id: None })
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|m| m.item.id == r.id && m.item.metadata["source"] == "lesson");
+                if let Some(m) = found {
+                    let mut md = m.item.metadata.clone();
+                    let key = if smooth { "helpful" } else { "harmful" };
+                    md[key] = json!(md[key].as_u64().unwrap_or(0) + 1);
+                    let _ = self.store.update_metadata(&m.item.id, md).await;
+                }
+            }
+        }
+
+        // 3b. durable facts for semantic memory: named by the worker model, kept only when the evidence states them word for word
+        if verified && self.cfg.economy.facts && self.models.has(Tier::Worker) {
+            self.learn_facts(rec).await;
         }
 
         // 4. skills: replay bookkeeping, or crystallise a new one
@@ -1337,7 +1530,7 @@ impl Inner {
         {
             let mut it = MemoryItem::new(MemoryKind::Procedural, skill.masked_request.clone(), 0.8);
             it.metadata = json!({"skill": skill});
-            let _ = self.store.store(it).await;
+            let _ = self.store.store(self.keep(it).await).await;
         }
     }
 }

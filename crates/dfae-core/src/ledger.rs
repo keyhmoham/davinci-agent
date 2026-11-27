@@ -37,6 +37,15 @@ pub struct LedgerEntry {
     /// aggregation skips them: the agent's own record already counts them.
     #[serde(default)]
     pub origin: Option<String>,
+    /// Part of `completion_tokens` spent on hidden reasoning.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Part of `prompt_tokens` written to the provider's prompt cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// The call's cost in USD as the provider or gateway reported it (`None`: not reported).
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,6 +85,19 @@ pub struct LedgerSummary {
     pub decision_calls: u32,
     pub gliner_calls: u32,
     pub cache_hits: u32,
+    /// Hidden reasoning tokens (part of the completion tokens above).
+    pub planner_reasoning_tokens: u64,
+    pub worker_reasoning_tokens: u64,
+    /// Prompt tokens written to the providers' caches.
+    pub planner_cache_write_tokens: u64,
+    pub worker_cache_write_tokens: u64,
+    /// What the calls cost in USD, as reported by the provider or gateway (calls that reported no cost are counted in
+    /// `unpriced_calls`, so a partial sum is never mistaken for the whole bill).
+    pub planner_cost_usd: f64,
+    pub worker_cost_usd: f64,
+    pub decision_cost_usd: f64,
+    pub cost_usd: f64,
+    pub unpriced_calls: u32,
 }
 
 impl Ledger {
@@ -107,6 +129,9 @@ impl Ledger {
                     s.worker_cached_tokens += e.cached_tokens;
                     s.worker_effective_tokens += effective_tokens(e.prompt_tokens, e.cached_tokens, e.completion_tokens);
                     *s.worker_by_purpose.entry(e.purpose.clone()).or_default() += t;
+                    s.worker_reasoning_tokens += e.reasoning_tokens;
+                    s.worker_cache_write_tokens += e.cache_write_tokens;
+                    s.worker_cost_usd += e.cost_usd.unwrap_or(0.0);
                 }
                 Component::Planner => {
                     s.planner_tokens += t;
@@ -114,15 +139,26 @@ impl Ledger {
                     s.planner_cached_tokens += e.cached_tokens;
                     s.planner_effective_tokens += effective_tokens(e.prompt_tokens, e.cached_tokens, e.completion_tokens);
                     *s.planner_by_purpose.entry(e.purpose.clone()).or_default() += t;
+                    s.planner_reasoning_tokens += e.reasoning_tokens;
+                    s.planner_cache_write_tokens += e.cache_write_tokens;
+                    s.planner_cost_usd += e.cost_usd.unwrap_or(0.0);
                 }
                 Component::Decision => {
                     s.decision_tokens += t;
                     s.decision_calls += 1;
+                    s.decision_cost_usd += e.cost_usd.unwrap_or(0.0);
                 }
                 Component::Gliner => s.gliner_calls += 1,
             }
         }
         s.generative_tokens = s.worker_tokens + s.planner_tokens;
+        s.cost_usd = s.planner_cost_usd + s.worker_cost_usd + s.decision_cost_usd;
+        s.unpriced_calls = self
+            .entries
+            .iter()
+            .filter(|e| include_rolled_up || e.origin.is_none())
+            .filter(|e| !e.cached && e.cost_usd.is_none() && matches!(e.component, Component::Worker | Component::Planner))
+            .count() as u32;
         s.baseline_tokens = self.baseline_tokens;
         // the baseline is what a monolithic agent would have spent on one hosted model; the decision model and the extractor are self-hosted
         s.saved_tokens = s.baseline_tokens.saturating_sub(s.generative_tokens);
@@ -181,6 +217,9 @@ mod tests {
             latency_ms: 1,
             cached: false,
             origin: None,
+            reasoning_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: None,
         });
         let s = l.summary();
         assert_eq!((s.generative_tokens, s.worker_tokens, s.planner_tokens), (150, 150, 0));
@@ -198,6 +237,9 @@ mod tests {
             latency_ms: 1,
             cached: false,
             origin: None,
+            reasoning_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: None,
         });
         let s = l.summary();
         assert_eq!((s.planner_tokens, s.saved_tokens), (300, 550));
@@ -233,6 +275,9 @@ mod tests {
                 latency_ms: 1,
                 cached: false,
                 origin: None,
+                reasoning_tokens: 0,
+                cache_write_tokens: 0,
+                cost_usd: None,
             });
         }
         let s = l.summary();

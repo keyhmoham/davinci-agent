@@ -190,6 +190,13 @@ fn engine(ws: &std::path::Path, plan: &str) -> Engine {
         }
         Arc::new(OpenModelProvider::new(&d).expect("decision model")) as Arc<dyn DecisionProvider>
     });
+    // otherwise the hosted Decisions API when the configuration has one (`DECISION_PROVIDER=local` turns it off)
+    let provider = provider.or_else(|| {
+        cfg.decision.hosted.as_ref().and_then(|h| {
+            dfae_decision::HostedDecisions::new(&h.base_url, &h.model, h.api_key.clone(), Duration::from_millis(h.timeout_ms))
+                .map(|p| Arc::new(p) as Arc<dyn DecisionProvider>)
+        })
+    });
     Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(provider, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
         extractor: Arc::new(HybridExtractor::new(None)),
@@ -205,7 +212,9 @@ fn engine(ws: &std::path::Path, plan: &str) -> Engine {
 #[ignore = "calls the hosted models: see the module docs"]
 async fn the_worker_system_carries_out_the_plans_a_good_planner_writes() {
     let mut failures = Vec::new();
-    for c in cases() {
+    // `LIVE_CASES=landing,config` runs only the cases whose name contains one of the words
+    let only: Vec<String> = std::env::var("LIVE_CASES").map(|v| v.split(',').map(|w| w.trim().to_lowercase()).collect()).unwrap_or_default();
+    for c in cases().into_iter().filter(|c| only.is_empty() || only.iter().any(|w| c.name.contains(w.as_str()))) {
         let ws = tempfile::tempdir().unwrap();
         for (p, t) in c.files {
             let f = ws.path().join(p);
@@ -238,6 +247,21 @@ async fn the_worker_system_carries_out_the_plans_a_good_planner_writes() {
             s.worker_calls,
             s.worker_by_purpose,
             tokens::truncate_tokens(t.final_answer.as_deref().unwrap_or(""), 60).replace('\n', " ")
+        );
+        eprintln!(
+            "  cost ${:.6} (planner ${:.6}, worker ${:.6}, decisions ${:.6} in {} calls; unpriced calls {}), reasoning planner {} / worker {}, cache planner read {} write {} / worker read {} write {}",
+            s.cost_usd,
+            s.planner_cost_usd,
+            s.worker_cost_usd,
+            s.decision_cost_usd,
+            s.decision_calls,
+            s.unpriced_calls,
+            s.planner_reasoning_tokens,
+            s.worker_reasoning_tokens,
+            s.planner_cached_tokens,
+            s.planner_cache_write_tokens,
+            s.worker_cached_tokens,
+            s.worker_cache_write_tokens
         );
         let verdict = if t.status != TaskStatus::Completed { Err(format!("{:?}: {:?}", t.status, t.error)) } else { (c.check)(ws.path(), &t) };
         if let Err(why) = verdict {

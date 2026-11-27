@@ -68,8 +68,23 @@ pub struct MemoryQuery {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredMemory {
     pub item: MemoryItem,
-    /// Cosine similarity of the embeddings.
+    /// How alike the query and the item are in meaning: the semantic embeddings' cosine when both have one (`semantic`), otherwise
+    /// the hash embeddings'. What retrieval ranks by.
     pub similarity: f32,
+    /// How alike they are in wording (the hash embeddings' cosine): what decides that a request has the same *shape* as a stored
+    /// skill, or that a memory is a near-duplicate. A paraphrase is close in meaning but not in shape.
+    #[serde(default)]
+    pub shape_similarity: f32,
+    /// `similarity` is the semantic one (its scale differs from the hash one: unrelated texts score ~0.2, not ~0).
+    #[serde(default)]
+    pub semantic: bool,
+}
+
+impl ScoredMemory {
+    /// An item scored by the hash embedding alone.
+    pub fn by_shape(item: MemoryItem, similarity: f32) -> Self {
+        Self { item, similarity, shape_similarity: similarity, semantic: false }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

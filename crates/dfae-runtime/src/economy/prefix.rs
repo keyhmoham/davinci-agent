@@ -26,6 +26,19 @@ impl Default for PrefixPolicy {
 }
 
 impl PrefixPolicy {
+    /// The policy for a planner model, by how long its provider keeps a cached prefix: OpenAI's newer models keep one for 30 minutes
+    /// (`gpt-*`, `o*`; also through a gateway), Anthropic's for 5. A cache write costs 1.25x and a read 0.1x the input price, so a prefix
+    /// pays for itself the first time it is read again: a prefixed call within the lifetime is enough to keep sending it.
+    pub fn for_model(model: &str) -> Self {
+        let m = model.rsplit('/').next().unwrap_or(model).to_ascii_lowercase();
+        let ttl_secs = std::env::var("PLANNER_CACHE_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(if m.starts_with("gpt-") || m.starts_with('o') { 1500 } else { 270 });
+        let ttl = Duration::from_secs(ttl_secs);
+        Self::new(ttl, ttl.max(Duration::from_secs(600)), 2)
+    }
+
     pub fn new(ttl: Duration, window: Duration, min_calls: usize) -> Self {
         Self { ttl, window, min_calls, calls: VecDeque::new(), last_prefixed: None }
     }
@@ -59,6 +72,17 @@ mod tests {
         assert!(!p.decide(at(20)));
         assert!(p.decide(at(40)), "the third call within the window: the cache will be used again soon");
         assert!(p.decide(at(200)) && p.decide(at(450)), "each prefixed call keeps the cache warm");
+    }
+
+    #[test]
+    fn a_planner_whose_cache_lives_30_minutes_keeps_the_prefix_between_tasks_minutes_apart() {
+        let mut p = PrefixPolicy::for_model("openai/gpt-6-luna");
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert!(!p.decide(at(0)), "one call alone does not bet on a cache");
+        assert!(p.decide(at(400)), "a second within the lifetime: the prefix will be read again");
+        assert!(p.decide(at(1200)) && p.decide(at(2400)), "each prefixed call within 25 minutes keeps it warm");
+        assert!(!PrefixPolicy::for_model("claude-sonnet-5").decide(at(0)));
     }
 
     #[test]

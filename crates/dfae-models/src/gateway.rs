@@ -124,6 +124,9 @@ impl ModelGateway {
                 latency_ms,
                 cached: false,
                 origin: None,
+                reasoning_tokens: resp.usage.reasoning_tokens.min(c),
+                cache_write_tokens: resp.usage.cache_write_tokens.min(p),
+                cost_usd: resp.usage.cost_usd,
             },
             text: strip_reasoning(&resp.text),
         })

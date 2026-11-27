@@ -85,6 +85,9 @@ impl LanguageModel for AnthropicModel {
                     + u["cache_read_input_tokens"].as_u64().unwrap_or(0),
                 completion_tokens: u["output_tokens"].as_u64().unwrap_or(0),
                 cached_tokens: u["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                cached_reported: u.get("cache_read_input_tokens").is_some(),
+                cache_write_tokens: u["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                ..Default::default()
             };
             return Ok(GenerationResponse { text, usage, model: v["model"].as_str().unwrap_or(&self.model).to_string() });
         }

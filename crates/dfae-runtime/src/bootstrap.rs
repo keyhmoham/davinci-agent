@@ -11,11 +11,30 @@ use std::sync::Arc;
 
 pub async fn build_engine(config: Config) -> Result<Engine, String> {
     // memory
+    let semantic = config
+        .embeddings
+        .as_ref()
+        .and_then(|e| dfae_memory::RemoteEmbedder::new(&e.base_url, &e.model, e.api_key.clone(), e.dim, std::time::Duration::from_secs(20)));
+    if let Some(m) = &semantic {
+        tracing::info!(model = m.model(), dim = m.dim(), "memory: semantic embeddings");
+    }
     let store: Arc<dyn MemoryStore> = match &config.database_url {
-        Some(url) => Arc::new(PgStore::connect(url).await.map_err(|e| e.to_string())?),
+        Some(url) => {
+            let pg = Arc::new(PgStore::connect(url).await.map_err(|e| e.to_string())?.with_semantic(semantic).await.map_err(|e| e.to_string())?);
+            // rows stored before (or while the model was unreachable) get their semantic embedding in the background
+            let bg = pg.clone();
+            tokio::spawn(async move {
+                match bg.backfill_semantic().await {
+                    Ok(n) if n > 0 => tracing::info!(rows = n, "memory: semantic embeddings backfilled"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "memory: semantic backfill stopped"),
+                }
+            });
+            pg
+        }
         None => {
             tracing::warn!("DATABASE_URL not set: using volatile in-memory storage");
-            Arc::new(InMemoryStore::new())
+            Arc::new(InMemoryStore::new().with_semantic(semantic))
         }
     };
     // policy
@@ -41,7 +60,20 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     if let Some(p) = &open {
         p.start_warmup(); // load the model in the background; decisions use the local rules until it answers
     }
-    let primary: Option<Arc<dyn DecisionProvider>> = open.map(|p| p as Arc<dyn DecisionProvider>);
+    // a self-hosted model when one is configured; otherwise the hosted Decisions API when it is (the rules are the fallback of both)
+    let hosted = config
+        .decision
+        .hosted
+        .as_ref()
+        .and_then(|h| dfae_decision::HostedDecisions::new(&h.base_url, &h.model, h.api_key.clone(), std::time::Duration::from_millis(h.timeout_ms)));
+    let primary: Option<Arc<dyn DecisionProvider>> = match (open, hosted) {
+        (Some(p), _) => Some(p as Arc<dyn DecisionProvider>),
+        (None, Some(h)) => {
+            tracing::info!(model = %config.decision.hosted.as_ref().map(|h| h.model.as_str()).unwrap_or(""), "decisions: hosted Decisions API");
+            Some(Arc::new(h) as Arc<dyn DecisionProvider>)
+        }
+        (None, None) => None,
+    };
     let decider = Arc::new(Decider::new(primary, calibrator, config.thresholds.clone()).with_model_kinds(&config.decision.kinds));
     // models
     let models = ModelGateway::new(build_model(&config.worker), build_model(&config.planner));
@@ -65,7 +97,11 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
             glama,
         )
     });
+    let pii_ner = config.pii_ner_url.as_deref().map(|u| Arc::new(GlinerClient::new(u)) as Arc<dyn EntityExtractor>);
     let engine = Engine::new(EngineDeps { config, store, extractor, decider, models, tools: registry, policy });
+    if let Some(ner) = pii_ner {
+        engine.set_pii_ner(ner);
+    }
     if let Some(hub) = hub {
         if let Some(file) = &mcp_cfg.servers_file {
             let text = std::fs::read_to_string(file).map_err(|e| format!("reading DFAE_MCP_SERVERS {}: {e}", file.display()))?;

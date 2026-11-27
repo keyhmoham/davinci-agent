@@ -42,6 +42,8 @@ pub enum MemoryError {
 pub enum ErrorKind {
     /// Denied by policy — never retried, never worked around.
     Policy,
+    /// Held back for the user (a removal that content from outside asked for): the plan goes on without it, never with it.
+    Withheld,
     InvalidArgs,
     NotFound,
     Timeout,

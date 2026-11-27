@@ -126,7 +126,7 @@ impl Decider {
             tokens_out: if from_cache { 0 } else { resp.output_tokens },
             note,
         };
-        let entry = (resp.provider == "open-model").then(|| LedgerEntry {
+        let entry = matches!(resp.provider.as_str(), "open-model" | "decisions-api").then(|| LedgerEntry {
             ts: Utc::now(),
             component: Component::Decision,
             model: resp.model.clone(),
@@ -138,6 +138,9 @@ impl Decider {
             latency_ms: resp.latency_ms,
             cached: from_cache,
             origin: None,
+            reasoning_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: if from_cache { None } else { resp.cost_usd },
         });
         (resp, record, entry)
     }
@@ -166,6 +169,7 @@ impl Decider {
         routing.conditional = yes("conditional_change");
         // an answer that depends on what the world looks like now has to be looked up: that is a task, not a conversation
         routing.fresh_data = yes("fresh_data");
+        routing.asks = yes("asks_answer");
         routing.needs_tools |= routing.fresh_data;
         // the model's judgement, or a service named outright in a request that has something to do (not "what is GitHub?")
         routing.external = yes("external_service") || (routing.needs_tools && crate::local::names_external_service(&request));
@@ -286,6 +290,11 @@ impl Decider {
         if matches!(facts.error_kind.as_str(), "policy" | "cancelled") {
             action = RecoveryAction::Fail;
             record.note = Some("hard rule: policy/cancel never recovered".into());
+        }
+        // an action held back for the user: the plan goes on without it (a re-plan is told why), it is never retried as it is
+        if facts.error_kind == "withheld" {
+            action = RecoveryAction::Replan;
+            record.note = Some("hard rule: a withheld action is planned around, never retried".into());
         }
         if action == RecoveryAction::Retry && facts.attempts >= facts.max_attempts {
             action = RecoveryAction::Replan;

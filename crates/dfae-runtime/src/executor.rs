@@ -334,6 +334,23 @@ impl Inner {
                     }
                     verdict = again;
                 }
+                // a tool step that missed: the worker first tries to fix it with tools (a server in the wrong directory, a test
+                // that fails), then the step runs again and is judged again; only a second miss goes to the planner
+                if let Some(why) = verdict.clone()
+                    && step.kind == StepKind::Tool
+                {
+                    let problem = format!(
+                        "the step ran, but its result does not meet what was expected: \"{}\" ({why}). The result was: {}",
+                        step.expect.as_deref().unwrap_or(""),
+                        tokens::truncate_tokens(&out.content, 300)
+                    );
+                    if self.local_fix(ctx, id, &step, &problem).await
+                        && let Ok(again) = self.run_tool(ctx, &step, tainted, &deps).await
+                    {
+                        verdict = self.judge_step(ctx, &step, &again.content).await;
+                        out = again;
+                    }
+                }
                 if let Some(why) = verdict {
                     let problem = format!(
                         "step {id} ({}) found: {} — this does not meet what was expected: \"{}\" ({why}). Adapt the remaining plan to what was actually found; do not repeat steps that are done.",
@@ -354,8 +371,15 @@ impl Inner {
             Ok(out) => {
                 let content = out.content;
                 let hits = dfae_core::safety::scan_injection(&content);
-                let mut summary = tokens::compress_text(&content, STEP_SUMMARY_TOKENS);
-                if let Some(c) = self.condense(ctx, &step, &content).await {
+                // what comes from outside (the web, an outside service) is extracted from, never summarised by a model
+                let untrusted =
+                    step.kind == StepKind::Tool && step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m));
+                if untrusted {
+                    ctx.rec.lock().await.exposed = true;
+                }
+                let mut summary =
+                    if untrusted { self.quarantined_summary(ctx, &step, &content).await } else { tokens::compress_text(&content, STEP_SUMMARY_TOKENS) };
+                if !untrusted && let Some(c) = self.condense(ctx, &step, &content).await {
                     summary = c;
                 }
                 if !hits.is_empty() && step.kind == StepKind::Tool {
@@ -605,6 +629,23 @@ impl Inner {
             dfae_tools::PolicyDecision::RequireApproval(r) => approval_reason = Some(r),
             dfae_tools::PolicyDecision::Allow => {}
         }
+        // once outside content has been read, removing files is the user's call, not the content's (an injected `rm -rf tests` in a
+        // setup page is not flagged as an injection: it reads like any other instruction)
+        let (exposed, goal) = {
+            let r = ctx.rec.lock().await;
+            (r.exposed, r.goal.clone())
+        };
+        if exposed && safety::removes_files(&name, &args) && !safety::asks_to_remove(&goal) {
+            let why =
+                "removes files after content from outside (the web or an outside service) was read, and the request did not ask for anything to be removed";
+            if self.cfg.approvals == ApprovalMode::Never {
+                return Err(StepFailure::new(
+                    ErrorKind::Withheld,
+                    format!("refused: this {why}. Leave the removal out (say in the answer that the fetched content asked for it), or ask the user"),
+                ));
+            }
+            approval_reason.get_or_insert_with(|| why.to_string());
+        }
         if step.approval_required && approval_reason.is_none() {
             approval_reason = Some("the plan marked this step as requiring approval".into());
         }
@@ -683,6 +724,22 @@ impl Inner {
         Ok(StepOutput { content, evidence })
     }
 
+    /// The summary of untrusted output (`quarantine.rs`): lines that read like instructions to a model dropped; a short output passed on as
+    /// it is; a long one reduced to the lines the worker model selects by number — verbatim, never in a model's own words.
+    async fn quarantined_summary(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> String {
+        use crate::quarantine::{clean_lines, dropped_note};
+        let (lines, dropped) = clean_lines(content);
+        let note = dropped_note(dropped);
+        let all = lines.join("\n");
+        if tokens::estimate_tokens(&all) <= STEP_SUMMARY_TOKENS || !self.models.has(Tier::Worker) {
+            return format!("{}{note}", tokens::compress_text(&all, STEP_SUMMARY_TOKENS));
+        }
+        match self.select_lines(ctx, step, &lines).await {
+            Some(picked) => format!("{picked}{note}"),
+            None => format!("{}{note}", tokens::compress_text(&all, STEP_SUMMARY_TOKENS)),
+        }
+    }
+
     /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the planner model
     /// reads this instead of a mechanical cut of the first lines. Kept only if it states nothing the output lacks.
     async fn condense(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> Option<String> {
@@ -690,19 +747,30 @@ impl Inner {
         {
             return None;
         }
+        // extractive: the worker selects lines by number and they are passed on verbatim (measured against a free-text summary on five
+        // big outputs: the same facts kept, 78% fewer output tokens, and nothing written that the output does not say)
+        let picked = self.select_lines(ctx, step, &crate::quarantine::output_lines(content)).await?;
+        (tokens::estimate_tokens(&picked) < tokens::estimate_tokens(content) / 2).then(|| format!("[condensed] {picked}"))
+    }
+
+    /// The lines of an output the worker model selects by number for the task and step (from the candidate lines), verbatim.
+    async fn select_lines(&self, ctx: &Arc<TaskCtx>, step: &Step, lines: &[String]) -> Option<String> {
+        use crate::quarantine::{SPAN_SYSTEM, assemble, candidate_lines, numbered, schema};
         let goal = ctx.rec.lock().await.goal.clone();
+        let offered = candidate_lines(lines, &format!("{goal} {}", step.description), 400);
         let user = format!(
             "TASK: {}\nSTEP: {}\n{}",
             tokens::truncate_tokens(&goal, 80),
             tokens::truncate_tokens(&step.description, 40),
-            dfae_core::safety::wrap_untrusted(step.tool.as_deref().unwrap_or("output"), &tokens::truncate_tokens(content, 6000))
+            dfae_core::safety::wrap_untrusted("numbered lines", &tokens::truncate_tokens(&numbered(&offered, 400), 6000))
         );
-        let mut req = self.gen_request(Tier::Worker, prompts::CONDENSE_SYSTEM, user, "condense");
-        req.max_tokens = req.max_tokens.min(500);
-        let text = self.generate_text(ctx, Tier::Worker, req).await.ok()?;
-        let text = text.trim().to_string();
-        let grounded = crate::answer::ungrounded_claims(&text, content, "").is_empty();
-        (grounded && !text.is_empty() && tokens::estimate_tokens(&text) < tokens::estimate_tokens(content) / 2).then(|| format!("[condensed] {text}"))
+        let mut req = self.gen_request(Tier::Worker, SPAN_SYSTEM, user, "select");
+        req.json = true;
+        req.schema = Some(schema());
+        req.schema_strict = true;
+        req.max_tokens = req.max_tokens.min(300);
+        let v = self.gen_json(ctx, Tier::Worker, req).await.ok()?;
+        assemble(&offered, &v, STEP_SUMMARY_TOKENS)
     }
 
     /// Suspend the step until a human approves *this exact action*.
@@ -797,6 +865,25 @@ impl Inner {
             (r.plan.as_ref().and_then(|p| p.step(id).cloned()), r.usage.clone(), r.budget.clone(), r.goal.clone(), r.entities.clone())
         };
         let Some(step) = step else { return Some(f.message) };
+        // a removal held back for the user a second time: the planner was told and planned it in again, so the step is left out
+        // (measured: re-plans that re-add it until the budget is gone) and the answer says so
+        if f.kind == ErrorKind::Withheld && ctx.withheld.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
+            let mut r = ctx.rec.lock().await;
+            {
+                if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                    s.status = StepStatus::Skipped;
+                    s.error = Some(f.message.clone());
+                }
+                r.problems.push(format!("step {id} left out: it removes files that only the fetched content asked to remove"));
+                drop(r);
+                self.emit(
+                    ctx,
+                    EventKind::Warning { message: format!("step {id} left out: a removal that content from outside asked for (ask the user to do it)") },
+                )
+                .await;
+                return None;
+            }
+        }
         // argument and path problems are fixed by code, at zero token cost, before any decision is asked
         if matches!(f.kind, ErrorKind::InvalidArgs | ErrorKind::NotFound) && self.repair_failed_step(ctx, &step, f.kind).await {
             return None;
@@ -857,6 +944,11 @@ impl Inner {
                 if step.kind == StepKind::Agent {
                     return Some(label);
                 }
+                // the worker first tries to fix it where it happened, with tools; the planner hears of it only if that does not work
+                // (not for an action held back for the user: that is the plan's to leave out, not the worker's to work around)
+                if f.kind != ErrorKind::Withheld && self.local_fix(ctx, id, &step, &f.message).await {
+                    return None;
+                }
                 let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
                 let tier = if action == Escalate { Tier::Planner } else { self.planner_tier(mode).unwrap_or(Tier::Worker) };
                 if !self.models.has(tier) {
@@ -893,6 +985,7 @@ impl Inner {
                 return Ok(false);
             }
             r.usage.replans += 1;
+            ctx.planner_rounds.store(r.usage.replans, std::sync::atomic::Ordering::Relaxed);
             r.problems.push(tokens::truncate_tokens(problem, 60));
             (r.usage.replans, r.budget.clone())
         };
@@ -1069,6 +1162,116 @@ impl Inner {
     }
 
     /// Install a revised plan and tell everyone.
+    /// The step agent (`step_agent.rs`): a bounded tool loop by the worker model to fix one failed step. `true`: the step runs again.
+    async fn local_fix(self: &Arc<Self>, ctx: &Arc<TaskCtx>, id: &str, step: &Step, problem: &str) -> bool {
+        use crate::step_agent::{Action, FIX_SYSTEM, parse, render_history, schema};
+        if !self.cfg.economy.step_agent || !self.models.has(Tier::Worker) || step.kind != StepKind::Tool || !ctx.fixed.lock().insert(id.to_string()) {
+            return false;
+        }
+        // Untrusted data never chooses actions (the plan-then-execute guarantee): a web page's or an outside service's text is not
+        // shown to a loop that may call tools, and once a task has seen text that reads like an injection, the loop may only read.
+        if step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m)) {
+            return false;
+        }
+        // Nor once the task has read such text at all: the loop's goal is to make the failed step pass, and it works around what
+        // stands in the way (measured: a removal a setup page asked for, refused, was retried by the loop as a move, then as a
+        // script). A re-plan is told why instead; the planner leaves it out.
+        if ctx.rec.lock().await.exposed {
+            return false;
+        }
+        let tainted = ctx.rec.lock().await.tainted;
+        let mut tools: Vec<String> = ctx
+            .allowed
+            .lock()
+            .iter()
+            .filter(|t| ctx.in_scope(t))
+            .filter(|t| !tainted || self.tools.meta(t).is_some_and(|m| !m.side_effects))
+            .cloned()
+            .collect();
+        tools.sort();
+        let catalog = self.tools.catalog_lines(&tools);
+        let goal = ctx.rec.lock().await.goal.clone();
+        self.emit(ctx, EventKind::Warning { message: format!("step {id} failed: the worker tries to fix it with tools before the plan is revised") }).await;
+        let mut turns: Vec<(String, bool, String)> = Vec::new();
+        for k in 1..=self.cfg.economy.step_agent_turns {
+            let user = format!(
+                "GOAL: {}\nFAILED STEP {id} ({}): {}\nARGS: {}\nFAILURE: {}\n{}\nTOOLS:\n{catalog}\nDONE SO FAR:\n{}",
+                tokens::truncate_tokens(&goal, 200),
+                step.tool.as_deref().unwrap_or("reasoning"),
+                tokens::truncate_tokens(&step.description, 80),
+                tokens::truncate_tokens(&step.args.to_string(), 200),
+                clip_error(problem, 500),
+                self.shell_environment(true),
+                if turns.is_empty() { "nothing yet".to_string() } else { render_history(&turns, 2) }
+            );
+            let system =
+                if self.cfg.economy.step_agent_script { format!("{FIX_SYSTEM}{}", crate::step_agent::FIX_SCRIPT_HINT) } else { FIX_SYSTEM.to_string() };
+            let mut req = self.gen_request(Tier::Worker, &system, user, "fix");
+            req.json = true;
+            req.schema = Some(schema(&tools));
+            req.schema_strict = true;
+            let Ok(v) = self.gen_json(ctx, Tier::Worker, req).await else { return false };
+            match parse(&v) {
+                None => return false,
+                Some(Action::GiveUp(why)) => {
+                    self.emit(ctx, EventKind::Warning { message: format!("the worker could not fix {id} ({why}): the plan is revised") }).await;
+                    return false;
+                }
+                Some(Action::Done(summary)) => {
+                    {
+                        let mut r = ctx.rec.lock().await;
+                        if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                            s.status = StepStatus::Pending;
+                            s.error = None;
+                        }
+                    }
+                    self.emit(ctx, EventKind::Repaired { step_id: id.into(), note: format!("fixed by the worker ({} actions): {summary}", turns.len()) }).await;
+                    return true;
+                }
+                Some(Action::Tool { tool, mut args, why }) => {
+                    let shown = format!("{tool} {}", tokens::truncate_tokens(&args.to_string(), 60));
+                    if !tools.contains(&tool) {
+                        turns.push((shown, false, format!("'{tool}' is not one of the TOOLS")));
+                        continue;
+                    }
+                    // a server never returns: in the foreground it would hold the loop until its timeout
+                    if tool == "shell"
+                        && args.get("background").is_none()
+                        && let Some(cmd) = args.get("command").and_then(|c| c.as_str())
+                        && crate::implement::implies_background(&why, cmd)
+                    {
+                        args["background"] = json!(true);
+                    }
+                    let mut s = Step::tool(&format!("{id}_fix{k}"), &tool, &format!("fix {id}: {why}"), args);
+                    s.approval_required = self.tools.meta(&tool).map(|m| m.requires_approval).unwrap_or(false);
+                    s.how = Some("step-agent".into());
+                    let res = self.run_tool(ctx, &s, false, &[]).await;
+                    let (ok, text) = match res {
+                        Ok(o) => (true, o.content),
+                        Err(f) => (false, f.message),
+                    };
+                    // recorded in the plan; an action that failed is kept as skipped (it is history, not a failed step of the task)
+                    s.status = if ok { StepStatus::Succeeded } else { StepStatus::Skipped };
+                    s.summary = Some(tokens::truncate_tokens(&text, 300));
+                    s.output = Some(text.clone());
+                    if !ok {
+                        s.error = Some(clip_error(&text, 200));
+                    }
+                    {
+                        let mut r = ctx.rec.lock().await;
+                        if let Some(p) = r.plan.as_mut() {
+                            let at = p.steps.iter().position(|x| x.id == id).unwrap_or(p.steps.len());
+                            p.steps.insert(at, s);
+                        }
+                    }
+                    self.persist(ctx).await;
+                    turns.push((shown, ok, text));
+                }
+            }
+        }
+        false
+    }
+
     async fn commit_revision(&self, ctx: &Arc<TaskCtx>, steps: Vec<Step>, _patch: Option<&crate::plandoc::PatchDoc>, problem: &str) {
         let revised = {
             let mut r = ctx.rec.lock().await;
