@@ -230,3 +230,21 @@ saying "MCP".
 * After the fix: **6/6** (Wikipedia 2/2, GitHub 2/2 via a directory GitHub server, Hacker News 2/2), no re-plans, $0.0068 in all.
 * Seen on the way: this sandbox's own network proxy answers 403 for github.com ("GitHub access … not enabled for this session") — an
   environment limit, not the system's.
+
+## Round 8: the researched reuses
+
+**W3 — extractive condensation of big outputs (the quarantine's line selection, reused).** Five realistic big outputs (a 48-test pytest
+run with 2 failures, a 320-line build log with one type error, a 600-line app log with one error at line 431, a 360-file listing, a
+220-record JSON response), each with the facts a planner needs:
+
+| Method | Facts kept | Values not in the output | Worker output tokens | Cost |
+|---|---:|---:|---:|---:|
+| free-text summary (the old condenser), first 6,000 tokens | 15/19 | 4 | 333 | $0.0044 |
+| line selection, first 400 lines | 12/19 | 0 | 323 | $0.0040 |
+| free-text summary over **ranked candidate lines** | 19/19 | 5 (e.g. `feature_0..feature_59`, "220") | 287 | $0.0028 |
+| **line selection over ranked candidate lines** (adopted) | **19/19** | **0** | **63** | $0.0026 |
+
+* The big win is the **candidate ranking**: the head and tail, lines that report trouble and lines sharing the task's words, each with
+  its neighbours — an error 431 lines into a log was cut off by every length limit before. JSON is flattened to one record per line.
+* On top of it, selection by line number: −78% output tokens and nothing written that the output does not say. Used for big trusted
+  outputs (the free-text condenser is gone) and for untrusted ones (after the instruction-like lines are dropped). Live: 5/5.
