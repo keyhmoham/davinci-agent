@@ -100,3 +100,17 @@ to a task are listed in the request (`EXTRA TOOLS`) and added to that task's sch
 tasks send byte-identical system prompts and schemas (test). The prefix policy uses the planner's cache lifetime: 25 minutes for
 OpenAI models (`PLANNER_CACHE_TTL_SECS`), 270 s otherwise. C2 (one effort for plans and re-plans) was **not** done: a re-plan thinks
 harder on purpose, and its separate cache line costs ≈ $0.0003 per re-plan.
+
+## E1.1: does GLiNER earn its keep? (5 runs × 6 harder cases per arm, one frozen build)
+
+| Extractor | Passed | Re-plans | Cost | Wall time |
+|---|---:|---:|---:|---:|
+| rules only | **29/30** | 15 | $0.0444 | 595 s |
+| rules + GLiNER (`gliner_small-v2.1`, CPU) | 28/30 | 10 | $0.0436 | 702 s (+18%) |
+
+* Success and cost are the same within noise. The re-plan difference comes mostly from one case (the served site: 7 vs 2) whose re-plans
+  vary from 0 to 3 between runs of the same arm.
+* The audit (`DFAE_EXTRACT_AUDIT`) found GLiNER-only entities holding 10 of 49 bound values in a 12-task run, but the rules-only arm
+  binds the same values (the planner writes them into the step, and the worker reads it): containment is not necessity.
+* Conclusion: on these tasks the semantic extractor adds latency and a service (and a ~600 MB model) without measurable benefit, so a
+  higher-quality hosted extractor would not help either: extraction is not where these tasks fail.
