@@ -213,3 +213,17 @@ async fn a_task_that_read_outside_content_can_only_propose_a_routine() {
     assert!(on.enabled && on.proposed.is_none() && on.state.next_run.is_some());
     drop(r);
 }
+
+#[tokio::test]
+async fn a_routine_about_a_change_is_gated_on_what_it_names() {
+    let r = rig();
+    std::fs::write(r.ws.path().join("status.txt"), "ok\n").unwrap();
+    let a = r.engine.add_routine(spec("Check whether status.txt has changed and tell me what it says now", "every 2h"), "user").await.unwrap();
+    assert_eq!(a.if_changed.as_deref(), Some("cat status.txt"));
+    let b = r.engine.add_routine(spec("Tell me when https://example.org/release-notes changes.", "daily 09:00"), "user").await.unwrap();
+    assert_eq!(b.if_changed.as_deref(), Some("GET https://example.org/release-notes"));
+    let c = r.engine.add_routine(spec("Summarise status.txt for me", "every 2h"), "user").await.unwrap();
+    assert_eq!(c.if_changed, None, "not about a change: every run runs");
+    let d = r.engine.add_routine(spec("Check whether missing.txt changed", "every 2h"), "user").await.unwrap();
+    assert_eq!(d.if_changed, None, "a file that is not there is no probe");
+}

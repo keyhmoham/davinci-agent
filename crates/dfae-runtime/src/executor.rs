@@ -331,8 +331,11 @@ impl Inner {
         // the planner said what success looks like: the decision model checks the result against it. A result that
         // misses it is not thrown away (it is real information: "the workspace is empty"); it makes the planner
         // look at the plan again, now knowing what was found.
+        // a step that schedules or defines work is done when the book holds it: what that work will do later is not this step's result
+        // (measured: "notes/later.txt contains checked" on a routine_add step made the step agent write the file at once)
+        let books = step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| matches!(m.category.as_str(), "routines" | "agents"));
         let result = match result {
-            Ok(mut out) if step.how.is_some() && step.expect.is_some() => {
+            Ok(mut out) if step.how.is_some() && step.expect.is_some() && !books => {
                 let mut verdict = self.judge_step(ctx, &step, &out.content).await;
                 // a self-hosted model that wrote the step gets one chance to put it right, told what was wrong, before the
                 // planner model hears of it
@@ -1247,7 +1250,12 @@ impl Inner {
         }
         // Untrusted data never chooses actions (the plan-then-execute guarantee): a web page's or an outside service's text is not
         // shown to a loop that may call tools, and once a task has seen text that reads like an injection, the loop may only read.
-        if step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m)) {
+        if step
+            .tool
+            .as_deref()
+            .and_then(|t| self.tools.meta(t))
+            .is_some_and(|m| crate::quarantine::untrusted(&m) || matches!(m.category.as_str(), "routines" | "agents"))
+        {
             return false;
         }
         // Nor once the task has read such text at all: the loop's goal is to make the failed step pass, and it works around what

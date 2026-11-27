@@ -108,9 +108,13 @@ impl Inner {
     /// the tools that manage routines or agents (an agent does its part; the main agent keeps the book).
     pub(crate) fn profile_scope(&self, p: &AgentProfile) -> Vec<String> {
         let metas = self.tools.metas();
+        let names: Vec<String> = metas.iter().map(|m| m.name.clone()).collect();
+        // tool names as a planner writes them (`read_file`, `fs-read`): resolved like a plan's; none that resolve → the defaults, never no tools
+        // (measured: an inline agent whose tools all missed had nothing to read the file it was to review with)
+        let wanted: Vec<String> = p.tools.iter().filter_map(|t| crate::plandoc::resolve_tool(t, &names)).collect();
         metas
             .iter()
-            .filter(|m| p.tools.is_empty() || p.tools.contains(&m.name))
+            .filter(|m| wanted.is_empty() || wanted.contains(&m.name))
             .filter(|m| p.writes || !m.side_effects)
             .filter(|m| !matches!(m.category.as_str(), "routines" | "agents"))
             .map(|m| m.name.clone())

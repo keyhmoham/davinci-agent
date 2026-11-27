@@ -207,6 +207,11 @@ impl Inner {
         if proposed.is_some() {
             spec.enabled = Some(false);
         }
+        // a goal that is about something changing, and names a file here or a URL, is gated on it (no model call when it did not):
+        // what the request asked, said in a sentence the binder left as prose (measured: 0/3 watches got their gate otherwise)
+        if spec.if_changed.is_none() && spec.if_ok.is_none() {
+            spec.if_changed = self.infer_watch(spec.goal.as_deref().unwrap_or(""));
+        }
         self.apply_spec(&mut r, &spec, now)?;
         if proposed.is_none() && r.state.next_run.is_none() {
             return Err(format!("'{when}' never runs (it is in the past, or its limits end it before its first run)"));
@@ -216,6 +221,23 @@ impl Inner {
         self.routine_event(&r.id, if proposed.is_some() { "proposed" } else { "added" }, r.line());
         self.routines.wake.notify_one();
         Ok(r)
+    }
+
+    /// `cat <file>` or `GET <url>` for a goal about a change in that file or page; `None` when the goal is not about a change.
+    fn infer_watch(&self, goal: &str) -> Option<String> {
+        static CHANGE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)\b(?:has|have|had|is|was)?\s*(?:changed|changes|change|differ\w*|updated|modified|new)\b").unwrap()
+        });
+        static URL: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r#"https?://[^\s"'<>)]+"#).unwrap());
+        static PATH: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"[\w./-]+\.[A-Za-z0-9]{1,6}\b").unwrap());
+        if !CHANGE.is_match(goal) {
+            return None;
+        }
+        if let Some(u) = URL.find(goal) {
+            return Some(format!("GET {}", u.as_str().trim_end_matches(['.', ','])));
+        }
+        let ws = self.policy.workspace();
+        PATH.find_iter(goal).map(|m| m.as_str().trim_end_matches('.')).find(|p| ws.join(p).is_file()).map(|p| format!("cat {p}"))
     }
 
     pub(crate) async fn update_routine(&self, id: &str, spec: RoutineSpec) -> Result<Routine, String> {
