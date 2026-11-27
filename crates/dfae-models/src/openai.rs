@@ -24,9 +24,10 @@ pub struct OpenAiCompat {
 impl OpenAiCompat {
     pub fn new(base: &str, model: &str, key: Option<String>, timeout: Duration) -> Self {
         let http = reqwest::Client::builder().timeout(timeout).build().expect("http client");
-        // OpenAI's own API caches a repeated prompt prefix by itself; other servers say so with `PLANNER_PROMPT_CACHE=on`.
-        // Self-hosted ones are free anyway, and a request that is billed in full is no loss there.
-        let caches = base.contains("api.openai.com");
+        // OpenAI's own API and Vercel AI Gateway (which passes on the providers' prefix caching: measured cache hits on the planner)
+        // cache a repeated prompt prefix by themselves; other servers say so with `PLANNER_PROMPT_CACHE=on`. A server that does not
+        // cache costs nothing extra: after three misses the cacheable prefix is no longer sent (`prefix_misses`).
+        let caches = base.contains("api.openai.com") || base.contains("ai-gateway.vercel.sh");
         Self {
             http,
             base: base.trim_end_matches('/').to_string(),

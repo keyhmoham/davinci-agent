@@ -262,6 +262,11 @@ pub struct EconomyConfig {
     /// Measured: same success (12/12), fix actions -50%, re-plans 8 -> 2, planner calls -45%, cost -47%.
     #[serde(default)]
     pub step_agent_script: bool,
+    /// Once a task has read content from outside (the web, an outside service), changing, moving or removing a file that was there
+    /// before needs the request to name it (or a human); so does sending what was read locally to the network. `true` turns this off
+    /// (`DFAE_EXPOSED_CHANGES=allow`): a task such as "upgrade the project as the migration guide at URL says" then edits freely.
+    #[serde(default)]
+    pub allow_exposed_changes: bool,
     /// Personal data (e-mail addresses, phone numbers, card numbers, IBANs) is replaced before text is kept for later — long-term
     /// memory and the decision log (`DFAE_REDACT_PII=off` keeps it). What a user asks to remember explicitly is kept as said.
     #[serde(default)]
@@ -451,6 +456,7 @@ impl Config {
                 step_agent: !matches!(env("DFAE_STEP_AGENT").as_deref(), Some("off" | "false" | "0")),
                 step_agent_turns: env_parse("DFAE_STEP_AGENT_TURNS", 6u32).clamp(1, 12),
                 step_agent_script: !matches!(env("DFAE_STEP_AGENT_STYLE").as_deref(), Some("tools" | "json")),
+                allow_exposed_changes: matches!(env("DFAE_EXPOSED_CHANGES").as_deref(), Some("allow" | "on" | "1")),
                 redact_pii: !matches!(env("DFAE_REDACT_PII").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {

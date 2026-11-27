@@ -49,6 +49,19 @@ fn kind_str(k: ErrorKind) -> String {
     serde_json::to_value(k).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_else(|| "other".into())
 }
 
+/// A shell command that talks to the network, and one that sends a file or a command's output with it.
+static SENDS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\b(?:curl|wget|nc|ncat|socat|scp|rsync|ssh|ftp|telnet)\b|https?://|requests\.|urllib|fetch\(|axios").unwrap()
+});
+static UPLOADS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)\s*['"]?[^\s'"]*@|\$\(|`[^`]+`|<\s*[\w./-]+\s*\|?\s*(?:nc|curl)|--post-file"#,
+    )
+    .unwrap()
+});
+/// A value worth keeping from leaving: at least 8 characters of a key, a token or an id.
+static LOCAL_VALUE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"[A-Za-z0-9_\-+/=]{8,}").unwrap());
+
 /// Outputs shorter than this are summarised mechanically: reading them locally would save the planner model nothing.
 const CONDENSE_MIN_TOKENS: usize = 1500;
 
@@ -629,22 +642,16 @@ impl Inner {
             dfae_tools::PolicyDecision::RequireApproval(r) => approval_reason = Some(r),
             dfae_tools::PolicyDecision::Allow => {}
         }
-        // once outside content has been read, removing files is the user's call, not the content's (an injected `rm -rf tests` in a
-        // setup page is not flagged as an injection: it reads like any other instruction)
-        let (exposed, goal) = {
-            let r = ctx.rec.lock().await;
-            (r.exposed, r.goal.clone())
-        };
-        if exposed && safety::removes_files(&name, &args) && !safety::asks_to_remove(&goal) {
-            let why =
-                "removes files after content from outside (the web or an outside service) was read, and the request did not ask for anything to be removed";
+        // once outside content has been read, what was already there and what was read locally are the user's (plan item E1e): an
+        // injected "delete the tests folder" or "set admin = true" reads like any other instruction, so nothing flags it
+        if let Some(why) = self.exposed_change(ctx, &name, &meta, &args).await {
             if self.cfg.approvals == ApprovalMode::Never {
                 return Err(StepFailure::new(
                     ErrorKind::Withheld,
-                    format!("refused: this {why}. Leave the removal out (say in the answer that the fetched content asked for it), or ask the user"),
+                    format!("refused: this {why}. Leave it out and say in the answer that the fetched content asked for it, or ask the user"),
                 ));
             }
-            approval_reason.get_or_insert_with(|| why.to_string());
+            approval_reason.get_or_insert(why);
         }
         if step.approval_required && approval_reason.is_none() {
             approval_reason = Some("the plan marked this step as requiring approval".into());
@@ -1159,6 +1166,54 @@ impl Inner {
         }
         let _ = goal;
         Err(last_problem)
+    }
+
+    /// What this call would do, after outside content was read, that the request did not ask for: change an existing file it does not
+    /// name, or send data read locally to the network. `None`: nothing to hold back.
+    async fn exposed_change(&self, ctx: &Arc<TaskCtx>, tool: &str, meta: &ToolMetadata, args: &Value) -> Option<String> {
+        if self.cfg.economy.allow_exposed_changes {
+            return None;
+        }
+        let (goal, since, local, outside) = {
+            let r = ctx.rec.lock().await;
+            if !r.exposed {
+                return None;
+            }
+            let (mut local, mut outside) = (String::new(), String::new());
+            for s in r.plan.iter().flat_map(|p| &p.steps).filter(|s| s.status == StepStatus::Succeeded) {
+                let untrusted = s.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m));
+                let out = if untrusted { &mut outside } else { &mut local };
+                out.push_str(s.output.as_deref().unwrap_or(""));
+                out.push('\n');
+            }
+            (r.goal.clone(), std::time::SystemTime::from(r.created_at), local, outside)
+        };
+        let changes = dfae_tools::changes::existing_changes(tool, args, self.policy.workspace(), Some(since));
+        let unnamed: Vec<String> = changes.iter().filter(|c| !dfae_tools::changes::named_in(&goal, &c.path)).map(|c| format!("{} {}", c.how, c.path)).collect();
+        if !unnamed.is_empty() {
+            return Some(format!(
+                "{} — files that were there before this task — after content from outside (the web or an outside service) was read, and the request does not name them",
+                unnamed.join(", ")
+            ));
+        }
+        // data read here, on its way out: a value from a local read (a key, a token, an id) in what goes to the network
+        let sends = crate::quarantine::untrusted(meta) || (tool == "shell" && SENDS.is_match(args["command"].as_str().unwrap_or("")));
+        if sends {
+            let text = args.to_string();
+            if let Some(v) = LOCAL_VALUE.find_iter(&local).map(|m| m.as_str()).find(|v| {
+                v.chars().any(|c| c.is_ascii_digit())
+                    && v.chars().any(|c| c.is_ascii_alphabetic())
+                    && text.contains(v)
+                    && !goal.contains(v)
+                    && !outside.contains(v)
+            }) {
+                return Some(format!("sends '{}…', read from this machine, to the network after content from outside was read", &v[..4.min(v.len())]));
+            }
+            if tool == "shell" && UPLOADS.is_match(args["command"].as_str().unwrap_or("")) {
+                return Some("sends files from this machine to the network after content from outside was read".into());
+            }
+        }
+        None
     }
 
     /// Install a revised plan and tell everyone.

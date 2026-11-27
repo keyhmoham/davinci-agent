@@ -251,7 +251,16 @@ impl Inner {
 
         // The decision model is consulted only where evidence alone is ambiguous
         // (reasoning steps, failures, skips); pure tool plans are judged by checks.
-        let needs_judgement = rec.plan.as_ref().map(|p| p.has_reasoning()).unwrap_or(false) || failed > 0 || skipped > 0;
+        // …and where the steps' own checks cannot know what "done" means: the task changed things after reading outside content, so
+        // what it had to do came from that content, not from the plan (measured: "apply the setup instructions" became an edit of
+        // app.py, every step passed, the setup files were never made, and the task read as verified)
+        let changed_after_reading = rec.exposed
+            && rec.plan.as_ref().is_some_and(|p| {
+                p.steps
+                    .iter()
+                    .any(|s| s.status == StepStatus::Succeeded && s.tool.as_deref().is_some_and(|t| self.tools.meta(t).is_some_and(|m| m.side_effects)))
+            });
+        let needs_judgement = rec.plan.as_ref().map(|p| p.has_reasoning()).unwrap_or(false) || failed > 0 || skipped > 0 || changed_after_reading;
         let completion = if needs_judgement && total > 0 {
             let mut st = self.decision_state(&rec.goal, &rec.entities);
             st.completion_facts = Some(CompletionFacts {
