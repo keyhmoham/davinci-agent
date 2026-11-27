@@ -857,6 +857,10 @@ impl Inner {
                 if step.kind == StepKind::Agent {
                     return Some(label);
                 }
+                // the worker first tries to fix it where it happened, with tools; the planner hears of it only if that does not work
+                if self.local_fix(ctx, id, &step, &f.message).await {
+                    return None;
+                }
                 let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
                 let tier = if action == Escalate { Tier::Planner } else { self.planner_tier(mode).unwrap_or(Tier::Worker) };
                 if !self.models.has(tier) {
@@ -1069,6 +1073,95 @@ impl Inner {
     }
 
     /// Install a revised plan and tell everyone.
+    /// The step agent (`step_agent.rs`): a bounded tool loop by the worker model to fix one failed step. `true`: the step runs again.
+    async fn local_fix(self: &Arc<Self>, ctx: &Arc<TaskCtx>, id: &str, step: &Step, problem: &str) -> bool {
+        use crate::step_agent::{Action, FIX_SYSTEM, parse, render_history, schema};
+        if !self.cfg.economy.step_agent || !self.models.has(Tier::Worker) || step.kind != StepKind::Tool || !ctx.fixed.lock().insert(id.to_string()) {
+            return false;
+        }
+        let mut tools: Vec<String> = ctx.allowed.lock().iter().filter(|t| ctx.in_scope(t)).cloned().collect();
+        tools.sort();
+        let catalog = self.tools.catalog_lines(&tools);
+        let goal = ctx.rec.lock().await.goal.clone();
+        self.emit(ctx, EventKind::Warning { message: format!("step {id} failed: the worker tries to fix it with tools before the plan is revised") }).await;
+        let mut turns: Vec<(String, bool, String)> = Vec::new();
+        for k in 1..=self.cfg.economy.step_agent_turns {
+            let user = format!(
+                "GOAL: {}\nFAILED STEP {id} ({}): {}\nARGS: {}\nFAILURE: {}\n{}\nTOOLS:\n{catalog}\nDONE SO FAR:\n{}",
+                tokens::truncate_tokens(&goal, 200),
+                step.tool.as_deref().unwrap_or("reasoning"),
+                tokens::truncate_tokens(&step.description, 80),
+                tokens::truncate_tokens(&step.args.to_string(), 200),
+                clip_error(problem, 500),
+                self.shell_environment(true),
+                if turns.is_empty() { "nothing yet".to_string() } else { render_history(&turns, 2) }
+            );
+            let mut req = self.gen_request(Tier::Worker, FIX_SYSTEM, user, "fix");
+            req.json = true;
+            req.schema = Some(schema(&tools));
+            req.schema_strict = true;
+            let Ok(v) = self.gen_json(ctx, Tier::Worker, req).await else { return false };
+            match parse(&v) {
+                None => return false,
+                Some(Action::GiveUp(why)) => {
+                    self.emit(ctx, EventKind::Warning { message: format!("the worker could not fix {id} ({why}): the plan is revised") }).await;
+                    return false;
+                }
+                Some(Action::Done(summary)) => {
+                    {
+                        let mut r = ctx.rec.lock().await;
+                        if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                            s.status = StepStatus::Pending;
+                            s.error = None;
+                        }
+                    }
+                    self.emit(ctx, EventKind::Repaired { step_id: id.into(), note: format!("fixed by the worker ({} actions): {summary}", turns.len()) }).await;
+                    return true;
+                }
+                Some(Action::Tool { tool, mut args, why }) => {
+                    let shown = format!("{tool} {}", tokens::truncate_tokens(&args.to_string(), 60));
+                    if !tools.contains(&tool) {
+                        turns.push((shown, false, format!("'{tool}' is not one of the TOOLS")));
+                        continue;
+                    }
+                    // a server never returns: in the foreground it would hold the loop until its timeout
+                    if tool == "shell"
+                        && args.get("background").is_none()
+                        && let Some(cmd) = args.get("command").and_then(|c| c.as_str())
+                        && crate::implement::implies_background(&why, cmd)
+                    {
+                        args["background"] = json!(true);
+                    }
+                    let mut s = Step::tool(&format!("{id}_fix{k}"), &tool, &format!("fix {id}: {why}"), args);
+                    s.approval_required = self.tools.meta(&tool).map(|m| m.requires_approval).unwrap_or(false);
+                    s.how = Some("step-agent".into());
+                    let res = self.run_tool(ctx, &s, false, &[]).await;
+                    let (ok, text) = match res {
+                        Ok(o) => (true, o.content),
+                        Err(f) => (false, f.message),
+                    };
+                    // recorded in the plan; an action that failed is kept as skipped (it is history, not a failed step of the task)
+                    s.status = if ok { StepStatus::Succeeded } else { StepStatus::Skipped };
+                    s.summary = Some(tokens::truncate_tokens(&text, 300));
+                    s.output = Some(text.clone());
+                    if !ok {
+                        s.error = Some(clip_error(&text, 200));
+                    }
+                    {
+                        let mut r = ctx.rec.lock().await;
+                        if let Some(p) = r.plan.as_mut() {
+                            let at = p.steps.iter().position(|x| x.id == id).unwrap_or(p.steps.len());
+                            p.steps.insert(at, s);
+                        }
+                    }
+                    self.persist(ctx).await;
+                    turns.push((shown, ok, text));
+                }
+            }
+        }
+        false
+    }
+
     async fn commit_revision(&self, ctx: &Arc<TaskCtx>, steps: Vec<Step>, _patch: Option<&crate::plandoc::PatchDoc>, problem: &str) {
         let revised = {
             let mut r = ctx.rec.lock().await;

@@ -972,3 +972,34 @@ async fn a_verified_task_leaves_its_durable_facts_and_a_newer_value_supersedes_t
     assert_eq!(current, vec!["port of app server: 9443"]);
     assert!(all.iter().any(|m| m.item.text.ends_with("8443") && m.item.metadata.get("superseded_by").is_some()), "the old one is kept as history");
 }
+
+#[tokio::test]
+async fn a_failed_step_is_fixed_by_the_worker_with_tools_before_the_planner_is_asked() {
+    let r = rig(false, |c| c.economy.step_agent = true);
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "read data/input.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    // the step agent: write the missing file, then say it is fixed
+    r.worker.push(&json!({"action": "tool", "tool": "fs_write", "args": {"path": "data/input.txt", "content": "hello\n"}, "why": "create the missing input", "summary": null, "reason": null}).to_string());
+    r.worker.push(&json!({"action": "done", "tool": null, "args": null, "why": null, "summary": "created data/input.txt", "reason": null}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} / {:?}", t.error, t.final_answer);
+    let plan = t.plan.as_ref().unwrap();
+    let ids: Vec<&str> = plan.steps.iter().map(|s| s.id.as_str()).collect();
+    assert_eq!(ids, ["s1_fix1", "s1"], "the fix is recorded in the plan, before the step it fixed");
+    assert_eq!(plan.step("s1_fix1").unwrap().how.as_deref(), Some("step-agent"));
+    assert_eq!(plan.step("s1").unwrap().status, StepStatus::Succeeded);
+    assert_eq!(r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("replan")).count(), 0, "no planning round");
+    assert_eq!(t.usage.replans, 0);
+}
+
+#[tokio::test]
+async fn a_step_the_worker_cannot_fix_still_goes_to_the_planner() {
+    let r = rig(false, |c| c.economy.step_agent = true);
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "read data/input.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    r.worker
+        .push(&json!({"action": "give_up", "tool": null, "args": null, "why": null, "summary": null, "reason": "the file is not mine to create"}).to_string());
+    r.planner.push(&json!({"edit": [], "add": [{"id": "r1_1", "do": "list the workspace", "tool": "fs_list", "after": [], "expect": null, "planner": false}], "drop": ["s1"]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
+    assert_eq!(r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("replan")).count(), 1, "{:?}", t.error);
+}

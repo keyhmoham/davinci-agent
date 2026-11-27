@@ -57,6 +57,8 @@ pub(crate) struct TaskCtx {
     pub mcp_hidden: Mutex<HashSet<String>>,
     /// A conversational reply said the request needs a task (a lookup, a command): the pipeline then runs it as one.
     pub reroute: std::sync::atomic::AtomicBool,
+    /// Steps the step agent has already tried to fix (one loop per step).
+    pub fixed: Mutex<HashSet<String>>,
 }
 
 impl TaskCtx {
@@ -78,6 +80,7 @@ impl TaskCtx {
             mcp: Mutex::new(HashSet::new()),
             mcp_hidden: Mutex::new(HashSet::new()),
             reroute: std::sync::atomic::AtomicBool::new(false),
+            fixed: Mutex::new(HashSet::new()),
         })
     }
 

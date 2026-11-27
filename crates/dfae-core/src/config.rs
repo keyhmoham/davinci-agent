@@ -243,6 +243,12 @@ pub struct EconomyConfig {
     /// After a verified task, the worker model names its durable facts for semantic memory (`DFAE_FACTS=off` disables it).
     #[serde(default)]
     pub facts: bool,
+    /// A failed step gets one short tool loop by the worker model (the step agent) before the planner is asked to patch the plan
+    /// (`DFAE_STEP_AGENT=on`; turns: `DFAE_STEP_AGENT_TURNS`, default 6).
+    #[serde(default)]
+    pub step_agent: bool,
+    #[serde(default)]
+    pub step_agent_turns: u32,
 }
 
 /// Team orchestration and dispatch limits.
@@ -412,6 +418,8 @@ impl Config {
                 workspace_snapshot: !matches!(env("DFAE_WORKSPACE_SNAPSHOT").as_deref(), Some("off" | "false" | "0")),
                 condense: !matches!(env("DFAE_CONDENSE").as_deref(), Some("off" | "false" | "0")),
                 facts: !matches!(env("DFAE_FACTS").as_deref(), Some("off" | "false" | "0")),
+                step_agent: matches!(env("DFAE_STEP_AGENT").as_deref(), Some("on" | "true" | "1")),
+                step_agent_turns: env_parse("DFAE_STEP_AGENT_TURNS", 6u32).clamp(1, 12),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),

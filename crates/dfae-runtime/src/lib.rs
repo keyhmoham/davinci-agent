@@ -21,6 +21,7 @@ pub mod prompts;
 mod session;
 mod shadow;
 pub mod skills;
+pub mod step_agent;
 mod style;
 mod syntax;
 pub mod team;
