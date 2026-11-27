@@ -179,7 +179,8 @@ fn cases() -> Vec<Case> {
                 let href = lower.split("href=\"").skip(1).map(|h| h.split('"').next().unwrap_or("")).find(|h| h.contains("about"));
                 let href = href.ok_or("the home page does not link to an about page")?;
                 let (ok, about) = run(ws, &format!("curl -fsS http://127.0.0.1:{port}/{}", href.trim_start_matches('/')));
-                if ok && about.to_lowercase().contains("about") && about.contains("Crumb") { Ok(()) } else { Err(format!("the about page ({href}): {about}")) }
+                // a second page about the bakery ("Our Story — Crumb & Co" is an about page without the word)
+                if ok && about.contains("Crumb") && about != home { Ok(()) } else { Err(format!("the about page ({href}): {about}")) }
             },
         },
         Case {

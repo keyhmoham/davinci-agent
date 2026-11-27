@@ -175,3 +175,8 @@ run by run (drift in the providers hits both), one frozen build:
 * The one failure of the "on" arm was **not** the step agent: the one-file split (round 3) had split an `fs_edit` step that named a test
   file as a *reference* ("fix stats.py to meet test_stats.py") and the worker edited the test file. The split now applies to `fs_read`
   only (renames across files are one `fs_edit` on the directory).
+
+## Final check with every default on (hosted decisions, semantic memory, facts, step agent, pinned worker)
+
+`live_worker` 5/5. `live_e2e` (10 harder cases, one run each): 9/10 by the oracle, **1 re-plan in all**, $0.0182; the one "failure" was
+the oracle's (an about page titled "Our Story — Crumb & Co" without the word "about"), now fixed. Every case's task completed.
