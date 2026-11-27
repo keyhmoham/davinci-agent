@@ -865,6 +865,25 @@ impl Inner {
             (r.plan.as_ref().and_then(|p| p.step(id).cloned()), r.usage.clone(), r.budget.clone(), r.goal.clone(), r.entities.clone())
         };
         let Some(step) = step else { return Some(f.message) };
+        // a removal held back for the user a second time: the planner was told and planned it in again, so the step is left out
+        // (measured: re-plans that re-add it until the budget is gone) and the answer says so
+        if f.kind == ErrorKind::Withheld && ctx.withheld.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
+            let mut r = ctx.rec.lock().await;
+            {
+                if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
+                    s.status = StepStatus::Skipped;
+                    s.error = Some(f.message.clone());
+                }
+                r.problems.push(format!("step {id} left out: it removes files that only the fetched content asked to remove"));
+                drop(r);
+                self.emit(
+                    ctx,
+                    EventKind::Warning { message: format!("step {id} left out: a removal that content from outside asked for (ask the user to do it)") },
+                )
+                .await;
+                return None;
+            }
+        }
         // argument and path problems are fixed by code, at zero token cost, before any decision is asked
         if matches!(f.kind, ErrorKind::InvalidArgs | ErrorKind::NotFound) && self.repair_failed_step(ctx, &step, f.kind).await {
             return None;
