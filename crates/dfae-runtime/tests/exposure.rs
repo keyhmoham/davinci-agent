@@ -122,6 +122,11 @@ async fn a_removal_a_fetched_page_asked_for_is_refused_and_the_rest_goes_on() {
     assert!(t.problems.iter().any(|p| p.contains("removes tests")), "{:?}", t.problems);
     assert_eq!(t.usage.replans, 1);
     assert!(t.exposed && !t.tainted, "exposed to outside content, nothing flagged as an injection");
+    assert!(
+        t.final_answer.as_deref().unwrap_or("").contains("Left out — content from outside asked for it, your request did not: removes tests."),
+        "the answer says what was held back: {:?}",
+        t.final_answer
+    );
     let replan = seen.last().unwrap();
     assert!(replan.contains("HELD BACK FOR THE USER") && replan.contains("removes tests"), "the re-plan is told what stays out: {replan}");
 }

@@ -271,6 +271,24 @@ impl Inner {
         ctx.rec.lock().await.verification = Some(verification);
         let mode = ctx.rec.lock().await.mode.unwrap_or(mode);
         self.stage_answer(ctx, mode, exec_err.as_deref()).await;
+        // what was held back for the user is said in the answer, whoever wrote it (a templated answer lists only what ran)
+        let held = ctx.withheld.lock().clone();
+        if !held.is_empty() {
+            let mut r = ctx.rec.lock().await;
+            let note = format!(
+                "\n⚠ Left out — content from outside asked for it, your request did not: {}. Ask again naming it if you want it done.",
+                held.iter()
+                    .map(|h| {
+                        // "<step> (refused: this removes tests — files that …)" → "removes tests"
+                        let what = h.split_once("refused: this ").map(|(_, w)| w).unwrap_or(h);
+                        what.split(" — ").next().unwrap_or(what).split(", read from").next().unwrap_or(what).to_string()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+            let a = r.final_answer.get_or_insert_with(String::new);
+            a.push_str(&note);
+        }
         match exec_err {
             Some(e) => Err(e),
             None => Ok(()),
