@@ -579,7 +579,7 @@ impl Inner {
 
     /// The files this task has written so far (the last three, from the same project), as text for a prompt: what a file written now must
     /// agree with. Each is cut short; only files, never what is outside the workspace.
-    async fn related_files(&self, ctx: &Arc<TaskCtx>, this_step: &str, target: &str) -> String {
+    async fn related_files(&self, ctx: &Arc<TaskCtx>, this_step: &str, target: &str, per_file: usize) -> String {
         let paths: Vec<String> = {
             let r = ctx.rec.lock().await;
             let Some(plan) = r.plan.as_ref() else { return String::new() };
@@ -598,7 +598,7 @@ impl Inner {
                 && let Ok(text) = std::fs::read_to_string(full)
                 && !text.is_empty()
             {
-                let cut: String = text.chars().take(3500).collect();
+                let cut: String = text.chars().take(per_file).collect();
                 shown.push(dfae_core::safety::wrap_untrusted(
                     &format!("file {p}"),
                     &if cut.len() < text.len() { format!("{cut}\n… [file continues]") } else { cut },
@@ -686,7 +686,14 @@ impl Inner {
         // The step is the instruction. The whole request is background, and only when the step alone is too thin to go on:
         // with two files in one request a small model writes the wrong one into the wrong file.
         let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
-        let mut user = format!("FILE TO WRITE (write only this one): {path}\nSTEP: {}\n", step.description);
+        // what kind of file this is, for this project (a Next.js page is not a standalone HTML document), and the project it belongs to
+        let project = crate::project::find(self.policy.workspace(), path);
+        let contract = crate::project::content_contract(path, project.as_ref());
+        let card = project.as_ref().and_then(crate::project::project_card);
+        let mut user = format!("FILE TO WRITE (write only this one): {path}\nFILE CONTRACT: {contract}\nSTEP: {}\n", step.description);
+        if let Some(card) = &card {
+            user.push_str(&format!("{}\n", dfae_core::safety::wrap_untrusted("PROJECT", card)));
+        }
         if step.description.split_whitespace().count() < 9 {
             user.push_str(&format!("BACKGROUND (the whole request; other files in it are written by other steps): {}\n", tokens::truncate_tokens(&goal, 300)));
         }
@@ -708,7 +715,8 @@ impl Inner {
             ));
         }
         // a file that belongs to a project is written knowing the others (the tests of a module see the module; a page sees its styles)
-        let related = self.related_files(ctx, &step.id, path).await;
+        // with the project card at hand, the other files are shown shorter: the card already says what the project is
+        let related = self.related_files(ctx, &step.id, path, if card.is_some() { 1200 } else { 3500 }).await;
         if !related.is_empty() {
             user.push_str(&format!("{related}\nThis file must fit with the files above (names, imports, paths, interfaces).\n"));
         }
@@ -725,8 +733,11 @@ impl Inner {
         let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?, path));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
         let missing = missing_names(&step.description, path, &text);
+        let unpinned = if path.ends_with("package.json") { crate::recipes::unpinned_deps(&text) } else { vec![] };
         let why = if degenerate(&text) {
             Some("it repeated the same lines".to_string())
+        } else if !unpinned.is_empty() {
+            Some(format!("it pins nothing for {}: give each dependency a known major version (\"^15.5.0\"), never latest or *", unpinned.join(", ")))
         } else if !missing.is_empty() {
             Some(format!("it does not mention {}, which the step names: the file is about that", missing.join(", ")))
         } else {
@@ -740,7 +751,9 @@ impl Inner {
         let mut req = self.gen_request(
             tier,
             prompts::CONTENT_SYSTEM,
-            format!("{user}YOUR PREVIOUS VERSION WAS REJECTED: {why}. Write the whole file again, complete, with its styles inside it and no external files, and with no repetition.\n"),
+            format!(
+                "{user}YOUR PREVIOUS VERSION WAS REJECTED: {why}. Write the whole file again, complete, following the FILE CONTRACT, and with no repetition.\n"
+            ),
             "content",
         );
         req.temperature = 0.4;

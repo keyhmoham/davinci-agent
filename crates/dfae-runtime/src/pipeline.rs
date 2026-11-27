@@ -228,6 +228,10 @@ impl Inner {
             }
         }
         let mut plan = plan;
+        // new work goes into a directory of its own, whatever the plan wrote (coding plan B3): the workspace is not rewound between tasks,
+        // and an old project's leftovers (a stray tsconfig, page.jsx beside page.tsx) were inherited by every attempt
+        self.own_directory(ctx, &goal, &mut plan).await;
+        *ctx.dirs_before.lock() = Some(crate::workspace::top_dirs(self.policy.workspace()));
         // a brief plan's remaining work is the local system's: free, apart from what the planner flagged
         let any_brief = plan.steps.iter().any(|s| s.brief);
         plan.estimate = Some(self.cost.estimate_plan(&plan, self.uses_planner(mode) && !any_brief));
@@ -947,6 +951,51 @@ impl Inner {
         Ok((steps, report))
     }
 
+    /// A request for something new whose plan writes into an existing, non-empty directory the request does not name: the plan is moved
+    /// to a directory named for the request, in code (no planner call). Every path, cwd and expectation follows.
+    async fn own_directory(&self, ctx: &Arc<TaskCtx>, goal: &str, plan: &mut Plan) {
+        use crate::workspace::{free_dir, move_dir_in, new_work, slug, top_dirs};
+        if !new_work(goal) {
+            return;
+        }
+        let ws = self.policy.workspace();
+        let goal_l = goal.to_lowercase();
+        let texts = |s: &Step| {
+            let mut t = vec![s.description.clone(), s.expect.clone().unwrap_or_default()];
+            if let Some(m) = s.args.as_object() {
+                t.extend(m.values().filter_map(|v| v.as_str()).map(str::to_string));
+            }
+            t
+        };
+        let used = top_dirs(ws).into_iter().find(|d| {
+            let full = ws.join(d);
+            std::fs::read_dir(&full).is_ok_and(|mut rd| rd.next().is_some())
+                && !goal_l.contains(&d.to_lowercase())
+                && plan.steps.iter().any(|s| texts(s).iter().any(|t| move_dir_in(t, d, "\u{1}") != *t))
+        });
+        let Some(old) = used else { return };
+        let new = free_dir(ws, &slug(goal));
+        for s in &mut plan.steps {
+            s.description = move_dir_in(&s.description, &old, &new);
+            s.expect = s.expect.as_deref().map(|e| move_dir_in(e, &old, &new));
+            if let serde_json::Value::Object(m) = &mut s.args {
+                for v in m.values_mut() {
+                    if let serde_json::Value::String(t) = v {
+                        *t = if t.trim_end_matches('/') == old { new.clone() } else { move_dir_in(t, &old, &new) };
+                    }
+                }
+            }
+        }
+        self.emit(
+            ctx,
+            EventKind::Repaired {
+                step_id: "plan".into(),
+                note: format!("new work gets its own directory: the plan wrote into the existing {old}/, it now uses {new}/"),
+            },
+        )
+        .await;
+    }
+
     /// What the workspace holds, one line, for a request that has to touch it (empty when the request needs no tools).
     pub(crate) async fn workspace_line(&self, ctx: &Arc<TaskCtx>) -> String {
         if !self.cfg.economy.workspace_snapshot {
@@ -959,7 +1008,31 @@ impl Inner {
         let s = crate::workspace::snapshot(self.policy.workspace(), 24);
         let ports = self.ports_line().await;
         let runtimes = self.runtimes_line().await;
-        if s.is_empty() { format!("{runtimes}{ports}") } else { format!("\n{s}{runtimes}{ports}") }
+        let recipe = self.recipe_line(ctx).await;
+        if s.is_empty() { format!("{runtimes}{ports}{recipe}") } else { format!("\n{s}{runtimes}{ports}{recipe}") }
+    }
+
+    /// The pinned recipe card for a framework the request names (coding plan B2), in the user message only, only on a match.
+    async fn recipe_line(&self, ctx: &Arc<TaskCtx>) -> String {
+        if self.policy.config().shell.mode != dfae_tools::ShellMode::Sandbox {
+            return String::new();
+        }
+        let goal = ctx.rec.lock().await.goal.clone();
+        let Some(recipe) = crate::recipes::matching(&goal) else { return String::new() };
+        tracing::info!(task = %ctx.id, recipe = recipe.name, "a recipe card goes to the planner");
+        let ws = self.policy.workspace();
+        let base = crate::workspace::slug(&goal);
+        let dir = if crate::workspace::new_work(&goal) { crate::workspace::free_dir(ws, &base) } else { base };
+        let mut port = 8000;
+        for p in 8000u16..=8010 {
+            let up =
+                tokio::time::timeout(std::time::Duration::from_millis(200), tokio::net::TcpStream::connect(("127.0.0.1", p))).await.is_ok_and(|r| r.is_ok());
+            if !up {
+                port = p;
+                break;
+            }
+        }
+        crate::recipes::card_for(&goal, &dir, port).unwrap_or_default()
     }
 
     /// Which runtimes the shell has, with their versions: a plan that scaffolds a project, picks a framework version or writes code for a
@@ -1174,6 +1247,18 @@ impl Inner {
         } else {
             TaskStatus::Completed
         };
+        // the directories this task made are remembered with the request they were made for: a follow-up ("make its title bigger") finds
+        // its project by that, and the next new request does not mistake it for a free place to build in
+        let before = ctx.dirs_before.lock().clone();
+        if status == TaskStatus::Completed
+            && ctx.depth == 0
+            && let Some(before) = before
+        {
+            let goal = ctx.rec.lock().await.goal.clone();
+            for d in crate::workspace::top_dirs(self.policy.workspace()).into_iter().filter(|d| !before.contains(d)) {
+                crate::workspace::record_origin(self.policy.workspace(), &d, &goal);
+            }
+        }
         if let Err(e) = &outcome {
             let mut r = ctx.rec.lock().await;
             r.error = Some(e.clone());

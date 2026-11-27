@@ -61,6 +61,8 @@ pub(crate) struct TaskCtx {
     pub fixed: Mutex<HashSet<String>>,
     /// What the step agent tried on a step and why it stopped, for the re-plan that follows ("tried: …; the same error every time: …").
     pub fix_notes: Mutex<HashMap<String, String>>,
+    /// The workspace's top-level directories when the plan was installed: those that appear later were made by this task.
+    pub dirs_before: Mutex<Option<Vec<String>>>,
     /// How hard the planner thinks for this task (from the request's complexity), and how many re-planning rounds it has had.
     pub planner_effort: Mutex<Option<String>>,
     pub planner_rounds: std::sync::atomic::AtomicU32,
@@ -90,6 +92,7 @@ impl TaskCtx {
             reroute: std::sync::atomic::AtomicBool::new(false),
             fixed: Mutex::new(HashSet::new()),
             fix_notes: Mutex::new(HashMap::new()),
+            dirs_before: Mutex::new(None),
             planner_effort: Mutex::new(None),
             planner_rounds: std::sync::atomic::AtomicU32::new(0),
             withheld: Mutex::new(Vec::new()),

@@ -1118,3 +1118,23 @@ async fn a_page_the_planner_describes_is_written_whole_not_reduced_to_the_fragme
     let written = std::fs::read_to_string(r.ws.path().join("shop/contact.html")).unwrap();
     assert_eq!(written, page, "the content writer wrote the page");
 }
+
+#[tokio::test]
+async fn new_work_gets_its_own_directory_and_a_follow_up_still_finds_the_old_one() {
+    let r = rig(false, |_| {});
+    std::fs::create_dir_all(r.ws.path().join("site")).unwrap();
+    std::fs::write(r.ws.path().join("site/index.html"), "<html><body>Earth</body></html>").unwrap();
+    // the planner reuses the old project directory, as it did for four tasks in a row
+    r.planner.push(
+        &json!({"steps": [{"id": "s1", "do": "write site/moon.html: a short page about the moon", "tool": "fs_write", "after": [], "expect": "site/moon.html exists", "planner": false}]})
+            .to_string(),
+    );
+    r.worker.push("<!doctype html><html><body><h1>The Moon</h1></body></html>");
+    let t = run_as(&r, ModeRequest::Escalated, "Create a page about the moon").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert!(r.ws.path().join("moon/moon.html").exists(), "the page went into a directory of its own");
+    assert!(!r.ws.path().join("site/moon.html").exists());
+    assert_eq!(std::fs::read_dir(r.ws.path().join("site")).unwrap().count(), 1, "the old project is untouched");
+    let origins = std::fs::read_to_string(r.ws.path().join(".dfae/dirs.json")).unwrap();
+    assert!(origins.contains("\"moon\"") && origins.contains("Create a page about the moon"), "{origins}");
+}
