@@ -42,6 +42,39 @@ pub struct DecisionConfig {
     pub parallel: usize,
     /// Which decisions the model makes (`all` or a list of kinds); the rest use the built-in rules.
     pub kinds: Vec<String>,
+    /// A hosted Decisions API (`<base>/decisions`): `DECISION_PROVIDER=decisions`, or by default when no self-hosted model is
+    /// configured and the planner's key reaches Vercel AI Gateway. `None`: not used.
+    #[serde(default)]
+    pub hosted: Option<HostedDecisionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostedDecisionConfig {
+    pub base_url: String,
+    pub model: String,
+    #[serde(skip_serializing)]
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+}
+
+/// The hosted Decisions API, if it is to be used: asked for (`DECISION_PROVIDER=decisions`), or the default when no self-hosted
+/// decision model is configured (`DECISION_BASE_URL` unset, `DECISION_PROVIDER` not `local`) and the planner's key reaches Vercel AI
+/// Gateway, which serves `openai/gpt-6-luna-decisions`. `DECISION_API_BASE_URL` / `DECISION_API_MODEL` / `DECISION_API_KEY` override.
+fn hosted_decisions(planner: &ModelConfig) -> Option<HostedDecisionConfig> {
+    let provider = env("DECISION_PROVIDER").map(|p| p.to_ascii_lowercase());
+    let asked = provider.as_deref() == Some("decisions");
+    let by_default = provider.is_none() && env("DECISION_BASE_URL").is_none() && planner.base_url.contains("ai-gateway.vercel.sh") && planner.api_key.is_some();
+    if !(asked || by_default) {
+        return None;
+    }
+    let base_url = env("DECISION_API_BASE_URL").unwrap_or_else(|| planner.base_url.clone());
+    let api_key = env("DECISION_API_KEY").or_else(|| (base_url == planner.base_url).then(|| planner.api_key.clone()).flatten());
+    Some(HostedDecisionConfig {
+        base_url,
+        model: env_or("DECISION_API_MODEL", "openai/gpt-6-luna-decisions"),
+        api_key,
+        timeout_ms: env_parse("DECISION_API_TIMEOUT_MS", 10_000),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +99,11 @@ pub struct ModelConfig {
     /// `<PREFIX>_REASONING_HARD`: the thinking effort when the model repairs something (a plan that hit a failure): debugging is the one
     /// job where thinking longer pays for itself. Default `medium` for the planner; unset for the worker (it keeps `reasoning`).
     pub reasoning_hard: Option<String>,
+    /// `<PREFIX>_PROVIDERS=a,b,c`: on Vercel AI Gateway, the upstream providers that may serve this model, in order of preference
+    /// (`providerOptions.gateway.order` and `only`). Keeps every call on providers with known weights (no quantised copies),
+    /// retention terms and latency, and on one provider's prompt cache. Empty: the gateway chooses. `any` clears a default.
+    #[serde(default)]
+    pub providers: Vec<String>,
 }
 
 /// Where hosted models are reached unless a deployment says otherwise (an OpenAI-compatible gateway).
@@ -77,7 +115,17 @@ impl ModelConfig {
     /// A hosted model from `<PREFIX>_PROVIDER` (`openai` | `anthropic` | `none`; default `openai` once a key is set),
     /// `_BASE_URL`, `_MODEL`, `_API_KEY`, `_MAX_TOKENS`, `_CONTENT_MAX_TOKENS`, `_TIMEOUT_SECS`. The planner and the worker
     /// model are configured the same way.
-    fn from_env(prefix: &str, default_model: &str, max_tokens: u32, content_max_tokens: u32, timeout_secs: u64, reasoning: &str, hard: &str) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn from_env(
+        prefix: &str,
+        default_model: &str,
+        max_tokens: u32,
+        content_max_tokens: u32,
+        timeout_secs: u64,
+        reasoning: &str,
+        hard: &str,
+        providers: &str,
+    ) -> Self {
         let var = |k: &str| env(&format!("{prefix}_{k}"));
         let provider = var("PROVIDER").unwrap_or_else(|| if var("API_KEY").is_some() { "openai".into() } else { "none".into() });
         Self {
@@ -94,6 +142,17 @@ impl ModelConfig {
                 .map(|r| r.to_ascii_lowercase())
                 .filter(|r| r != "default" && !r.is_empty()),
             prompt_cache: var("PROMPT_CACHE").map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")),
+            providers: {
+                let model = var("MODEL").unwrap_or_else(|| default_model.into());
+                // the default list belongs to the default model: another model has other providers
+                let fallback = if model == default_model { providers } else { "" };
+                var("PROVIDERS")
+                    .unwrap_or_else(|| fallback.into())
+                    .split(',')
+                    .map(|p| p.trim().to_ascii_lowercase())
+                    .filter(|p| !p.is_empty() && p != "any")
+                    .collect()
+            },
         }
     }
 }
@@ -238,8 +297,10 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
-        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium");
-        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "off", "");
+        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium", "");
+        // GLM-5.3-Flash always thinks (it cannot be switched off): `low` is its least effort. Its providers: unquantised weights, zero data
+        // retention and no training on the data, the best tail latency (measured 2026-11-27 on the gateway's endpoint list).
+        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "low", "", "baseten,nebius,fireworks");
         // one gateway, one key: a worker with no key of its own uses the planner's when they share an endpoint
         if worker.api_key.is_none() && worker.base_url == planner.base_url && planner.api_key.is_some() {
             worker.api_key = planner.api_key.clone();
@@ -274,6 +335,7 @@ impl Config {
                 parallel: env_parse("DECISION_PARALLEL", 3),
                 // the model is self-hosted and free per token, so it makes every decision; narrow it to save latency
                 kinds: env_or("DECISION_KINDS", "all").split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                hosted: hosted_decisions(&planner),
             },
             worker,
             planner,
@@ -328,6 +390,7 @@ impl Default for Config {
         c.database_url = None;
         c.gliner_url = None;
         c.decision.base_url = None;
+        c.decision.hosted = None;
         c.approvals = ApprovalMode::Ask; // the approval machinery is what the hermetic tests exercise
         c.worker.provider = "none".into();
         c.planner.provider = "none".into();

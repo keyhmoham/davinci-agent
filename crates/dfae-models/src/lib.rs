@@ -28,7 +28,7 @@ pub fn build_model(cfg: &ModelConfig) -> Option<Arc<dyn LanguageModel>> {
     let timeout = Duration::from_secs(cfg.timeout_secs);
     match cfg.provider.as_str() {
         "openai" => {
-            let mut m = OpenAiCompat::new(&cfg.base_url, &cfg.model, cfg.api_key.clone(), timeout);
+            let mut m = OpenAiCompat::new(&cfg.base_url, &cfg.model, cfg.api_key.clone(), timeout).with_providers(&cfg.providers);
             if let Some(on) = cfg.prompt_cache {
                 m = m.with_prompt_cache(on);
             }

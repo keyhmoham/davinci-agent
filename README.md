@@ -7,7 +7,7 @@ model** that routes, selects tools and judges, and a hosted, cheaper **worker mo
 cannot and writes content. Execution, security, memory and verification are deterministic code.
 
 ```
-docker compose up -d --build     # engine + Postgres/pgvector + GLiNER + Ollama (decision model)
+docker compose up -d --build     # engine + Postgres/pgvector + GLiNER (decisions: hosted Decisions API; COMPOSE_PROFILES=local-decisions adds Ollama)
 docker compose run --rm tui      # the terminal UI
 # or both:  ./dfae
 ```

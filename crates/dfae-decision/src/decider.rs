@@ -126,7 +126,7 @@ impl Decider {
             tokens_out: if from_cache { 0 } else { resp.output_tokens },
             note,
         };
-        let entry = (resp.provider == "open-model").then(|| LedgerEntry {
+        let entry = matches!(resp.provider.as_str(), "open-model" | "decisions-api").then(|| LedgerEntry {
             ts: Utc::now(),
             component: Component::Decision,
             model: resp.model.clone(),
@@ -140,7 +140,7 @@ impl Decider {
             origin: None,
             reasoning_tokens: 0,
             cache_write_tokens: 0,
-            cost_usd: None,
+            cost_usd: if from_cache { None } else { resp.cost_usd },
         });
         (resp, record, entry)
     }

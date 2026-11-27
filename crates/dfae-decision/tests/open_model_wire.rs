@@ -54,6 +54,7 @@ fn cfg(base: String) -> DecisionConfig {
         timeout_ms: 3000,
         parallel: 1,
         kinds: vec![],
+        hosted: None,
     }
 }
 

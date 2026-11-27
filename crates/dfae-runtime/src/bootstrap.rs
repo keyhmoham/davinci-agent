@@ -41,7 +41,20 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     if let Some(p) = &open {
         p.start_warmup(); // load the model in the background; decisions use the local rules until it answers
     }
-    let primary: Option<Arc<dyn DecisionProvider>> = open.map(|p| p as Arc<dyn DecisionProvider>);
+    // a self-hosted model when one is configured; otherwise the hosted Decisions API when it is (the rules are the fallback of both)
+    let hosted = config
+        .decision
+        .hosted
+        .as_ref()
+        .and_then(|h| dfae_decision::HostedDecisions::new(&h.base_url, &h.model, h.api_key.clone(), std::time::Duration::from_millis(h.timeout_ms)));
+    let primary: Option<Arc<dyn DecisionProvider>> = match (open, hosted) {
+        (Some(p), _) => Some(p as Arc<dyn DecisionProvider>),
+        (None, Some(h)) => {
+            tracing::info!(model = %config.decision.hosted.as_ref().map(|h| h.model.as_str()).unwrap_or(""), "decisions: hosted Decisions API");
+            Some(Arc::new(h) as Arc<dyn DecisionProvider>)
+        }
+        (None, None) => None,
+    };
     let decider = Arc::new(Decider::new(primary, calibrator, config.thresholds.clone()).with_model_kinds(&config.decision.kinds));
     // models
     let models = ModelGateway::new(build_model(&config.worker), build_model(&config.planner));

@@ -291,6 +291,8 @@ pub struct DecisionResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub latency_ms: u64,
+    /// What the decision cost in USD, when a hosted provider says so.
+    pub cost_usd: Option<f64>,
 }
 
 impl DecisionResponse {

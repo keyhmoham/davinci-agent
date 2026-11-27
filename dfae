@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 compose() { docker compose "$@"; }
 # The first start downloads the worker model (~2 GB). Requests fail with "model not found" until that is done.
 wait_models() {
+  # only with the self-hosted decision model (COMPOSE_PROFILES=local-decisions); the default hosted one needs no download
+  [[ ",${COMPOSE_PROFILES:-}," == *",local-decisions,"* ]] || return 0
   if [[ -n "$(docker compose ps -q --status running ollama-pull 2>/dev/null)" ]]; then
     echo "Waiting for the decision model download to finish (follow it with: ./dfae logs ollama-pull)..." >&2
   fi

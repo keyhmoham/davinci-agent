@@ -41,3 +41,29 @@ A plan with a warm cache costs about **$0.0001**. Costs are already very low. Wh
    Brewster") is rejected and rewritten with the reason (`missing_names`).
 
 After the fixes: **15/15** live runs pass (3 runs × 5 cases); 2 of 3 runs failed before.
+
+## Round 2: hosted decisions, worker provider pinning, `low` worker effort
+
+**Decisions API (`openai/gpt-6-luna-decisions`) as the default decision provider** (`DECISION_PROVIDER=decisions`, or by default when no
+self-hosted model is set and the planner's key reaches the gateway; the rules stay the fallback). Routing accuracy over 5 labels per
+request (`needs_tools`, `changes`, `asks`, `smalltalk`, `fresh_data`), `cargo test -p dfae-decision --test routing_eval -- --ignored`:
+
+| Set | Rules | Hosted (as first written) | Hosted + context line + clearer wording |
+|---|---:|---:|---:|
+| tuning set (36 requests, 180 labels) | 94.4% | 93.9% | 97.8% (the wording was tuned on this set) |
+| **held-out set** (30 requests, 150 labels, labelled before any run) | **91.3%** | — | **98.0%** |
+
+* The first hosted run did **not** beat the rules: the model was not told the agent has files, a shell and web tools, so "which files
+  mention TODO?" looked like general knowledge (`needs_tools=false`). One context line fixed that.
+* On held-out phrasings the rules miss things that matter: "add a dark mode toggle to site/index.html" → no tools (it would be answered
+  as chat), "kill the process on port 8001" / "upgrade the dependencies" → no change, "will it rain in London tomorrow" → not fresh.
+* Cost: about **$0.0003–0.0004 per task** (3–5 decision calls of ≈ 1,000 input tokens; output is free), about 3× the planner's cost on a
+  small task, $0.35 per 1,000 tasks. It replaces the 2.5 GB self-hosted model.
+* The `fresh_data` question no longer counts "the state of this machine" (it sent "check disk usage" toward web tools), and
+  `asks_answer` no longer counts "list / show / find / check something".
+
+**Worker providers pinned** (`WORKER_PROVIDERS`, default `baseten,nebius,fireworks`: unquantised, zero data retention, no training,
+$0.15/$0.50, best p95 latency on the gateway's endpoint list) through `providerOptions.gateway.order` + `only`.
+**`WORKER_REASONING=low`** by default (GLM-5.3-Flash cannot switch thinking off; `low` measured 0 reasoning tokens on ordinary steps).
+
+Live suite after these changes: 5/5 × 3 runs pass.

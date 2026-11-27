@@ -211,6 +211,7 @@ impl OpenModelProvider {
             input_tokens: tin,
             output_tokens: tout,
             latency_ms: started.elapsed().as_millis() as u64,
+            cost_usd: None,
         })
     }
 }

@@ -599,6 +599,7 @@ impl DecisionProvider for LocalDecider {
             input_tokens: 0,
             output_tokens: 0,
             latency_ms: started.elapsed().as_millis() as u64,
+            cost_usd: None,
         })
     }
 }
