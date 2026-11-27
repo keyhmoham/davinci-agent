@@ -248,3 +248,9 @@ run with 2 failures, a 320-line build log with one type error, a 600-line app lo
   its neighbours — an error 431 lines into a log was cut off by every length limit before. JSON is flattened to one record per line.
 * On top of it, selection by line number: −78% output tokens and nothing written that the output does not say. Used for big trusted
   outputs (the free-text condenser is gone) and for untrusted ones (after the instruction-like lines are dropped). Live: 5/5.
+
+**GLiNER-PII for names and street addresses (GLiNER reused off the hot path).** `urchade/gliner_multi_pii-v1` through the existing
+service, labels `person` and `street address`. Tuning set (13 names/addresses, 12 lookalikes): threshold 0.5 → 13/13 and 1/12 flagged
+("Rust" as a person), 0.7 → 12/13 and 0/12; **0.6 chosen before a fresh held-out set → 14/14 found, 0/12 lookalikes touched** (products,
+companies, cities, frameworks). Wired in as a second redaction pass when memory is written (`DFAE_PII_NER_URL`, compose profile `pii`);
+live test: a request naming a person and an address leaves "post it to [NAME] at [ADDRESS]" in memory, the task record unchanged.

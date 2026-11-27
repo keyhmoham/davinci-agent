@@ -32,6 +32,17 @@ services:
   # Entity extraction (GLiNER). The model downloads on first start.
   # Optional (COMPOSE_PROFILES=gliner, GLINER_URL=http://gliner:8000): on the harder end-to-end suite it made no measurable difference
   # (rules only 29/30, with GLiNER 28/30, same cost, +18% time), so requests are read with rules and the planner's own sentences.
+  # Optional (COMPOSE_PROFILES=pii, DFAE_PII_NER_URL=http://gliner-pii:8000): a GLiNER PII model that takes person names and street
+  # addresses out of what is kept for later (held-out set: 14/14 found, 0/12 lookalikes touched), off the request path.
+  gliner-pii:
+    build: ./services/gliner-service
+    profiles: ["pii"]
+    restart: unless-stopped
+    environment:
+      GLINER_MODEL: ${GLINER_PII_MODEL:-urchade/gliner_multi_pii-v1}
+    volumes:
+      - hf-models:/models
+
   gliner:
     build: ./services/gliner-service
     profiles: ["gliner"]
@@ -99,6 +110,8 @@ services:
       DFAE_EMBEDDINGS: ${DFAE_EMBEDDINGS:-}
       DFAE_EMBEDDINGS_DIM: ${DFAE_EMBEDDINGS_DIM:-}
       DFAE_FACTS: ${DFAE_FACTS:-}
+      DFAE_PII_NER_URL: ${DFAE_PII_NER_URL:-}
+      DFAE_REDACT_PII: ${DFAE_REDACT_PII:-}
       # decision model: an open-weight model in the ollama service, answering typed questions through
       # token log-probabilities. DECISION_PROVIDER=local => built-in decision rules only.
       DECISION_BASE_URL: ${DECISION_BASE_URL:-}

@@ -1301,21 +1301,43 @@ impl Inner {
             );
             let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.8);
             it.metadata = json!({"source": "lesson", "task_id": prev.task_id, "feedback": "negative"});
-            let _ = self.store.store(self.keep(it)).await;
+            let _ = self.store.store(self.keep(it).await).await;
         }
         let _ = self.store.kv_set("calibration", self.decider.calibrator.snapshot()).await;
         self.export_decisions(prev, if good { "confirmed_by_user" } else { "rejected_by_user" });
     }
 
     /// What is kept for later is kept without personal data (`EconomyConfig::redact_pii`).
-    fn keep(&self, mut it: MemoryItem) -> MemoryItem {
+    async fn keep(&self, mut it: MemoryItem) -> MemoryItem {
         if self.cfg.economy.redact_pii {
-            it.text = dfae_core::safety::redact_pii(&it.text);
+            it.text = self.redact(&it.text).await;
             for e in &mut it.entities {
                 e.text = dfae_core::safety::redact_pii(&e.text);
             }
         }
         it
+    }
+
+    /// Personal data out of a text: the rules (e-mail addresses, phone numbers, cards, IBANs), then — with a PII span model —
+    /// person names and street addresses. A model that cannot be reached leaves the rules' result.
+    pub(crate) async fn redact(&self, text: &str) -> String {
+        let mut out = dfae_core::safety::redact_pii(text);
+        if let Some(ner) = self.pii_ner.get()
+            && let Ok(res) = ner.extract(ExtractionRequest { text: out.clone(), labels: vec!["person".into(), "street address".into()], threshold: 0.6 }).await
+        {
+            let mut spans: Vec<(String, &str)> = res
+                .entities
+                .iter()
+                .filter(|e| e.text.chars().count() >= 2)
+                .map(|e| (e.text.clone(), if e.label == "person" { "[NAME]" } else { "[ADDRESS]" }))
+                .collect();
+            // longest first, so "Anna Becker" goes before "Anna"
+            spans.sort_by_key(|(t, _)| std::cmp::Reverse(t.len()));
+            for (t, placeholder) in spans {
+                out = out.replace(&t, placeholder);
+            }
+        }
+        out
     }
 
     /// One JSON line per decision of a task, with what became of it (when a log file is configured).
@@ -1375,7 +1397,7 @@ impl Inner {
             let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.65);
             it.metadata = json!({"source": "fact", "kind": fact.kind, "subject": fact.subject, "value": fact.value, "task_id": rec.task_id});
             let new_id = it.id.clone();
-            if self.store.store(self.keep(it)).await.is_ok() {
+            if self.store.store(self.keep(it).await).await.is_ok() {
                 for old in same {
                     let mut md = old.item.metadata.clone();
                     md["superseded_by"] = json!(new_id);
@@ -1422,7 +1444,7 @@ impl Inner {
         item.entities = rec.entities.clone();
         item.session_id = Some(rec.session_id.clone());
         item.metadata = json!({"task_id": rec.task_id, "success": success, "mode": rec.mode});
-        let _ = self.store.store(self.keep(item)).await;
+        let _ = self.store.store(self.keep(item).await).await;
 
         // 2b. reflection: a task that went wrong and then worked leaves a one-line lesson for requests like it
         if success && let Some(lesson) = self.lesson_from(rec) {
@@ -1437,7 +1459,7 @@ impl Inner {
             if !dup {
                 let mut it = MemoryItem::new(MemoryKind::Semantic, lesson, 0.75);
                 it.metadata = json!({"source": "lesson", "task_id": rec.task_id});
-                let _ = self.store.store(self.keep(it)).await;
+                let _ = self.store.store(self.keep(it).await).await;
             }
         }
 
@@ -1465,7 +1487,7 @@ impl Inner {
                         let mut it = MemoryItem::new(MemoryKind::Semantic, fact, 0.6);
                         it.entities = vec![e.clone()];
                         it.metadata = json!({"source": "promoted-entity", "task_id": rec.task_id});
-                        let _ = self.store.store(self.keep(it)).await;
+                        let _ = self.store.store(self.keep(it).await).await;
                     }
                 }
             }
@@ -1508,7 +1530,7 @@ impl Inner {
         {
             let mut it = MemoryItem::new(MemoryKind::Procedural, skill.masked_request.clone(), 0.8);
             it.metadata = json!({"skill": skill});
-            let _ = self.store.store(self.keep(it)).await;
+            let _ = self.store.store(self.keep(it).await).await;
         }
     }
 }

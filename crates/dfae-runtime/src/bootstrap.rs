@@ -97,7 +97,11 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
             glama,
         )
     });
+    let pii_ner = config.pii_ner_url.as_deref().map(|u| Arc::new(GlinerClient::new(u)) as Arc<dyn EntityExtractor>);
     let engine = Engine::new(EngineDeps { config, store, extractor, decider, models, tools: registry, policy });
+    if let Some(ner) = pii_ner {
+        engine.set_pii_ner(ner);
+    }
     if let Some(hub) = hub {
         if let Some(file) = &mcp_cfg.servers_file {
             let text = std::fs::read_to_string(file).map_err(|e| format!("reading DFAE_MCP_SERVERS {}: {e}", file.display()))?;

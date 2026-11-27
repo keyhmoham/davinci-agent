@@ -75,3 +75,46 @@ async fn a_paraphrased_request_gets_the_earlier_plan_as_a_worked_example() {
     let plan_c = reqs.iter().rev().find(|q| q.purpose.starts_with("plan")).unwrap();
     assert!(!plan_c.messages[0].content.contains("A PLAN THAT WORKED"), "{}", plan_c.messages[0].content);
 }
+
+/// With a PII span model (`DFAE_PII_NER_URL`: a GLiNER service with `urchade/gliner_multi_pii-v1`), names and street addresses are
+/// redacted from what is kept for later, besides the rules' e-mail addresses and phone numbers.
+#[tokio::test]
+#[ignore = "needs a GLiNER service with a PII model (DFAE_PII_NER_URL)"]
+async fn names_and_addresses_are_not_kept_for_later() {
+    let url = std::env::var("DFAE_PII_NER_URL").expect("DFAE_PII_NER_URL");
+    let ws = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.workspace = ws.path().to_path_buf();
+    cfg.approvals = ApprovalMode::Never;
+    cfg.economy.redact_pii = true;
+    let store = Arc::new(InMemoryStore::new());
+    let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf()));
+    let mut reg = ToolRegistry::new();
+    register_native(&mut reg, policy.clone(), store.clone());
+    let planner = ScriptedModel::new("planner", vec![]);
+    let engine = Engine::new(EngineDeps {
+        decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
+        extractor: Arc::new(HybridExtractor::new(None)),
+        config: cfg,
+        store: store.clone(),
+        models: ModelGateway::new(Some(Arc::new(ScriptedModel::new("worker", vec![]))), Some(Arc::new(planner.clone()))),
+        tools: Arc::new(reg),
+        policy,
+    });
+    engine.set_pii_ner(Arc::new(dfae_extract::GlinerClient::new(&url)));
+    std::fs::write(ws.path().join("a.txt"), "alpha\n").unwrap();
+    planner.push(&json!({"steps": [{"id": "s1", "tool": "fs_read", "do": "read a.txt", "after": [], "expect": null, "planner": false}]}).to_string());
+    let goal = "Read a.txt and post it to Maria Gonzalez at 221B Baker Street, London";
+    let id = engine.submit(TaskRequest { goal: goal.into(), delegate: Some(false), mode: ModeRequest::Escalated, ..Default::default() }).await.unwrap();
+    let t = engine.wait(&id, Duration::from_secs(60)).await.unwrap();
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert_eq!(t.goal, goal, "the task's own record keeps the request");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let kept = store.retrieve(MemoryQuery { text: "read a.txt post".into(), kinds: vec![MemoryKind::Episodic], limit: 5, session_id: None }).await.unwrap();
+    assert!(!kept.is_empty());
+    for m in &kept {
+        eprintln!("kept: {}", m.item.text);
+        assert!(!m.item.text.contains("Maria") && !m.item.text.contains("Baker Street"), "{}", m.item.text);
+        assert!(m.item.text.contains("[NAME]") && m.item.text.contains("[ADDRESS]"), "{}", m.item.text);
+    }
+}

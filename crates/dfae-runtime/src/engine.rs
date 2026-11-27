@@ -134,6 +134,9 @@ pub(crate) struct Inner {
     pub shadow: [std::sync::atomic::AtomicU64; 3],
     /// MCP servers: set once at startup, when any are configured or discoverable.
     pub mcp: std::sync::OnceLock<Arc<dfae_mcp::McpHub>>,
+    /// A span model for personal data (a GLiNER service with a PII model, `DFAE_PII_NER_URL`): names and street addresses, which no
+    /// rule catches, are taken out of what is kept for later.
+    pub pii_ner: std::sync::OnceLock<Arc<dyn EntityExtractor>>,
     /// The versions of the runtimes the shell has (`node v26…, python 3.13…`), asked once.
     pub runtimes: tokio::sync::OnceCell<String>,
 }
@@ -203,12 +206,17 @@ impl Engine {
                 prefix_policy: Mutex::new(prefix_policy),
                 shadow: Default::default(),
                 mcp: std::sync::OnceLock::new(),
+                pii_ner: std::sync::OnceLock::new(),
                 runtimes: tokio::sync::OnceCell::new(),
             }),
         }
     }
 
     /// Give the engine its MCP servers (once).
+    pub fn set_pii_ner(&self, ner: Arc<dyn EntityExtractor>) {
+        let _ = self.inner.pii_ner.set(ner);
+    }
+
     pub fn set_mcp(&self, hub: Arc<dfae_mcp::McpHub>) {
         let _ = self.inner.mcp.set(hub);
     }
