@@ -86,6 +86,38 @@ fn diagnostic_line(text: &str, e: &oxc_diagnostics::OxcDiagnostic) -> usize {
     text[..at].matches('\n').count() + 1
 }
 
+/// Source files under `root` modified at or after `since` (a script a fix turn ran may have rewritten some with a heredoc or sed, out of
+/// `fs_write`'s check — coding plan C5). Dependency and build directories are skipped; at most `max` files.
+pub fn changed_since(root: &Path, since: std::time::SystemTime, max: usize) -> Vec<std::path::PathBuf> {
+    const SKIP: &[&str] = &["node_modules", ".git", "target", "dist", "build", ".next", "__pycache__", ".venv", "venv", ".tools", ".dfae"];
+    const EXT: &[&str] = &["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "json", "toml", "py", "sh", "html", "htm"];
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > 20_000 || out.len() >= max {
+                return out;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                if depth < 8 && !SKIP.contains(&name.as_str()) {
+                    stack.push((e.path(), depth + 1));
+                }
+            } else if ft.is_file()
+                && Path::new(&name).extension().and_then(|x| x.to_str()).is_some_and(|x| EXT.contains(&x.to_ascii_lowercase().as_str()))
+                && e.metadata().and_then(|m| m.modified()).is_ok_and(|m| m >= since)
+            {
+                out.push(e.path());
+            }
+        }
+    }
+    out
+}
+
 fn first_line(s: &str) -> String {
     s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().chars().take(200).collect()
 }
@@ -235,6 +267,21 @@ mod tests {
         );
         assert!(problem(Path::new("/nowhere/server.js"), "const http = require('http');\nmodule.exports = http;\n").await.is_none());
         assert!(problem(Path::new("/nowhere/a.ts"), "const a: number = ;\n").await.unwrap().starts_with("TypeScript syntax error: line 1"));
+    }
+
+    #[test]
+    fn files_a_script_changed_are_found_and_dependencies_are_not_walked() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("app")).unwrap();
+        std::fs::create_dir_all(d.path().join("node_modules/x")).unwrap();
+        std::fs::write(d.path().join("old.tsx"), "x").unwrap();
+        let since = std::time::SystemTime::now();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(d.path().join("app/layout.jsx"), "<html>").unwrap();
+        std::fs::write(d.path().join("node_modules/x/index.js"), "x").unwrap();
+        std::fs::write(d.path().join("app/notes.txt"), "x").unwrap();
+        let got = changed_since(d.path(), since, 10);
+        assert_eq!(got, [d.path().join("app/layout.jsx")]);
     }
 
     #[tokio::test]

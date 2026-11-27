@@ -1,6 +1,9 @@
 # Coding & shell upgrade plan — why "a Next.js landing page" fails, and what fixes it
 
-> Status: proposal, 2026-11-27. Nothing here is implemented yet.
+> Status: implemented 2026-11-27 (branch `claude/eager-tesla-9wsk79`), except the optional `DFAE_PREWARM` image step. Hermetic tests
+> cover every item; **D1 (the live case) is written but has not been run**: it needs the real gateway inside the container. Until D1
+> passes 5 runs, none of the token or success estimates in §3 is a measurement. See [§6](#6-implementation-notes) for what changed
+> from the proposal and why.
 > Same rules as [`upgrade-plan.md`](upgrade-plan.md): each item has **Problem → Evidence → Fix → Files → Done when**, ships behind a flag
 > where behaviour changes, and is kept only if the live suite says so. Evidence labels: `[seen]` = in a real task record or reproduced in
 > the running container today; `[code]` = read in the code; `[hypothesis]` = best explanation, not yet proven.
@@ -261,3 +264,33 @@ completed**. Today: 44k–80k tokens per attempt, and **failed**. Ordinary tasks
   it) during `next build`.
 * Pin Next 15 or move to 16? Pin the major the worker knows best (today 15), measure 16 in D1 before switching, and bump recipes deliberately.
 * `oxc_parser` vs a global `typescript` in the image (A6): oxc is faster and needs no Node; `typescript` also gives type errors. Both can coexist.
+
+## 6. Implementation notes
+
+What was built, item by item, and where it differs from the proposal above.
+
+| Item | Where | Notes / deviations |
+|---|---|---|
+| A1 | `Tool::max_runtime` (`dfae-core/src/tool.rs`), `Shell::max_runtime`, `executor.rs` | Shell: its timeout + 30 s grace; background starts 60 s; capped by the task's time left. The *shell's own* timeout keeps the partial output; the executor's backstop still cannot (the future is dropped), it now says which limit it hit. |
+| A2 | `GroupGuard` in `coding.rs` (`run_script`, `spawn_job`) | Test drops a running `sleep & sleep` future and finds no `sleep` left. |
+| A3 | `coding.rs` `hint`, `installs_node_modules` | Unit tests only; the "≤ 2 fix turns on a truncated `.node`" check belongs to D1. |
+| A4 | `implement.rs` `strip_fences(text, path)` | Regression test with the `8d665de7` layout. |
+| A5 | `dfae-extract` `framework_name` (rules and normalisation), `implement.rs` `step_paths_only` | **Deviation:** a capitalised stem is *not* rejected (`App.js`, `Button.js` are real React files); only a known framework stem without a `/` is. "Unless the file exists" is not checked (the extractor has no workspace). |
+| A6 | `syntax.rs` `js_problem` | `oxc_parser` **0.96** (the newest release whose MSRV, 1.88, matches the workspace's `rust-version`; 0.160 needs 1.98). `.js` is now parsed in-process too: the old `node --check --input-type=commonjs` rejected ESM and JSX, i.e. every Next.js `page.js`. |
+| A7 | `implement.rs` | One retry of `write_content`, told why, then a precise failure; the vote is off whenever the tool has a content parameter. The bench mock that served content through `bind` was changed to serve `content`. |
+| A8 | `implement.rs` `probe_like`, `executor.rs` | An allow-list of inspection commands (not a deny-list of verbs): anything unknown counts as a real command. |
+| A9 | `coding.rs` `choose_port`/`rewrite_port`, `executor.rs` `move_step_port` | Our own job on that port **for the same directory** is replaced; anything else → first free port of 8000–8010, and the step's command, expectation and the pending steps follow (`port moved: A -> B` evidence). |
+| B1 | `project.rs` `content_contract`, `prompts::CONTENT_SYSTEM` | The worker's content system prompt changed once (its cache prefix with it); the planner's is unaffected by B1. |
+| B2 | `recipes.rs`, `pipeline.rs` `recipe_line`, `prompts.rs` rule | **Deviation:** the proposal's Next.js flag `--no-import-alias` is not a documented create-next-app flag; the card uses `--import-alias "@/*" --yes`. Vite cards use `npx -y create-vite@6 … --template …`. **No Astro card**: its non-interactive flag spellings are not on its official install page, and a guessed flag is worse than none. The `"latest"` lint runs where the file is written (`write_content` rejects a `package.json` that pins nothing), since a brief plan never holds file content. The planner's system prompt changed by one sentence (one cache miss). |
+| B3 | `workspace.rs` (`new_work`, `slug`, `move_dir_in`, origins), `pipeline.rs` `own_directory` | Origins live in `.dfae/dirs.json` at the workspace root and show in the snapshot as `site/ (by: "…"; …)`. |
+| B4 | `project.rs` `project_card`, `implement.rs` | **Deviation:** the last-written files are not dropped when the card exists, only cut to 1,200 characters each: a page must still agree with a component this task wrote. |
+| C1 | `step_agent.rs` `fingerprint`/`action_key`, `executor.rs` `local_fix` | **Deviation:** "the same command twice" stops only when *nothing changed* since its last run — build → fix → build is the normal loop, not a repeat. The re-plan gets `THE WORKER ALREADY TRIED (n actions): … — the same error every time: …`. |
+| C2 | `step_agent.rs` `shown_result` | |
+| C3 | `Budget::max_fix_tool_calls` (`DFAE_STEP_AGENT_TOOL_CALLS`, 12), `Budget::for_project` (`DFAE_PROJECT_MAX_SECONDS` 1500, `DFAE_PROJECT_MAX_TOOL_CALLS` 40) | A project task is one whose plan has a scaffold/install/build shell step; the budget is only ever raised, never lowered. |
+| C4 | `executor.rs` `replan`, `transport_error` | 5 / 15 / 30 s, only while ≥ wait + 20 s of the task's time is left. |
+| C5 | `syntax.rs` `changed_since`, `executor.rs` `local_fix` | A malformed file marks the turn as failed, so the worker does not say `done` on it. |
+| D1 | `live_e2e.rs` "nextjs landing in a used workspace" | Not run here. It leaves its python listener on 8000 running after the case. |
+| D2 | `planned.rs`, unit tests | X4, X5, X7, X8, X9, C1 (both stop rules), C4, B3. |
+
+Found and fixed on the way: a task whose continuation re-plan was tried and not given stayed `Recovering` for good (`Recovering → Completed`
+is not a valid transition), so it never became terminal although its answer had been given (`pipeline.rs` `execute_and_conclude`).

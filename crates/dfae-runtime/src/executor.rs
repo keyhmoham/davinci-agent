@@ -1065,7 +1065,24 @@ impl Inner {
         if tier == Tier::Planner {
             // the planner sees every tool; what the plan may use is every tool of this agent's scope
             *ctx.allowed.lock() = self.scoped_metas(ctx).into_iter().map(|m| m.name).collect();
-            return self.patch_plan(ctx, goal, problem, replans, &budget).await;
+            // A gateway that is away for ~10 s ended a task with "replanning failed: error sending request" (coding plan R5): a transport error
+            // of the planner during recovery is waited out (5, 15, 30 s, within the task's time) before recovery gives up.
+            let mut waits = [5u64, 15, 30].into_iter();
+            loop {
+                match self.patch_plan(ctx, goal, problem, replans, &budget).await {
+                    Err(e) if transport_error(&e) => {
+                        let left = self.time_left(ctx).await;
+                        let Some(w) = waits.next().filter(|w| left > Duration::from_secs(w + 20)) else { return Err(e) };
+                        self.emit(
+                            ctx,
+                            EventKind::Warning { message: format!("the planner could not be reached ({}); trying again in {w} s", clip_error(&e, 30)) },
+                        )
+                        .await;
+                        tokio::select! { _ = ctx.cancel.cancelled() => return Err("cancelled".into()), _ = tokio::time::sleep(Duration::from_secs(w)) => {} }
+                    }
+                    other => return other,
+                }
+            }
         }
         // widen the tool set through the decision layer (direct/skill plans start narrow)
         let (entities, base) = {
@@ -1394,11 +1411,27 @@ impl Inner {
                     let mut s = Step::tool(&format!("{id}_fix{k}"), &tool, &format!("fix {id}: {why}"), args);
                     s.approval_required = self.tools.meta(&tool).map(|m| m.requires_approval).unwrap_or(false);
                     s.how = Some("step-agent".into());
+                    let started = std::time::SystemTime::now() - Duration::from_secs(1);
                     let res = self.run_tool(ctx, &s, false, &[]).await;
-                    let (ok, text) = match res {
+                    let (mut ok, mut text) = match res {
                         Ok(o) => (true, o.content),
                         Err(f) => (false, f.message),
                     };
+                    // a script that rewrote a source file went around fs_write's parse check: what it left is parsed here
+                    if tool == "shell" {
+                        let ws = self.policy.workspace();
+                        let root =
+                            s.args.get("cwd").and_then(|c| c.as_str()).and_then(|c| self.policy.guard().read_path(c).ok()).unwrap_or_else(|| ws.to_path_buf());
+                        for f in crate::syntax::changed_since(&root, started, 40) {
+                            if let Ok(src) = std::fs::read_to_string(&f)
+                                && let Some(p) = crate::syntax::problem(&f, &src).await
+                            {
+                                let rel = f.strip_prefix(ws).unwrap_or(&f).display().to_string();
+                                text.push_str(&format!("\n[the script left {rel} malformed: {p}]"));
+                                ok = false;
+                            }
+                        }
+                    }
                     // recorded in the plan; an action that failed is kept as skipped (it is history, not a failed step of the task)
                     s.status = if ok { StepStatus::Succeeded } else { StepStatus::Skipped };
                     s.summary = Some(tokens::truncate_tokens(&text, 300));
@@ -1470,6 +1503,27 @@ pub(crate) fn punts(reply: &str) -> bool {
         .unwrap()
     });
     PUNT.is_match(reply)
+}
+
+/// A model call that never reached the model (the network, the gateway), as opposed to an answer that was wrong or a budget spent.
+pub(crate) fn transport_error(e: &str) -> bool {
+    let e = e.to_lowercase();
+    !e.contains("budget")
+        && [
+            "error sending request",
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "operation timed out",
+            "dns error",
+            "502",
+            "503",
+            "504",
+            "bad gateway",
+            "service unavailable",
+        ]
+        .iter()
+        .any(|m| e.contains(m))
 }
 
 /// An error text cut to a size, keeping its END: what went wrong is said last.
@@ -1601,7 +1655,15 @@ mod digest_tests {
 
 #[cfg(test)]
 mod port_tests {
-    use super::{move_port_in, move_step_port, moved_port};
+    use super::{move_port_in, move_step_port, moved_port, transport_error};
+
+    #[test]
+    fn a_planner_that_could_not_be_reached_is_told_from_one_that_answered_wrong() {
+        assert!(transport_error("model request failed: error sending request for url (https://gw/v1/chat/completions)"));
+        assert!(transport_error("model request failed: HTTP 503 Service Unavailable"));
+        assert!(!transport_error("model-call budget exceeded (12 allowed)"));
+        assert!(!transport_error("the patch changes nothing"));
+    }
     use dfae_core::Step;
     use serde_json::json;
 

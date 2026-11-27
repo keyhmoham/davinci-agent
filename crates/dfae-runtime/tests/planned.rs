@@ -1138,3 +1138,36 @@ async fn new_work_gets_its_own_directory_and_a_follow_up_still_finds_the_old_one
     let origins = std::fs::read_to_string(r.ws.path().join(".dfae/dirs.json")).unwrap();
     assert!(origins.contains("\"moon\"") && origins.contains("Create a page about the moon"), "{origins}");
 }
+
+#[tokio::test]
+async fn a_planner_that_is_briefly_unreachable_during_recovery_is_waited_for() {
+    let r = rig(false, |_| {});
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read missing.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    r.planner.push_err("error sending request for url (https://gateway/v1/chat/completions)");
+    r.planner.push(
+        &json!({"edit": [], "add": [{"id": "r1_1", "do": "read a.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}], "drop": ["s1"]})
+            .to_string(),
+    );
+    let t = run_as(&r, ModeRequest::Escalated, "Read missing.txt").await;
+    assert!(t.plan.as_ref().unwrap().step("r1_1").is_some_and(|s| s.status == StepStatus::Succeeded), "{:?}", t.error);
+    assert!(events(&r, &t.task_id).iter().any(|e| matches!(e, EventKind::Warning { message } if message.contains("trying again in 5 s"))));
+}
+
+#[tokio::test]
+async fn a_page_the_content_writer_did_not_return_is_written_again_never_bound_inside_json() {
+    // task 8d665de7: the content step fell into the JSON binder with a 3-sample vote (11.4k output tokens), then failed anyway
+    let r = rig(false, |_| {});
+    r.planner.push(
+        &json!({"steps": [{"id": "s1", "do": "write site/index.html: a landing page for a crypto exchange with a hero and three features", "tool": "fs_write", "after": [], "expect": "site/index.html exists", "planner": false}]})
+            .to_string(),
+    );
+    r.worker.push("");
+    r.worker.push("<!doctype html><html><body><h1>Crypto exchange</h1><p>hero and three features</p></body></html>");
+    let t = run_as(&r, ModeRequest::Escalated, "Create a landing page for a crypto exchange in site/index.html").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    let reqs = r.worker.requests.lock().clone();
+    assert_eq!(reqs.iter().filter(|q| q.purpose == "content").count(), 2);
+    assert_eq!(reqs.iter().filter(|q| q.purpose == "bind").count(), 0, "content is never bound inside JSON");
+    assert!(std::fs::read_to_string(r.ws.path().join("site/index.html")).unwrap().contains("Crypto exchange"));
+}
