@@ -118,3 +118,86 @@ async fn names_and_addresses_are_not_kept_for_later() {
         assert!(m.item.text.contains("[NAME]") && m.item.text.contains("[ADDRESS]"), "{}", m.item.text);
     }
 }
+
+/// A store with 200 unrelated memories and one that answers the request in other words: does the planner get it? (The end-to-end form
+/// of the paraphrase retrieval measurement; with a near-empty store every embedder finds everything.)
+async fn planner_sees_the_needle(semantic: bool) -> bool {
+    let key = std::env::var("PLANNER_API_KEY").expect("PLANNER_API_KEY");
+    let ws = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.workspace = ws.path().to_path_buf();
+    cfg.approvals = ApprovalMode::Never;
+    let embed =
+        semantic.then(|| RemoteEmbedder::new("https://ai-gateway.vercel.sh/v1", "voyage/voyage-4-lite", Some(key), 1024, Duration::from_secs(30)).unwrap());
+    let store = Arc::new(InMemoryStore::new().with_semantic(embed));
+    let verbs = ["create", "rename", "delete", "list", "compress", "convert", "fix", "test", "deploy", "serve", "summarise", "count"];
+    let things = [
+        "the landing page",
+        "notes.txt",
+        "the logo",
+        "the CSV export",
+        "the Docker image",
+        "the unit tests",
+        "the API docs",
+        "the cron job",
+        "the sitemap",
+        "the theme colours",
+        "the user guide",
+        "the backup script",
+        "the i18n strings",
+        "the README",
+        "the CI workflow",
+        "the metrics dashboard",
+        "the photo gallery",
+    ];
+    let mut n = 0;
+    'fill: for v in verbs {
+        for t in things {
+            store.store(MemoryItem::new(MemoryKind::Episodic, format!("{v} {t} → done, verified"), 0.5)).await.unwrap();
+            n += 1;
+            if n == 200 {
+                break 'fill;
+            }
+        }
+    }
+    let needle = "Lesson: for \"configure the billing service\": it runs on host billing-7.internal, port 7421 — what worked: config/billing.toml";
+    store.store(MemoryItem::new(MemoryKind::Semantic, needle, 0.75)).await.unwrap();
+    let policy = Arc::new(PolicyEngine::new(PolicyConfig::default(), ws.path().to_path_buf()));
+    let mut reg = ToolRegistry::new();
+    register_native(&mut reg, policy.clone(), store.clone());
+    let planner = ScriptedModel::new("planner", vec![]);
+    let engine = Engine::new(EngineDeps {
+        decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
+        extractor: Arc::new(HybridExtractor::new(None)),
+        config: cfg,
+        store,
+        models: ModelGateway::new(Some(Arc::new(ScriptedModel::new("worker", vec![]))), Some(Arc::new(planner.clone()))),
+        tools: Arc::new(reg),
+        policy,
+    });
+    planner.push(&json!({"steps": [{"id": "s1", "tool": "fs_list", "do": "list the workspace", "after": [], "expect": null, "planner": false}]}).to_string());
+    let id = engine
+        .submit(TaskRequest {
+            goal: "Where does our invoicing backend run? List the workspace too.".into(),
+            delegate: Some(false),
+            mode: ModeRequest::Escalated,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let t = engine.wait(&id, Duration::from_secs(120)).await.unwrap();
+    let _ = &t;
+    let reqs = planner.requests.lock().clone();
+    let plan = reqs.iter().find(|q| q.purpose.starts_with("plan")).unwrap();
+    plan.messages[0].content.contains("billing-7.internal")
+}
+
+#[tokio::test]
+#[ignore = "calls the gateway's embeddings endpoint"]
+async fn among_two_hundred_memories_the_one_that_answers_in_other_words_reaches_the_planner() {
+    let hash = planner_sees_the_needle(false).await;
+    let semantic = planner_sees_the_needle(true).await;
+    eprintln!("hash embedder: {hash}; semantic embedder: {semantic}");
+    assert!(semantic, "with semantic embeddings the planner sees the lesson");
+    assert!(!hash, "the hash embedder ranks 200 unrelated memories above it (the comparison this test exists for)");
+}

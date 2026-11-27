@@ -266,3 +266,11 @@ package with three bugs in two modules; a JavaScript slug function failing three
 Same success; −50% fix actions, −75% re-plans, −45% planner calls, −47% cost and time — the direction and size CodeAct reports for
 multi-step work. A script that writes a file skips `fs_write`'s parse check; the failed step always runs again and is judged, which
 is the stronger check. `DFAE_STEP_AGENT_STYLE=tools` keeps the old form.
+
+**Memory with 200 distractors, end to end (the stronger memory test).** The store holds 200 unrelated episodes and one lesson that
+answers the request in other words ("Where does our invoicing backend run?" — the lesson is about "the billing service"). Retrieval:
+the hash embedder returned two unrelated episodes; the semantic one returned exactly the lesson (score 0.49). **But neither reached the
+planner**: the `Minimal` context profile — used for every request the decision model scores simple — allowed **zero memories and zero
+prior turns**, so lessons, facts and plan templates were dropped for those requests. Fixed (2 memories, 1 prior turn: relevant ones
+only, ~80 tokens each). After the fix: **hash embedder — the planner does not see the lesson; semantic — it does** (test
+`among_two_hundred_memories…`, asserting both).

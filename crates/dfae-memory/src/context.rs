@@ -118,7 +118,10 @@ fn render_entities(es: &[Entity]) -> String {
 pub fn build_context(input: &ContextInput) -> ContextPackage {
     let budget = input.profile.token_budget();
     let (mem_n, prior_n, obs_tokens) = match input.profile {
-        ContextProfile::Minimal => (0, 0, 120),
+        // a simple request still gets what memory knows about it: the two most relevant memories (already filtered for relevance,
+        // ~80 tokens each) and the last turn. With none, a lesson, a fact or a template never reached the planner of a request the
+        // decision model scored simple (measured: a needle among 200 memories was retrieved, then dropped here)
+        ContextProfile::Minimal => (2, 1, 120),
         ContextProfile::Standard => (3, 2, 500),
         ContextProfile::Reasoning => (6, 4, 1400),
     };
