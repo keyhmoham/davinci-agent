@@ -223,6 +223,22 @@ async fn a_file_is_written_knowing_the_files_of_its_project_that_were_written_be
 }
 
 #[tokio::test]
+async fn a_reply_that_hands_the_work_back_is_run_as_a_task_instead() {
+    // the decision model took the request for a conversation; the reply says it needs a command
+    let r = oracle_rig_with_strong(vec![(DecisionKind::RouteTask, "needs_tools", Answer::noul(0.0), "zorblax")]);
+    std::fs::write(r.ws.path().join("zorblax-notes.txt"), "remember the milk\n").unwrap();
+    r.worker.push("That needs a look at your files, which has to be run as a task.");
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "list the files in the workspace", "tool": "fs_list"}]}).to_string());
+    r.worker.push(&json!({"path": "."}).to_string());
+    let t = run(&r, "give me an overview of my zorblax situation").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?} {:?}", t.error, t.final_answer);
+    let answer = t.final_answer.unwrap_or_default();
+    assert!(answer.contains("zorblax-notes.txt") && !answer.contains("as a task"), "{answer}");
+    assert_eq!(t.plan.as_ref().unwrap().source, PlanSource::Planner);
+    assert!(events(&r, &t.task_id).iter().any(|e| matches!(e, EventKind::Warning { message } if message.contains("running the request as a task"))));
+}
+
+#[tokio::test]
 async fn the_decision_model_and_rules_turn_a_thinking_step_into_a_tool_call_when_it_binds_outright() {
     let r = rig(false, |_| {});
     r.planner.push(&json!({"steps": [{"id": "s1", "do": "run `echo planned`", "tool": null}]}).to_string());

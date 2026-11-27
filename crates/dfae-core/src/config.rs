@@ -63,6 +63,9 @@ pub struct ModelConfig {
     /// `<PREFIX>_REASONING`: `off`, `minimal`, `low`, `medium`, `high` or `default` (the provider's own). A reasoning model otherwise
     /// spends most of a small output limit on hidden thinking: the planner thinks a little, the worker not at all.
     pub reasoning: Option<String>,
+    /// `<PREFIX>_REASONING_HARD`: the thinking effort when the model repairs something (a plan that hit a failure): debugging is the one
+    /// job where thinking longer pays for itself. Default `medium` for the planner; unset for the worker (it keeps `reasoning`).
+    pub reasoning_hard: Option<String>,
 }
 
 /// Where hosted models are reached unless a deployment says otherwise (an OpenAI-compatible gateway).
@@ -74,7 +77,7 @@ impl ModelConfig {
     /// A hosted model from `<PREFIX>_PROVIDER` (`openai` | `anthropic` | `none`; default `openai` once a key is set),
     /// `_BASE_URL`, `_MODEL`, `_API_KEY`, `_MAX_TOKENS`, `_CONTENT_MAX_TOKENS`, `_TIMEOUT_SECS`. The planner and the worker
     /// model are configured the same way.
-    fn from_env(prefix: &str, default_model: &str, max_tokens: u32, content_max_tokens: u32, timeout_secs: u64, reasoning: &str) -> Self {
+    fn from_env(prefix: &str, default_model: &str, max_tokens: u32, content_max_tokens: u32, timeout_secs: u64, reasoning: &str, hard: &str) -> Self {
         let var = |k: &str| env(&format!("{prefix}_{k}"));
         let provider = var("PROVIDER").unwrap_or_else(|| if var("API_KEY").is_some() { "openai".into() } else { "none".into() });
         Self {
@@ -87,6 +90,9 @@ impl ModelConfig {
             content_max_tokens: var("CONTENT_MAX_TOKENS").and_then(|v| v.parse().ok()).unwrap_or(content_max_tokens),
             timeout_secs: var("TIMEOUT_SECS").and_then(|v| v.parse().ok()).unwrap_or(timeout_secs),
             reasoning: Some(var("REASONING").unwrap_or_else(|| reasoning.into())).map(|r| r.to_ascii_lowercase()).filter(|r| r != "default"),
+            reasoning_hard: Some(var("REASONING_HARD").unwrap_or_else(|| hard.into()))
+                .map(|r| r.to_ascii_lowercase())
+                .filter(|r| r != "default" && !r.is_empty()),
             prompt_cache: var("PROMPT_CACHE").map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")),
         }
     }
@@ -232,8 +238,8 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
-        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low");
-        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "off");
+        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium");
+        let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "off", "");
         // one gateway, one key: a worker with no key of its own uses the planner's when they share an endpoint
         if worker.api_key.is_none() && worker.base_url == planner.base_url && planner.api_key.is_some() {
             worker.api_key = planner.api_key.clone();

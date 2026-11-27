@@ -429,6 +429,19 @@ impl Inner {
         if !inputs.is_empty() {
             user.push_str(&format!("INPUTS:\n{inputs}\n"));
         }
+        // a file that exists is being replaced: what it holds may be what the framework needs (a stylesheet's `@import "tailwindcss"`, a
+        // config's plugins), and a rewrite from scratch loses it
+        if let Ok(existing) = self.policy.guard().read_path(path)
+            && existing.is_file()
+            && let Ok(old) = std::fs::read_to_string(&existing)
+            && !old.trim().is_empty()
+        {
+            let shown: String = old.chars().take(3000).collect();
+            user.push_str(&format!(
+                "{}\nThis file already exists and is being replaced: keep what the project's tooling needs from it (imports, directives, configuration, exports the other files use).\n",
+                dfae_core::safety::wrap_untrusted(&format!("CURRENT {path}"), &shown)
+            ));
+        }
         // a file that belongs to a project is written knowing the others (the tests of a module see the module; a page sees its styles)
         let related = self.related_files(ctx, &step.id, path).await;
         if !related.is_empty() {

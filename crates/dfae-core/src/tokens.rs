@@ -16,6 +16,26 @@ pub fn estimate_tokens(s: &str) -> usize {
 }
 
 /// Truncate `s` so that it fits in roughly `max_tokens` tokens.
+/// Like [`truncate_tokens`], but keeps the start and the END, cutting the middle: what a command ends with (a summary line, the error)
+/// is what an answer needs, and the head alone would drop it.
+pub fn truncate_middle(s: &str, max_tokens: usize) -> String {
+    if estimate_tokens(s) <= max_tokens {
+        return s.to_string();
+    }
+    let max_chars = max_tokens * 4;
+    let chars: Vec<char> = s.chars().collect();
+    let (head, tail) = (max_chars * 2 / 5, max_chars * 3 / 5);
+    if chars.len() <= head + tail {
+        return s.to_string();
+    }
+    format!(
+        "{}\n… [{} characters omitted] …\n{}",
+        chars[..head].iter().collect::<String>(),
+        chars.len() - head - tail,
+        chars[chars.len() - tail..].iter().collect::<String>()
+    )
+}
+
 pub fn truncate_tokens(s: &str, max_tokens: usize) -> String {
     if estimate_tokens(s) <= max_tokens {
         return s.to_string();
@@ -89,6 +109,14 @@ fn elide_middle(text: &str, max_tokens: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_middle_goes_the_ends_stay() {
+        let s = format!("START {} END: 8 passed", "x".repeat(4000));
+        let t = truncate_middle(&s, 100);
+        assert!(t.starts_with("START") && t.ends_with("8 passed") && t.contains("omitted") && t.len() < 600, "{t}");
+        assert_eq!(truncate_middle("short", 100), "short");
+    }
 
     #[test]
     fn estimates_are_monotonic() {
