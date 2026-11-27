@@ -635,3 +635,74 @@ Evidence for every line is in `docs/eval/validation-2026-11-27.md`.
 | E1c quarantined extraction | **done** | defence in depth; the baseline was already safe on the two injection pages (6/6 both arms) |
 | E1d personal-data redaction | **done** | fresh held-out set: 18/18 found, 15/15 lookalikes untouched |
 | W3 deterministic condensation, X1 masking for re-plans | not done | next candidates |
+
+---
+
+## 17. What did not help: why, and where it can still pay (2026-11-27)
+
+Each item below was measured in this repository (`docs/eval/validation-2026-11-27.md`) and then checked against the literature.
+
+### 17.1 Adaptive planner effort (measured worse: 14/20 vs 19/20)
+* **Why it failed — consistent with the literature.** Cuadron et al. (*The Danger of Overthinking*, 2025) and Mia & Amini (*Don't
+  Overthink, Don't Underthink*, 2026) both find that effort must fit the task, and the latter warns that controls driven by
+  **pre-execution difficulty estimates** fit agentic work poorly, because what a task needs shows up during planning and tool use. Our
+  version was exactly that: a complexity score read from the request before anything ran, and `none` for "simple" requests caused
+  under-thinking (worse plans → more re-plans → more planner tokens in the end).
+* **Where it can still pay:** adapt **during execution, upward only**, on evidence of difficulty. DFAE already does half of it
+  (`PLANNER_REASONING_HARD` from the second re-plan). The remaining candidate is a step marked `planner: true` (the worker could not do
+  it) planned at `medium`. Head-room is small: fixed `low` already passes 19/20, so this is **low priority**; `none` should never be used
+  for planning.
+
+### 17.2 Native function calling for binding (no gain: 23/24 vs 22/24, +41% cost)
+* **Why it did not help:** the gateway already enforces the JSON schema for GLM, so the failure mode native calls prevent did not occur;
+  a single-tool binding call is the simplest case for any format.
+* **Where a different action format can pay:** CodeAct (Wang et al., ICML 2024) — *code* as the action, not JSON or native calls — gave
+  up to +20% success and up to 30% fewer actions across 17 LLMs, with gains concentrated in **multi-step** tasks. In DFAE that is the
+  step agent's fix loop (one JSON action per turn). The sandbox shell already runs scripts, so a step agent told to prefer one script
+  action that inspects, edits and re-runs (and fed back the script's error) is the CodeAct form of the same loop. **Worth an A/B**: fix
+  turns and success on the cases where the step agent fires.
+* Also relevant: *Let Me Speak Freely?* (Tam et al., EMNLP 2024) found strict format restrictions (JSON mode worst) degrade reasoning.
+  Plans are short and the planner reasons in hidden tokens before writing JSON, so the effect there is probably small; it is an
+  argument against adding reasoning fields *inside* strict schemas (the step agent's `why` is one-line and harmless).
+
+### 17.3 Quarantined extraction of untrusted content (no measured difference: both arms safe)
+* **Why nothing showed:** the attacks were too weak — the baseline (GLM + plan-then-execute) already ignored them. Defence evaluations
+  on AgentDojo show the spread only under realistic attacks: no defence ≈ 45.7% attack success (GPT-4o), spotlighting ≈ 40%, a tool
+  filter ≈ 6.5%; a recent defence that **parses only the needed data out of tool results** (2601.04795) is the same idea as ours, and is
+  measured as effective there. So the approach is supported; our test was not strong enough to show it.
+* **Where the same technique pays now — W3.** The line-number selection is **extractive compression**: RECOMP (Xu et al., ICLR 2024)
+  shows extractive compressors reach ~6% of the original length with minimal loss and are faithful by construction, unlike abstractive
+  summaries. DFAE still condenses big *trusted* outputs (build logs, test output, listings) with a free-text worker summary plus a
+  grounding check. Using the same verbatim line selection there removes hallucination risk by construction and cuts the worker's
+  output tokens to a list of numbers. **Recommended next.**
+* To measure E1c itself: an AgentDojo-style suite where the injected goal is something the task's tools can actually do (write a
+  file in a task that writes files, fetch a URL in a task that fetches).
+
+### 17.4 GLiNER on the hot path (no measured benefit: 29/30 vs 28/30, +18% time)
+* **Why:** the planner writes every concrete value into the step sentence, so span extraction for binding duplicates work.
+* **Where an encoder span model is the right tool — names and addresses in redaction.** The regex redaction (E1d) cannot find person
+  names or street addresses. Rule/NER tools are weak exactly there (PIIBench: Presidio PERSON F1 ≈ 0.26, ADDRESS 0.0), while GLiNER-PII
+  models (knowledgator `gliner-pii`, GLiNER2-PII — best span F1 on SPY in its own comparison) are built for it, run on CPU, and the
+  redaction runs off the hot path (at memory-write time), so their latency does not matter. **Recommended** as an optional
+  `gliner` profile use: the existing service with PII labels, measured on a labelled set of names and addresses.
+
+### 17.5 Memory changes with no end-to-end difference
+* Not a failed idea but a weak test: each e2e run's store holds two or three memories, so any embedder finds the right one. The
+  component evaluation (recall@1 0.65 → 1.00) is the evidence. An end-to-end test with a store pre-filled with a few hundred
+  distractor memories would show the ranking difference; plan templates need the same (a store of verified skills).
+
+### Summary
+
+| Feature | Verdict | Reuse |
+|---|---|---|
+| adaptive planner effort | pre-execution estimate is the wrong signal | upward-only, in execution; low priority |
+| native function calling | no gain for one-tool binding | CodeAct-style script actions for the step agent (A/B) |
+| quarantined extraction | approach supported, attack suite too weak | same technique as extractive condensation (W3) — next; stronger attack suite |
+| GLiNER | redundant for binding | names/addresses for PII redaction, off the hot path |
+| memory e2e | test too weak | distractor-filled store test |
+
+Sources: [Danger of Overthinking](https://arxiv.org/abs/2502.08235), [Don't Overthink, Don't Underthink](https://arxiv.org/abs/2608.26442),
+[CodeAct](https://arxiv.org/abs/2402.01030), [Let Me Speak Freely?](https://arxiv.org/abs/2408.02442),
+[RECOMP](https://arxiv.org/abs/2310.04408), [Defense via Tool Result Parsing](https://arxiv.org/abs/2601.04795),
+[AgentDyn](https://arxiv.org/pdf/2602.03117), [GLiNER-PII](https://huggingface.co/knowledgator/gliner-pii-base-v1.0),
+[GLiNER2-PII](https://arxiv.org/pdf/2605.09973), [PIIBench](https://arxiv.org/pdf/2604.15776), [OpenAI Privacy Filter eval](https://arxiv.org/pdf/2608.02616).
