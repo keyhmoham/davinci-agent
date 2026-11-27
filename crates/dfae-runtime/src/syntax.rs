@@ -223,9 +223,16 @@ mod tests {
         let e = problem(Path::new("/nowhere/site/app/page.tsx"), "export function Page() { return <main />; }\n").await.unwrap();
         assert!(e.contains("no default export"), "{e}");
         assert!(problem(Path::new("/nowhere/site/app/page.tsx"), "function Page() { return <main />; }\nexport { Page as default };\n").await.is_none());
-        assert!(problem(Path::new("/nowhere/src/components/Hero.tsx"), "export function Hero() { return <h1/>; }\n").await.is_none(), "only app/ pages need one");
+        assert!(
+            problem(Path::new("/nowhere/src/components/Hero.tsx"), "export function Hero() { return <h1/>; }\n").await.is_none(),
+            "only app/ pages need one"
+        );
         // ESM and JSX in a .js file are normal in a Next.js project; CommonJS still parses
-        assert!(problem(Path::new("/nowhere/app/page.js"), "import Link from 'next/link'\nexport default function P() { return <Link href=\"/\">x</Link> }\n").await.is_none());
+        assert!(
+            problem(Path::new("/nowhere/app/page.js"), "import Link from 'next/link'\nexport default function P() { return <Link href=\"/\">x</Link> }\n")
+                .await
+                .is_none()
+        );
         assert!(problem(Path::new("/nowhere/server.js"), "const http = require('http');\nmodule.exports = http;\n").await.is_none());
         assert!(problem(Path::new("/nowhere/a.ts"), "const a: number = ;\n").await.unwrap().starts_with("TypeScript syntax error: line 1"));
     }

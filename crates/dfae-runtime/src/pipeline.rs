@@ -231,7 +231,17 @@ impl Inner {
         // a brief plan's remaining work is the local system's: free, apart from what the planner flagged
         let any_brief = plan.steps.iter().any(|s| s.brief);
         plan.estimate = Some(self.cost.estimate_plan(&plan, self.uses_planner(mode) && !any_brief));
-        ctx.rec.lock().await.plan = Some(plan.clone());
+        {
+            let mut r = ctx.rec.lock().await;
+            if crate::implement::project_plan(&plan) {
+                let before = (r.budget.max_seconds, r.budget.max_tool_calls);
+                r.budget.for_project();
+                if before != (r.budget.max_seconds, r.budget.max_tool_calls) {
+                    tracing::info!(task = %ctx.id, seconds = r.budget.max_seconds, tool_calls = r.budget.max_tool_calls, "a project task: budget raised");
+                }
+            }
+            r.plan = Some(plan.clone());
+        }
         self.emit(ctx, EventKind::PlanCreated { plan }).await;
         self.persist(ctx).await;
 
@@ -268,6 +278,9 @@ impl Inner {
             self.set_status(ctx, TaskStatus::Verifying).await;
             verification = self.stage_verify(ctx).await;
         }
+        // a continuation that was tried and not given (the planner could not be reached, or added nothing) left the task `Recovering`, from
+        // which it cannot complete: it stayed non-terminal for good although its answer was given
+        self.set_status(ctx, TaskStatus::Verifying).await;
         ctx.rec.lock().await.verification = Some(verification);
         let mode = ctx.rec.lock().await.mode.unwrap_or(mode);
         self.stage_answer(ctx, mode, exec_err.as_deref()).await;

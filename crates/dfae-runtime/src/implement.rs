@@ -119,9 +119,57 @@ pub(crate) fn implies_background(description: &str, command: &str) -> bool {
 /// change state (an installer, `rm`, a redirect into a file, a build or test runner, a script) makes it a real command.
 pub(crate) fn probe_like(command: &str) -> bool {
     const LOOK: &[&str] = &[
-        "command", "which", "type", "whereis", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "rg", "find", "echo", "printf", "pwd", "whoami",
-        "id", "uname", "env", "printenv", "test", "[", "stat", "file", "df", "du", "free", "ps", "pgrep", "ss", "netstat", "lsof", "nproc", "date",
-        "hostname", "realpath", "readlink", "dirname", "basename", "true", "jq", "sort", "uniq", "cut", "tr", "awk", "tree", "diff", "sha256sum", "md5sum",
+        "command",
+        "which",
+        "type",
+        "whereis",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "egrep",
+        "rg",
+        "find",
+        "echo",
+        "printf",
+        "pwd",
+        "whoami",
+        "id",
+        "uname",
+        "env",
+        "printenv",
+        "test",
+        "[",
+        "stat",
+        "file",
+        "df",
+        "du",
+        "free",
+        "ps",
+        "pgrep",
+        "ss",
+        "netstat",
+        "lsof",
+        "nproc",
+        "date",
+        "hostname",
+        "realpath",
+        "readlink",
+        "dirname",
+        "basename",
+        "true",
+        "jq",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "awk",
+        "tree",
+        "diff",
+        "sha256sum",
+        "md5sum",
     ];
     let cleaned = command.replace("2>&1", " ").replace("2>/dev/null", " ").replace(">/dev/null", " ").replace("&>/dev/null", " ");
     if cleaned.contains('>') || cleaned.contains("$(") || cleaned.contains('`') || cleaned.trim().is_empty() {
@@ -131,14 +179,20 @@ pub(crate) fn probe_like(command: &str) -> bool {
         let words: Vec<&str> = seg.split_whitespace().collect();
         let first = words[0].rsplit('/').next().unwrap_or(words[0]);
         // `awk`/`find` can write (`-exec`, `-delete`, `system(`): only their read-only forms are a look
-        if (first == "find" && words.iter().any(|w| matches!(*w, "-exec" | "-execdir" | "-delete" | "-ok")))
-            || (first == "awk" && seg.contains("system("))
-        {
+        if (first == "find" && words.iter().any(|w| matches!(*w, "-exec" | "-execdir" | "-delete" | "-ok"))) || (first == "awk" && seg.contains("system(")) {
             return false;
         }
         // `npm --version`, `node -v`, `python3 -V`: asking a program its version is a look
         LOOK.contains(&first) || (words.len() == 2 && matches!(words[1], "--version" | "-v" | "-V" | "version"))
     })
+}
+
+/// Does this plan scaffold, install or build a project? Such a task gets the project budget (time is not tokens).
+pub(crate) fn project_plan(plan: &Plan) -> bool {
+    static BUILD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:create-[\w-]+|npm\s+(?:install|ci|i|run\s+build|create|init)|yarn\s+(?:install|add|build)|pnpm\s+(?:install|add|build)|next\s+build|vite\s+build|cargo\s+(?:build|new|init)|pip\s+install|poetry\s+install|go\s+build|mvn|gradle|scaffold)\b").unwrap()
+    });
+    plan.steps.iter().any(|s| s.tool.as_deref() == Some("shell") && (BUILD.is_match(&s.description) || BUILD.is_match(&s.args.to_string())))
 }
 
 /// Parameters whose values are content (text to write): the one thing allowed to run long.
@@ -1145,10 +1199,27 @@ mod content_tests {
     #[test]
     fn a_probe_is_told_from_a_command_that_changes_something() {
         use super::probe_like;
-        for c in ["command -v node npm corepack nvm; npm --version", "ls -la site", "cat package.json | jq .dependencies", "node -v && python3 --version 2>&1", "test -d node_modules || echo missing", "ss -ltnp | grep 8000"] {
+        for c in [
+            "command -v node npm corepack nvm; npm --version",
+            "ls -la site",
+            "cat package.json | jq .dependencies",
+            "node -v && python3 --version 2>&1",
+            "test -d node_modules || echo missing",
+            "ss -ltnp | grep 8000",
+        ] {
             assert!(probe_like(c), "{c}");
         }
-        for c in ["npm install", "npm run build", "rm -rf node_modules", "echo x > a.txt", "ls; npm test", "find . -name '*.tmp' -delete", "python3 app.py", "cat $(which x)", "pytest"] {
+        for c in [
+            "npm install",
+            "npm run build",
+            "rm -rf node_modules",
+            "echo x > a.txt",
+            "ls; npm test",
+            "find . -name '*.tmp' -delete",
+            "python3 app.py",
+            "cat $(which x)",
+            "pytest",
+        ] {
             assert!(!probe_like(c), "{c}");
         }
     }

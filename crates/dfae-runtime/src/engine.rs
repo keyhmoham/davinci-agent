@@ -59,6 +59,8 @@ pub(crate) struct TaskCtx {
     pub reroute: std::sync::atomic::AtomicBool,
     /// Steps the step agent has already tried to fix (one loop per step).
     pub fixed: Mutex<HashSet<String>>,
+    /// What the step agent tried on a step and why it stopped, for the re-plan that follows ("tried: …; the same error every time: …").
+    pub fix_notes: Mutex<HashMap<String, String>>,
     /// How hard the planner thinks for this task (from the request's complexity), and how many re-planning rounds it has had.
     pub planner_effort: Mutex<Option<String>>,
     pub planner_rounds: std::sync::atomic::AtomicU32,
@@ -87,6 +89,7 @@ impl TaskCtx {
             mcp_hidden: Mutex::new(HashSet::new()),
             reroute: std::sync::atomic::AtomicBool::new(false),
             fixed: Mutex::new(HashSet::new()),
+            fix_notes: Mutex::new(HashMap::new()),
             planner_effort: Mutex::new(None),
             planner_rounds: std::sync::atomic::AtomicU32::new(0),
             withheld: Mutex::new(Vec::new()),
@@ -671,6 +674,16 @@ impl Inner {
             }
             r.usage.worker_calls += n;
         }
+        Ok(())
+    }
+
+    /// A tool call of the step agent, from its own pool.
+    pub(crate) async fn take_fix_tool_call(&self, ctx: &Arc<TaskCtx>) -> Result<(), String> {
+        let mut r = ctx.rec.lock().await;
+        if r.usage.fix_tool_calls + 1 > r.budget.max_fix_tool_calls {
+            return Err(format!("the step agent's tool-call budget is spent ({} allowed)", r.budget.max_fix_tool_calls));
+        }
+        r.usage.fix_tool_calls += 1;
         Ok(())
     }
 

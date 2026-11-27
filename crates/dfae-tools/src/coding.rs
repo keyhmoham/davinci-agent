@@ -959,8 +959,7 @@ pub(crate) async fn choose_port(port: u16, cwd: &Path) -> Result<Option<u16>, To
     if !listening(port).await {
         return Ok(None);
     }
-    let ours: Vec<Arc<Job>> =
-        JOBS.lock().values().filter(|j| j.port == Some(port) && j.exit.lock().is_none() && same_dir(&j.cwd, cwd)).cloned().collect();
+    let ours: Vec<Arc<Job>> = JOBS.lock().values().filter(|j| j.port == Some(port) && j.exit.lock().is_none() && same_dir(&j.cwd, cwd)).cloned().collect();
     if !ours.is_empty() {
         for j in &ours {
             j.kill.notify_one();

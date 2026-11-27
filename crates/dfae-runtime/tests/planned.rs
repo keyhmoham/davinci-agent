@@ -1005,6 +1005,46 @@ async fn a_step_the_worker_cannot_fix_still_goes_to_the_planner() {
 }
 
 #[tokio::test]
+async fn a_fix_loop_that_keeps_hitting_the_same_error_stops_and_tells_the_planner_what_was_tried() {
+    let r = rig(false, |c| {
+        c.economy.step_agent = true;
+        c.economy.step_agent_turns = 6;
+    });
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "read data/input.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    // two different actions, the same failure (only the path differs): the loop ends after the second
+    r.worker.push(&json!({"action": "tool", "tool": "fs_read", "args": {"path": "data/a.txt"}, "why": "look", "summary": null, "reason": null}).to_string());
+    r.worker
+        .push(&json!({"action": "tool", "tool": "fs_read", "args": {"path": "data/b.txt"}, "why": "look again", "summary": null, "reason": null}).to_string());
+    r.planner.push(&json!({"edit": [], "add": [{"id": "r1_1", "do": "list the workspace", "tool": "fs_list", "after": [], "expect": null, "planner": false}], "drop": ["s1"]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
+    let plan = t.plan.as_ref().unwrap();
+    assert!(plan.step("s1_fix2").is_some() && plan.step("s1_fix3").is_none(), "{:?}", plan.steps.iter().map(|s| &s.id).collect::<Vec<_>>());
+    let reqs = r.planner.requests.lock().clone();
+    let replan = reqs.iter().find(|q| q.purpose.starts_with("replan")).expect("a re-plan");
+    let text = replan.messages.iter().map(|m| m.content.clone()).collect::<Vec<_>>().join("\n");
+    assert!(text.contains("THE WORKER ALREADY TRIED (2 actions)") && text.contains("the same error every time"), "{text}");
+    assert!(t.status.is_terminal(), "the task ends even when the continuation re-plan cannot be had: {:?}", t.status);
+}
+
+#[tokio::test]
+async fn a_fix_loop_that_repeats_an_action_with_nothing_changed_stops() {
+    let r = rig(false, |c| {
+        c.economy.step_agent = true;
+        c.economy.step_agent_turns = 6;
+    });
+    r.planner
+        .push(&json!({"steps": [{"id": "s1", "do": "read data/input.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}]}).to_string());
+    r.worker.push(&json!({"action": "tool", "tool": "fs_list", "args": {"path": "."}, "why": "look", "summary": null, "reason": null}).to_string());
+    r.worker.push(&json!({"action": "tool", "tool": "fs_list", "args": {"path":  "."}, "why": "look again", "summary": null, "reason": null}).to_string());
+    r.planner.push(&json!({"edit": [], "add": [{"id": "r1_1", "do": "list the workspace", "tool": "fs_list", "after": [], "expect": null, "planner": false}], "drop": ["s1"]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
+    let plan = t.plan.as_ref().unwrap();
+    assert!(plan.step("s1_fix1").is_some() && plan.step("s1_fix2").is_none(), "the repeat is not run");
+    assert!(t.usage.fix_tool_calls == 1 && t.usage.tool_calls >= 1, "the fix drew on its own pool: {:?}", t.usage);
+}
+
+#[tokio::test]
 async fn a_result_that_misses_its_expectation_is_fixed_by_the_worker_before_the_planner_revisits() {
     let r = rig(false, |c| c.economy.step_agent = true);
     std::fs::create_dir_all(r.ws.path().join("site")).unwrap();

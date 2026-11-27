@@ -65,6 +65,64 @@ pub fn parse(v: &Value) -> Option<Action> {
     }
 }
 
+/// A failure's fingerprint: its last complaint line with paths, numbers and hashes masked, so "the same error again" is recognised however
+/// the build numbered its chunks (coding plan R1: four turns produced the identical `ld.so` line, each running a full `next build`).
+pub fn fingerprint(failure: &str) -> String {
+    static COMPLAINT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)\b(?:error|failed|failure|exception|cannot|can't|not found|denied|fatal|panic|unable|invalid|missing|inconsistency|killed|timed out)\b",
+        )
+        .unwrap()
+    });
+    static MASK: std::sync::LazyLock<[(regex::Regex, &'static str); 3]> = std::sync::LazyLock::new(|| {
+        [
+            (regex::Regex::new(r"(?:\.{0,2}/)?(?:[\w.@-]+/)+[\w.@-]*").unwrap(), "<path>"),
+            (regex::Regex::new(r"\b[0-9a-f]{7,}\b").unwrap(), "<hash>"),
+            (regex::Regex::new(r"\d+").unwrap(), "<n>"),
+        ]
+    });
+    let lines: Vec<&str> =
+        failure.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with("[hint]") && !l.starts_with("[exit code") && *l != "[…]").collect();
+    let line = lines.iter().rev().find(|l| COMPLAINT.is_match(l)).or(lines.last()).copied().unwrap_or("");
+    let mut out = line.to_lowercase();
+    for (re, with) in MASK.iter() {
+        out = re.replace_all(&out, *with).into_owned();
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The last complaint line itself, for the planner ("the same error every time: …").
+pub fn complaint(failure: &str) -> String {
+    let fp_line = failure
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("[hint]") && !l.starts_with("[exit code"))
+        .rev()
+        .find(|l| fingerprint(l) == fingerprint(failure))
+        .unwrap_or("");
+    fp_line.chars().take(200).collect()
+}
+
+/// An action as it repeats: the tool and its arguments with whitespace collapsed.
+pub fn action_key(tool: &str, args: &Value) -> String {
+    format!("{tool} {}", args.to_string().split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// What the result of a turn shows the worker: a failure is reduced to the lines that say what went wrong (a build log's error is at its
+/// end); a success keeps its start and its end (coding plan R2 — `take(2500)` showed the head of a log and only an added `| tail -20` helped).
+fn shown_result(ok: bool, result: &str) -> String {
+    if !ok {
+        return crate::executor::failure_digest(result);
+    }
+    let n = result.chars().count();
+    if n <= 2500 {
+        return result.to_string();
+    }
+    let head: String = result.chars().take(600).collect();
+    let tail: String = result.chars().skip(n - 1900).collect();
+    format!("{head}\n… [{} characters omitted] …\n{tail}", n - 2500)
+}
+
 /// One turn of the history, as the worker sees it: the latest results in full (bounded), older ones as one line.
 pub fn render_history(turns: &[(String, bool, String)], full_last: usize) -> String {
     let n = turns.len();
@@ -74,7 +132,7 @@ pub fn render_history(turns: &[(String, bool, String)], full_last: usize) -> Str
         .map(|(i, (action, ok, result))| {
             let status = if *ok { "ok" } else { "FAILED" };
             if i + full_last >= n {
-                let body: String = result.chars().take(2500).collect();
+                let body = shown_result(*ok, result);
                 format!("{}. {action} → {status}\n{}", i + 1, safety::wrap_untrusted("result", &body))
             } else {
                 let first = result.lines().next().unwrap_or("").chars().take(120).collect::<String>();
@@ -108,6 +166,26 @@ mod tests {
             "the action's own fields never reach the tool"
         );
         assert_eq!(parse(&json!({"hello": 1})), None);
+    }
+
+    #[test]
+    fn the_same_error_is_recognised_however_it_is_numbered() {
+        let a = "> next build\n▲ Next.js 16.4.6\nCreating an optimized production build ...\nInconsistency detected by ld.so: ../sysdeps/x86_64/dl-machine.h: 545: elf_machine_rela_relative: Assertion `ELFW(R_TYPE) (reloc->r_info) == R_X86_64_RELATIVE' failed!\n[exit code 127]";
+        let b = "> next build --webpack\n▲ Next.js 16.4.6\nInconsistency detected by ld.so: ../sysdeps/x86_64/dl-machine.h: 547: elf_machine_rela_relative: Assertion `ELFW(R_TYPE) (reloc->r_info) == R_X86_64_RELATIVE' failed!\n[exit code 127]";
+        assert_eq!(fingerprint(a), fingerprint(b));
+        assert!(complaint(a).starts_with("Inconsistency detected by ld.so"), "{}", complaint(a));
+        assert_ne!(fingerprint(a), fingerprint("Error: listen EADDRINUSE: address already in use :::8000"));
+        assert_eq!(action_key("shell", &json!({"command": "npm  run build"})), action_key("shell", &json!({"command": "npm run build"})));
+    }
+
+    #[test]
+    fn a_failed_result_shows_its_end_and_a_long_success_both_ends() {
+        let log = format!("START\n{}\nError: Expression expected at layout.jsx:31\n[exit code 1]", "compiling chunk\n".repeat(400));
+        let h = render_history(&[("shell npm run build".into(), false, log)], 2);
+        assert!(h.contains("Expression expected") && !h.contains("START"), "{h}");
+        let ok = format!("HEAD-LINE\n{}\nTAIL-LINE", "x".repeat(5000));
+        let h = render_history(&[("shell ls".into(), true, ok)], 2);
+        assert!(h.contains("HEAD-LINE") && h.contains("TAIL-LINE") && h.contains("characters omitted"), "{h}");
     }
 
     #[test]

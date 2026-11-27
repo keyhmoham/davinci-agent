@@ -628,11 +628,12 @@ impl Tool for Shell {
                     first.push_str(&crate::coding::await_listening(id, port, Duration::from_secs(40)).await?);
                 }
                 let note = moved
-                    .map(|(old, new)| format!("\nport {old} was taken by another process, so it was started on port {new} instead: it is at http://localhost:{new}"))
+                    .map(|(old, new)| {
+                        format!("\nport {old} was taken by another process, so it was started on port {new} instead: it is at http://localhost:{new}")
+                    })
                     .unwrap_or_default();
-                let mut out = ToolOutput::ok(format!(
-                    "started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it{note}{first}"
-                ));
+                let mut out =
+                    ToolOutput::ok(format!("started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it{note}{first}"));
                 if let Some((old, new)) = moved {
                     out.evidence.push(format!("port moved: {old} -> {new}"));
                 }

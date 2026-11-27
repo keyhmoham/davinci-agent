@@ -389,6 +389,10 @@ impl Inner {
                         tokens::truncate_tokens(&out.content, 150),
                         step.expect.as_deref().unwrap_or(""),
                     );
+                    let problem = match ctx.fix_notes.lock().get(id) {
+                        Some(n) => format!("{problem}\n{n}. Do not plan those again; change the approach."),
+                        None => problem,
+                    };
                     ctx.checkpoints.lock().push(problem);
                     out.evidence.push(format!("expectation not met: {why}"));
                     self.emit(ctx, EventKind::Warning { message: format!("step {id}: {why}; the plan will be revisited") }).await;
@@ -691,7 +695,8 @@ impl Inner {
         let out = match cached {
             Some(content) => ToolOutput { content, ok: true, exit_code: Some(0), evidence: vec!["served from the team's shared cache".into()] },
             None => {
-                self.take_tool_call(ctx).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
+                if step.how.as_deref() == Some("step-agent") { self.take_fix_tool_call(ctx).await } else { self.take_tool_call(ctx).await }
+                    .map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
                 // the tool's own limit governs (a 600 s install is not cut at 120 s), never past the task's remaining time
                 let limit = tool.max_runtime(&args).min(self.time_left(ctx).await);
                 let res = tokio::time::timeout(limit, tool.execute(args.clone(), tctx.clone())).await;
@@ -1008,7 +1013,7 @@ impl Inner {
                 if tier == Tier::Planner {
                     ctx.rec.lock().await.mode = Some(ExecMode::Escalated);
                 }
-                let problem = format!(
+                let mut problem = format!(
                     "step {id} \"{}\" ({} {}) failed with {}: {}",
                     tokens::truncate_tokens(&step.description, 30),
                     step.tool.as_deref().unwrap_or("reasoning"),
@@ -1016,6 +1021,9 @@ impl Inner {
                     kind_str(f.kind),
                     clip_error(&f.message, 380)
                 );
+                if let Some(n) = ctx.fix_notes.lock().get(id) {
+                    problem.push_str(&format!("\n{n}. Do not plan those again; change the approach."));
+                }
                 match self.replan(ctx, tier, &goal, &problem, Some(id)).await {
                     Ok(true) => None,
                     Ok(false) => Some(label),
@@ -1310,6 +1318,15 @@ impl Inner {
         let goal = ctx.rec.lock().await.goal.clone();
         self.emit(ctx, EventKind::Warning { message: format!("step {id} failed: the worker tries to fix it with tools before the plan is revised") }).await;
         let mut turns: Vec<(String, bool, String)> = Vec::new();
+        // a loop that cannot change the outcome stops (coding plan C1): the same error twice, or the same action again with nothing
+        // changed since; the re-plan is then told what was tried and what kept happening
+        let mut failures: Vec<String> = Vec::new();
+        let mut actions: Vec<(String, usize)> = Vec::new();
+        let mut last_change: Option<usize> = None;
+        let note = |turns: &[(String, bool, String)], why: &str| {
+            let tried: Vec<&str> = turns.iter().map(|(a, _, _)| a.as_str()).collect();
+            format!("THE WORKER ALREADY TRIED ({} actions): {} — {why}", tried.len(), tokens::truncate_tokens(&tried.join("; "), 120))
+        };
         for k in 1..=self.cfg.economy.step_agent_turns {
             let user = format!(
                 "GOAL: {}\nFAILED STEP {id} ({}): {}\nARGS: {}\nFAILURE: {}\n{}\nTOOLS:\n{catalog}\nDONE SO FAR:\n{}",
@@ -1327,11 +1344,14 @@ impl Inner {
             req.json = true;
             req.schema = Some(schema(&tools));
             req.schema_strict = true;
-            let Ok(v) = self.gen_json(ctx, Tier::Worker, req).await else { return false };
+            let Ok(v) = self.gen_json(ctx, Tier::Worker, req).await else { break };
             match parse(&v) {
-                None => return false,
+                None => break,
                 Some(Action::GiveUp(why)) => {
                     self.emit(ctx, EventKind::Warning { message: format!("the worker could not fix {id} ({why}): the plan is revised") }).await;
+                    if !turns.is_empty() {
+                        ctx.fix_notes.lock().insert(id.to_string(), note(&turns, &format!("it gave up: {}", tokens::truncate_tokens(&why, 40))));
+                    }
                     return false;
                 }
                 Some(Action::Done(summary)) => {
@@ -1359,6 +1379,18 @@ impl Inner {
                     {
                         args["background"] = json!(true);
                     }
+                    let key = crate::step_agent::action_key(&tool, &args);
+                    if let Some((_, at)) = actions.iter().rev().find(|(a, _)| *a == key)
+                        && last_change.is_none_or(|c| c <= *at)
+                    {
+                        let why = format!("it repeated `{}` with nothing changed since", tokens::truncate_tokens(&shown, 30));
+                        self.emit(ctx, EventKind::Warning { message: format!("step {id}: the worker {why}; the plan is revised") }).await;
+                        ctx.fix_notes.lock().insert(id.to_string(), note(&turns, &why));
+                        return false;
+                    }
+                    actions.push((key, turns.len()));
+                    let changes = self.tools.meta(&tool).is_some_and(|m| m.side_effects)
+                        && !(tool == "shell" && args.get("command").and_then(|c| c.as_str()).is_some_and(crate::implement::probe_like));
                     let mut s = Step::tool(&format!("{id}_fix{k}"), &tool, &format!("fix {id}: {why}"), args);
                     s.approval_required = self.tools.meta(&tool).map(|m| m.requires_approval).unwrap_or(false);
                     s.how = Some("step-agent".into());
@@ -1382,9 +1414,27 @@ impl Inner {
                         }
                     }
                     self.persist(ctx).await;
-                    turns.push((shown, ok, text));
+                    if ok && changes {
+                        last_change = Some(turns.len());
+                    }
+                    let failed_fp = (!ok).then(|| crate::step_agent::fingerprint(&text));
+                    turns.push((shown, ok, text.clone()));
+                    if let Some(fp) = failed_fp {
+                        if !fp.is_empty() && failures.contains(&fp) {
+                            let line = crate::step_agent::complaint(&text);
+                            let why = format!("the same error every time: {line}");
+                            self.emit(ctx, EventKind::Warning { message: format!("step {id}: the worker's fixes keep ending in {line}; the plan is revised") })
+                                .await;
+                            ctx.fix_notes.lock().insert(id.to_string(), note(&turns, &why));
+                            return false;
+                        }
+                        failures.push(fp);
+                    }
                 }
             }
+        }
+        if !turns.is_empty() {
+            ctx.fix_notes.lock().insert(id.to_string(), note(&turns, "none of it fixed the step"));
         }
         false
     }

@@ -79,8 +79,8 @@ static SOFT_VER: LazyLock<Regex> = LazyLock::new(|| {
 /// Only a bare name (no directory) with a known framework stem: `src/next.js` and `App.js` stay files.
 pub(crate) fn framework_name(t: &str) -> bool {
     const STEMS: &[&str] = &[
-        "next", "node", "vue", "nuxt", "three", "express", "nest", "react", "d3", "chart", "socket", "p5", "alpine", "ember", "backbone", "solid",
-        "svelte", "angular", "deno", "electron", "moment", "anime", "phaser", "pixi", "babylon", "leaflet", "ext", "meteor",
+        "next", "node", "vue", "nuxt", "three", "express", "nest", "react", "d3", "chart", "socket", "p5", "alpine", "ember", "backbone", "solid", "svelte",
+        "angular", "deno", "electron", "moment", "anime", "phaser", "pixi", "babylon", "leaflet", "ext", "meteor",
     ];
     if t.contains('/') {
         return false;

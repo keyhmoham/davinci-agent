@@ -455,6 +455,9 @@ impl Config {
                 max_replans: env_parse("DFAE_MAX_REPLANS", 4),
                 max_seconds: env_parse("DFAE_MAX_SECONDS", 600),
                 max_children: env_parse("DFAE_MAX_CHILDREN", 8),
+                max_fix_tool_calls: env_parse("DFAE_STEP_AGENT_TOOL_CALLS", 12),
+                project_max_seconds: env_parse("DFAE_PROJECT_MAX_SECONDS", 1500),
+                project_max_tool_calls: env_parse("DFAE_PROJECT_MAX_TOOL_CALLS", 40),
             },
             thresholds: Thresholds {
                 direct_min_confidence: env_parse("DFAE_DIRECT_MIN_CONF", 0.6),
