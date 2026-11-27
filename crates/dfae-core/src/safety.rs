@@ -25,6 +25,64 @@ pub fn redact_secrets(s: &str) -> String {
     out
 }
 
+static EMAIL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}\b").unwrap());
+/// A phone number: `+` and a country code, or a parenthesised area code, or the usual separated groups — at least 9 digits in all.
+static PHONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:\+\d{1,3}[\s.\-]?)?(?:\(\d{2,4}\)[\s.\-]?)?\d{2,4}(?:[\s.\-]\d{2,4}){1,4}\b|\+\d{9,14}\b").unwrap());
+static CARD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(?:\d[ \-]?){12,18}\d\b").unwrap());
+static IBAN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){3,7}(?: ?[A-Z0-9]{1,3})?\b").unwrap());
+
+fn luhn(digits: &str) -> bool {
+    let d: Vec<u32> = digits.chars().filter_map(|c| c.to_digit(10)).collect();
+    if d.len() < 13 || d.len() > 19 {
+        return false;
+    }
+    let sum: u32 = d
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(i, &x)| {
+            if i % 2 == 1 {
+                let y = x * 2;
+                if y > 9 { y - 9 } else { y }
+            } else {
+                x
+            }
+        })
+        .sum();
+    sum.is_multiple_of(10)
+}
+
+/// A phone-shaped match that is something else: a date, a version, a time, a decimal, an IP address.
+fn not_a_phone(m: &str) -> bool {
+    let digits = m.chars().filter(|c| c.is_ascii_digit()).count();
+    let dots = m.matches('.').count();
+    let marked = m.starts_with('+') || m.contains('(');
+    let groups = m.split(|c: char| !c.is_ascii_digit()).filter(|g| !g.is_empty()).count();
+    // E.164 allows at most 15 digits; two bare groups ("12345 67890") are two numbers unless a + or an area code says otherwise
+    !(9..=15).contains(&digits) || (dots >= 2 && !m.contains(' ') && !marked) || m.contains(':') || (groups <= 2 && !marked)
+}
+
+/// Replace personal data with a placeholder before text is kept for later (long-term memory, the decision log): e-mail addresses,
+/// phone numbers, card numbers (Luhn-checked) and IBANs. High precision by design: versions, ports, dates, prices, paths, hashes and
+/// IP addresses are left alone. Names and street addresses need a model and are not caught.
+pub fn redact_pii(s: &str) -> String {
+    let out = EMAIL.replace_all(s, "[EMAIL]").into_owned();
+    let out = IBAN
+        .replace_all(&out, |c: &regex::Captures| {
+            let m = &c[0];
+            if m.chars().filter(|c| c.is_ascii_digit()).count() >= 10 { "[IBAN]".to_string() } else { m.to_string() }
+        })
+        .into_owned();
+    let out = CARD.replace_all(&out, |c: &regex::Captures| if luhn(&c[0]) { "[CARD]".to_string() } else { c[0].to_string() }).into_owned();
+    PHONE
+        .replace_all(&out, |c: &regex::Captures| {
+            let m = &c[0];
+            if not_a_phone(m) { m.to_string() } else { "[PHONE]".to_string() }
+        })
+        .into_owned()
+}
+
 static INJECTION_PATTERNS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     vec![
         (Regex::new(r"(?i)ignore (all |any )?(the )?(previous|prior|above|earlier) (instructions|prompts|rules)").unwrap(), "override-instructions"),
@@ -54,6 +112,37 @@ pub fn wrap_untrusted(label: &str, s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_data_is_replaced_and_lookalikes_are_not() {
+        let pii = [
+            ("write to ana.lopez@example.com tomorrow", "write to [EMAIL] tomorrow"),
+            ("call me on +44 20 7946 0958", "call me on [PHONE]"),
+            ("my number is (415) 555-2671", "my number is [PHONE]"),
+            ("ring 030 1234 5678 after six", "ring [PHONE] after six"),
+            ("+14155552671", "[PHONE]"),
+            ("card 4111 1111 1111 1111 exp 09/29", "card [CARD] exp 09/29"),
+            ("pay to DE89 3704 0044 0532 0130 00 now", "pay to [IBAN] now"),
+        ];
+        for (input, want) in pii {
+            assert_eq!(redact_pii(input), want, "{input}");
+        }
+        let keep = [
+            "Python 3.15.2 was released on 2026-10-25",
+            "serve it on port 8001 at http://localhost:8001",
+            "the build took 12.5 s and costs $49.90",
+            "server db01.internal at 10.0.0.12",
+            "commit 4f2a9c1e0b7d and sha256 9f86d081884c7d659a2feaa0c55ad015",
+            "order 1000123 shipped, invoice INV-2041",
+            "the meeting is at 14:30 on 2026-11-27",
+            "a 16-digit id 1234 5678 9012 3456 that fails Luhn",
+            "path /var/log/app/2026/11/27/server.log",
+            "@decorator and user@ alone",
+        ];
+        for k in keep {
+            assert_eq!(redact_pii(k), k, "a lookalike was changed: {k}");
+        }
+    }
 
     #[test]
     fn redacts() {

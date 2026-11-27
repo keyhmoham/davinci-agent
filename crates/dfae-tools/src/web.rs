@@ -20,9 +20,28 @@ static SCRIPT_STYLE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?is)<script[^>]*>.*?</script>|<style[^>]*>.*?</style>|<noscript[^>]*>.*?</noscript>|<svg[^>]*>.*?</svg>|<!--.*?-->").unwrap()
 });
 static TAGS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?s)<[^>]+>").unwrap());
+/// Elements a browser never shows: a page's hidden text is where an injection aimed at a model hides (a person reading the page
+/// never sees it, so it is never part of what the page says).
+static HIDDEN: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    let hidden = r#"(?:display\s*:\s*none|visibility\s*:\s*hidden|\shidden\b|aria-hidden\s*=\s*["']?true|font-size\s*:\s*0(?:px)?\s*[;"'])"#;
+    let mut v: Vec<Regex> = ["p", "div", "span", "section", "li", "a", "td", "small", "font", "label", "article", "aside"]
+        .iter()
+        .map(|t| Regex::new(&format!(r"(?is)<{t}\b[^>]*{hidden}[^>]*>.*?</{t}\s*>")).unwrap())
+        .collect();
+    v.push(Regex::new(r"(?is)<template\b[^>]*>.*?</template\s*>").unwrap());
+    v
+});
+/// Block boundaries stay line breaks, so a reader (and a span selector) sees the page's lines.
+static BLOCKS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)</?(?:p|div|h[1-6]|li|ul|ol|tr|table|section|article|header|footer|nav|main|aside|blockquote|pre|dt|dd)\b[^>]*>|<br\s*/?>").unwrap()
+});
 
 pub(crate) fn html_to_text(html: &str) -> String {
-    let t = SCRIPT_STYLE.replace_all(html, " ");
+    let mut t = SCRIPT_STYLE.replace_all(html, " ").into_owned();
+    for re in HIDDEN.iter() {
+        t = re.replace_all(&t, " ").into_owned();
+    }
+    let t = BLOCKS.replace_all(&t, "\n");
     let t = TAGS.replace_all(&t, " ");
     let t = t
         .replace("&nbsp;", " ")
@@ -32,7 +51,7 @@ pub(crate) fn html_to_text(html: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
         .replace("&#x27;", "'");
-    t.split_whitespace().collect::<Vec<_>>().join(" ")
+    t.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n")
 }
 
 pub(crate) struct Fetched {

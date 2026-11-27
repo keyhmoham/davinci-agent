@@ -18,6 +18,7 @@ mod pipeline;
 pub mod plandoc;
 pub mod planner;
 pub mod prompts;
+pub mod quarantine;
 mod session;
 mod shadow;
 pub mod skills;

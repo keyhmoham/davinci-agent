@@ -1242,7 +1242,8 @@ impl Inner {
             && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
         {
             use std::io::Write;
-            let _ = writeln!(f, "{}", crate::shadow::log_line(&ctx.id, &state.request, agree, total, &diffs));
+            let request = if self.cfg.economy.redact_pii { dfae_core::safety::redact_pii(&state.request) } else { state.request.clone() };
+            let _ = writeln!(f, "{}", crate::shadow::log_line(&ctx.id, &request, agree, total, &diffs));
         }
     }
 
@@ -1300,10 +1301,21 @@ impl Inner {
             );
             let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.8);
             it.metadata = json!({"source": "lesson", "task_id": prev.task_id, "feedback": "negative"});
-            let _ = self.store.store(it).await;
+            let _ = self.store.store(self.keep(it)).await;
         }
         let _ = self.store.kv_set("calibration", self.decider.calibrator.snapshot()).await;
         self.export_decisions(prev, if good { "confirmed_by_user" } else { "rejected_by_user" });
+    }
+
+    /// What is kept for later is kept without personal data (`EconomyConfig::redact_pii`).
+    fn keep(&self, mut it: MemoryItem) -> MemoryItem {
+        if self.cfg.economy.redact_pii {
+            it.text = dfae_core::safety::redact_pii(&it.text);
+            for e in &mut it.entities {
+                e.text = dfae_core::safety::redact_pii(&e.text);
+            }
+        }
+        it
     }
 
     /// One JSON line per decision of a task, with what became of it (when a log file is configured).
@@ -1312,8 +1324,9 @@ impl Inner {
         let Some(path) = &self.cfg.decision_log else { return };
         let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
         for d in &rec.decisions {
+            let goal = if self.cfg.economy.redact_pii { dfae_core::safety::redact_pii(&rec.goal) } else { rec.goal.clone() };
             let line = json!({
-                "task_id": rec.task_id, "goal": rec.goal, "kind": d.kind, "provider": d.provider, "answers": d.answers,
+                "task_id": rec.task_id, "goal": goal, "kind": d.kind, "provider": d.provider, "answers": d.answers,
                 "outcome": outcome, "status": rec.status, "mode": rec.mode, "ts": d.ts,
             });
             let _ = writeln!(f, "{line}");
@@ -1340,6 +1353,10 @@ impl Inner {
         }
         let Ok(reply) = reply else { return };
         for fact in crate::facts::verified(&reply, &sources) {
+            // a fact whose value is personal data is not kept at all (a redacted value is no fact)
+            if self.cfg.economy.redact_pii && dfae_core::safety::redact_pii(&fact.value) != fact.value {
+                continue;
+            }
             let text = fact.text();
             let same: Vec<ScoredMemory> = self
                 .store
@@ -1358,7 +1375,7 @@ impl Inner {
             let mut it = MemoryItem::new(MemoryKind::Semantic, text, 0.65);
             it.metadata = json!({"source": "fact", "kind": fact.kind, "subject": fact.subject, "value": fact.value, "task_id": rec.task_id});
             let new_id = it.id.clone();
-            if self.store.store(it).await.is_ok() {
+            if self.store.store(self.keep(it)).await.is_ok() {
                 for old in same {
                     let mut md = old.item.metadata.clone();
                     md["superseded_by"] = json!(new_id);
@@ -1405,7 +1422,7 @@ impl Inner {
         item.entities = rec.entities.clone();
         item.session_id = Some(rec.session_id.clone());
         item.metadata = json!({"task_id": rec.task_id, "success": success, "mode": rec.mode});
-        let _ = self.store.store(item).await;
+        let _ = self.store.store(self.keep(item)).await;
 
         // 2b. reflection: a task that went wrong and then worked leaves a one-line lesson for requests like it
         if success && let Some(lesson) = self.lesson_from(rec) {
@@ -1420,7 +1437,7 @@ impl Inner {
             if !dup {
                 let mut it = MemoryItem::new(MemoryKind::Semantic, lesson, 0.75);
                 it.metadata = json!({"source": "lesson", "task_id": rec.task_id});
-                let _ = self.store.store(it).await;
+                let _ = self.store.store(self.keep(it)).await;
             }
         }
 
@@ -1448,7 +1465,7 @@ impl Inner {
                         let mut it = MemoryItem::new(MemoryKind::Semantic, fact, 0.6);
                         it.entities = vec![e.clone()];
                         it.metadata = json!({"source": "promoted-entity", "task_id": rec.task_id});
-                        let _ = self.store.store(it).await;
+                        let _ = self.store.store(self.keep(it)).await;
                     }
                 }
             }
@@ -1491,7 +1508,7 @@ impl Inner {
         {
             let mut it = MemoryItem::new(MemoryKind::Procedural, skill.masked_request.clone(), 0.8);
             it.metadata = json!({"skill": skill});
-            let _ = self.store.store(it).await;
+            let _ = self.store.store(self.keep(it)).await;
         }
     }
 }

@@ -1044,3 +1044,21 @@ async fn the_planner_thinks_as_hard_as_the_request_needs_and_a_first_replan_keep
     let replan = reqs.iter().find(|q| q.purpose == "replan").expect("a re-plan");
     assert_eq!(replan.reasoning, plan2.reasoning, "the first re-plan keeps the plan's effort");
 }
+
+#[tokio::test]
+async fn what_is_kept_for_later_is_kept_without_personal_data() {
+    let r = rig(false, |c| c.economy.redact_pii = true);
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read a.txt", "tool": "fs_read"}]}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "Read a.txt and mail it to ana.lopez@example.com or call +44 20 7946 0958").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert!(t.goal.contains("ana.lopez@example.com"), "the task's own record keeps the request as the user wrote it");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let kept =
+        r.engine.store().retrieve(MemoryQuery { text: "read a.txt mail".into(), kinds: vec![MemoryKind::Episodic], limit: 5, session_id: None }).await.unwrap();
+    assert!(!kept.is_empty(), "the task left an episode");
+    for m in &kept {
+        assert!(!m.item.text.contains("ana.lopez") && !m.item.text.contains("7946"), "{}", m.item.text);
+        assert!(m.item.text.contains("[EMAIL]") && m.item.text.contains("[PHONE]"), "{}", m.item.text);
+    }
+}

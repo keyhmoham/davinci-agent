@@ -258,6 +258,10 @@ pub struct EconomyConfig {
     pub step_agent: bool,
     #[serde(default)]
     pub step_agent_turns: u32,
+    /// Personal data (e-mail addresses, phone numbers, card numbers, IBANs) is replaced before text is kept for later — long-term
+    /// memory and the decision log (`DFAE_REDACT_PII=off` keeps it). What a user asks to remember explicitly is kept as said.
+    #[serde(default)]
+    pub redact_pii: bool,
 }
 
 /// Team orchestration and dispatch limits.
@@ -435,6 +439,7 @@ impl Config {
                 facts: !matches!(env("DFAE_FACTS").as_deref(), Some("off" | "false" | "0")),
                 step_agent: !matches!(env("DFAE_STEP_AGENT").as_deref(), Some("off" | "false" | "0")),
                 step_agent_turns: env_parse("DFAE_STEP_AGENT_TURNS", 6u32).clamp(1, 12),
+                redact_pii: !matches!(env("DFAE_REDACT_PII").as_deref(), Some("off" | "false" | "0")),
             },
             team: TeamConfig {
                 enabled: !matches!(env("DFAE_TEAM").as_deref(), Some("off" | "false" | "0")),

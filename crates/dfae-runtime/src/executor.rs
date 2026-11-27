@@ -371,8 +371,12 @@ impl Inner {
             Ok(out) => {
                 let content = out.content;
                 let hits = dfae_core::safety::scan_injection(&content);
-                let mut summary = tokens::compress_text(&content, STEP_SUMMARY_TOKENS);
-                if let Some(c) = self.condense(ctx, &step, &content).await {
+                // what comes from outside (the web, an outside service) is extracted from, never summarised by a model
+                let untrusted =
+                    step.kind == StepKind::Tool && step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m));
+                let mut summary =
+                    if untrusted { self.quarantined_summary(ctx, &step, &content).await } else { tokens::compress_text(&content, STEP_SUMMARY_TOKENS) };
+                if !untrusted && let Some(c) = self.condense(ctx, &step, &content).await {
                     summary = c;
                 }
                 if !hits.is_empty() && step.kind == StepKind::Tool {
@@ -698,6 +702,34 @@ impl Inner {
             }
         }
         Ok(StepOutput { content, evidence })
+    }
+
+    /// The summary of untrusted output (`quarantine.rs`): lines that read like instructions to a model dropped; a short output passed on as
+    /// it is; a long one reduced to the lines the worker model selects by number — verbatim, never in a model's own words.
+    async fn quarantined_summary(&self, ctx: &Arc<TaskCtx>, step: &Step, content: &str) -> String {
+        use crate::quarantine::{SPAN_SYSTEM, assemble, clean_lines, dropped_note, numbered, schema};
+        let (lines, dropped) = clean_lines(content);
+        let note = dropped_note(dropped);
+        let all = lines.join("\n");
+        if tokens::estimate_tokens(&all) <= STEP_SUMMARY_TOKENS || !self.models.has(Tier::Worker) {
+            return format!("{}{note}", tokens::compress_text(&all, STEP_SUMMARY_TOKENS));
+        }
+        let goal = ctx.rec.lock().await.goal.clone();
+        let user = format!(
+            "TASK: {}\nSTEP: {}\n{}",
+            tokens::truncate_tokens(&goal, 80),
+            tokens::truncate_tokens(&step.description, 40),
+            dfae_core::safety::wrap_untrusted("numbered lines", &tokens::truncate_tokens(&numbered(&lines, 400), 6000))
+        );
+        let mut req = self.gen_request(Tier::Worker, SPAN_SYSTEM, user, "select");
+        req.json = true;
+        req.schema = Some(schema());
+        req.schema_strict = true;
+        req.max_tokens = req.max_tokens.min(300);
+        match self.gen_json(ctx, Tier::Worker, req).await.ok().and_then(|v| assemble(&lines, &v, STEP_SUMMARY_TOKENS)) {
+            Some(picked) => format!("{picked}{note}"),
+            None => format!("{}{note}", tokens::compress_text(&all, STEP_SUMMARY_TOKENS)),
+        }
     }
 
     /// A big tool output, read once by the self-hosted model and reduced to what the task needs: the planner model
