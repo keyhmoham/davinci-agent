@@ -197,11 +197,20 @@ impl ToolOutput {
     }
 }
 
+/// The executor's backstop for a tool call when the tool names no runtime of its own.
+pub const DEFAULT_MAX_RUNTIME_SECS: u64 = 120;
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn metadata(&self) -> ToolMetadata;
 
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// The longest this call may run before the executor gives up on it. A tool with its own timeout (the shell: `timeout_secs`, a
+    /// longer one for installs and builds) says so here, so the executor's backstop never cuts it short (coding plan A1).
+    fn max_runtime(&self, _input: &Value) -> std::time::Duration {
+        std::time::Duration::from_secs(DEFAULT_MAX_RUNTIME_SECS)
+    }
 
     /// Independent post-condition check (e.g. read the file back). Returns
     /// human-readable evidence strings, or an error describing the mismatch.

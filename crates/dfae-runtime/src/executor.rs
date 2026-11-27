@@ -328,6 +328,21 @@ impl Inner {
                 }
             }
         }
+        // the shell started the server on another port than the plan said (the planned one was taken): what this step expects and what
+        // the steps after it check follow the port it is really on, so the move costs no re-plan (coding plan A9)
+        if let Ok(out) = &result
+            && let Some((old, new)) = moved_port(&out.evidence)
+        {
+            // this step too: run again (after a local fix), it must restart the server where it now is, not look for yet another port
+            move_step_port(&mut step, old, new);
+            self.emit(ctx, EventKind::Warning { message: format!("step {id}: port {old} was taken; the server is on {new}, and the plan follows") }).await;
+            let mut r = ctx.rec.lock().await;
+            if let Some(plan) = r.plan.as_mut() {
+                for s in plan.steps.iter_mut().filter(|s| s.id == id || s.status == StepStatus::Pending) {
+                    move_step_port(s, old, new);
+                }
+            }
+        }
         // the planner said what success looks like: the decision model checks the result against it. A result that
         // misses it is not thrown away (it is real information: "the workspace is empty"); it makes the planner
         // look at the plan again, now knowing what was found.
@@ -677,7 +692,9 @@ impl Inner {
             Some(content) => ToolOutput { content, ok: true, exit_code: Some(0), evidence: vec!["served from the team's shared cache".into()] },
             None => {
                 self.take_tool_call(ctx).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
-                let res = tokio::time::timeout(Duration::from_secs(120), tool.execute(args.clone(), tctx.clone())).await;
+                // the tool's own limit governs (a 600 s install is not cut at 120 s), never past the task's remaining time
+                let limit = tool.max_runtime(&args).min(self.time_left(ctx).await);
+                let res = tokio::time::timeout(limit, tool.execute(args.clone(), tctx.clone())).await;
                 if meta.side_effects
                     && let Some(sh) = &shared
                 {
@@ -685,7 +702,12 @@ impl Inner {
                 }
                 match res {
                     Ok(r) => r.map_err(StepFailure::from)?,
-                    Err(_) => return Err(StepFailure::new(ErrorKind::Timeout, "tool timed out after 120s")),
+                    Err(_) => {
+                        return Err(StepFailure::new(
+                            ErrorKind::Timeout,
+                            format!("tool timed out after {}s (its own limit, or the task's remaining time); it was stopped", limit.as_secs()),
+                        ));
+                    }
                 }
             }
         };
@@ -696,7 +718,14 @@ impl Inner {
         {
             sh.put(k, content.clone(), generation);
         }
-        if !out.ok {
+        // a step that only looks (`command -v nvm`) and expects nothing in particular found something out: what is missing is a finding
+        let probe = !out.ok
+            && name == "shell"
+            && step.expect.is_none()
+            && args.get("background").and_then(|b| b.as_bool()) != Some(true)
+            && out.exit_code.is_some_and(|c| c > 0 && c < 128)
+            && args.get("command").and_then(|c| c.as_str()).is_some_and(crate::implement::probe_like);
+        if !out.ok && !probe {
             return Err(StepFailure::new(
                 ErrorKind::Other,
                 format!("{name} reported failure (exit {}): {}", out.exit_code.unwrap_or(-1), failure_digest(&content)),
@@ -725,6 +754,9 @@ impl Inner {
             return Err(StepFailure::new(ErrorKind::Other, format!("{path} was written but is malformed: {problem}")));
         }
         let mut evidence = out.evidence.clone();
+        if probe {
+            evidence.push(format!("a probe: exit code {} is what it found, not a failure", out.exit_code.unwrap_or(-1)));
+        }
         if let Some(v) = tool.verify(&args, &out, &tctx).await {
             match v {
                 Ok(ev) => evidence.push(format!("verified: {ev}")),
@@ -1397,6 +1429,39 @@ fn clip_error(msg: &str, max_tokens: usize) -> String {
     if n <= max_chars { msg.to_string() } else { format!("…{}", msg.chars().skip(n - max_chars).collect::<String>()) }
 }
 
+/// `port moved: 8000 -> 8001` in a tool's evidence: the server is on another port than its command said.
+fn moved_port(evidence: &[String]) -> Option<(u16, u16)> {
+    evidence.iter().find_map(|e| {
+        let (a, b) = e.strip_prefix("port moved: ")?.split_once(" -> ")?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
+/// A step's sentence, expectation and text arguments, moved from one port to another.
+fn move_step_port(s: &mut Step, old: u16, new: u16) {
+    s.expect = s.expect.as_deref().map(|e| move_port_in(e, old, new));
+    s.description = move_port_in(&s.description, old, new);
+    if let Value::Object(m) = &mut s.args {
+        for (k, v) in m.iter_mut() {
+            if let Value::String(t) = v {
+                // a command line names its port bare too (`http.server 8000`): there, the number on its own is the port
+                *t = if k == "command" {
+                    let re = regex::Regex::new(&format!(r"(^|[^\d.]){old}([^\d]|$)")).expect("port pattern");
+                    re.replace_all(t, format!("${{1}}{new}${{2}}").as_str()).into_owned()
+                } else {
+                    move_port_in(t, old, new)
+                };
+            }
+        }
+    }
+}
+
+/// A port in a sentence or URL (`localhost:8000`, `port 8000`, `-p 8000`) moved to another one; other numbers are left alone.
+fn move_port_in(text: &str, old: u16, new: u16) -> String {
+    let re = regex::Regex::new(&format!(r"(:|\bport\s+|-p\s+|--port[ =]|PORT=){old}\b")).expect("port pattern");
+    re.replace_all(text, format!("${{1}}{new}").as_str()).into_owned()
+}
+
 /// What a failed command said that matters: the end of its output (where a build, a test run or an install says what went wrong), and,
 /// when the end holds no complaint, the last lines that do. The first line of a log is its banner.
 pub(crate) fn failure_digest(output: &str) -> String {
@@ -1481,5 +1546,25 @@ mod digest_tests {
         run.push_str("FAILED test_main.py::test_add - sqlite3.OperationalError: table bo...\n4 failed in 1.2s");
         let d = failure_digest(&run);
         assert!(d.contains("no such table: bookmarks") && d.matches("no such table").count() == 1 && d.contains("4 failed"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::{move_port_in, move_step_port, moved_port};
+    use dfae_core::Step;
+    use serde_json::json;
+
+    #[test]
+    fn a_moved_server_takes_the_plan_with_it() {
+        assert_eq!(moved_port(&["exit code 0".into(), "port moved: 8000 -> 8001".into()]), Some((8000, 8001)));
+        assert_eq!(moved_port(&["exit code 0".into()]), None);
+        assert_eq!(move_port_in("http://localhost:8000 serves the page; 18000 visitors", 8000, 8001), "http://localhost:8001 serves the page; 18000 visitors");
+        assert_eq!(move_port_in("listening on port 8000", 8000, 8002), "listening on port 8002");
+        let mut s: Step = serde_json::from_value(json!({"id": "s5", "kind": "tool", "description": "serve on port 8000", "args": {"command": "python3 -m http.server 8000 --bind 0.0.0.0", "cwd": "site"}, "expect": "http://localhost:8000 serves the page"})).unwrap();
+        move_step_port(&mut s, 8000, 8001);
+        assert_eq!(s.args["command"], "python3 -m http.server 8001 --bind 0.0.0.0");
+        assert_eq!(s.expect.as_deref(), Some("http://localhost:8001 serves the page"));
+        assert_eq!(s.description, "serve on port 8001");
     }
 }

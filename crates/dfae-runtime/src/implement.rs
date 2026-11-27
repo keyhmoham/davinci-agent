@@ -37,7 +37,11 @@ fn majority(candidates: Vec<Map<String, Value>>) -> Option<Map<String, Value>> {
 }
 
 /// A model that was told to reply with the file alone still wraps it in a code fence, or adds a sentence in front.
-pub(crate) fn strip_fences(text: &str) -> String {
+///
+/// `path` is the file the text is for: a sentence before a bare HTML document is cut only from an `.html`/`.htm` file, and only when
+/// what would be cut holds no code. A JSX layout's `<html>` is part of its code (`export default function RootLayout(…) { return (`
+/// came before it, and was lost — coding plan X4).
+pub(crate) fn strip_fences(text: &str, path: &str) -> String {
     let t = text.trim();
     // Only a reply that IS one fenced block (optionally after a one-line "here is the file:" and before a one-line sign-off) is
     // unwrapped. Fences inside the content — a README's code samples, a doc's examples — are the content, and are kept.
@@ -60,14 +64,34 @@ pub(crate) fn strip_fences(text: &str) -> String {
         }
         return t.to_string();
     }
-    // a sentence before a bare HTML document
+    // a sentence before a bare HTML document, in an HTML file
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+    let html_file = matches!(ext.as_deref(), Some("html" | "htm"));
     let lower = t.to_ascii_lowercase();
-    if let Some(at) = lower.find("<!doctype").or_else(|| lower.find("<html"))
+    if html_file
+        && let Some(at) = lower.find("<!doctype").or_else(|| lower.find("<html"))
         && at > 0
+        && !looks_like_code(&t[..at])
     {
         return t[at..].to_string();
     }
     t.to_string()
+}
+
+/// When the step's sentence names a file of its own, the file paths that came from elsewhere (the request) are dropped.
+fn step_paths_only(entities: Vec<Entity>, step_text: &str) -> Vec<Entity> {
+    let own = |e: &Entity| e.label == "file path" && step_text.contains(e.text.as_str());
+    if !entities.iter().any(own) {
+        return entities;
+    }
+    entities.into_iter().filter(|e| e.label != "file path" || own(e)).collect()
+}
+
+/// Does this text hold code (rather than a sentence such as "Here is the page:")?
+fn looks_like_code(prefix: &str) -> bool {
+    static WORDS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\b(?:export|import|function|return|const|let|var|class|require)\b").unwrap());
+    prefix.contains(['{', '}', '(', ')', ';', '=']) || WORDS.is_match(prefix)
 }
 
 /// Should this shell command run in the background? The step's sentence says so, or the command is a server (`http.server`, `uvicorn`,
@@ -88,6 +112,33 @@ pub(crate) fn implies_background(description: &str, command: &str) -> bool {
     });
     SENTENCE.is_match(description)
         || command.split(['&', ';', '|']).filter(|seg| !seg.trim().is_empty() && !INSTALLER.is_match(seg)).any(|seg| SERVER.is_match(seg))
+}
+
+/// Does this command only look (`command -v node npm nvm; npm --version`, `ls`, `cat package.json`)? A non-zero exit of such a command is
+/// a finding ("nvm is not installed"), not a failed step (coding plan X8). Every part of it must be an inspection; anything that could
+/// change state (an installer, `rm`, a redirect into a file, a build or test runner, a script) makes it a real command.
+pub(crate) fn probe_like(command: &str) -> bool {
+    const LOOK: &[&str] = &[
+        "command", "which", "type", "whereis", "ls", "cat", "head", "tail", "wc", "grep", "egrep", "rg", "find", "echo", "printf", "pwd", "whoami",
+        "id", "uname", "env", "printenv", "test", "[", "stat", "file", "df", "du", "free", "ps", "pgrep", "ss", "netstat", "lsof", "nproc", "date",
+        "hostname", "realpath", "readlink", "dirname", "basename", "true", "jq", "sort", "uniq", "cut", "tr", "awk", "tree", "diff", "sha256sum", "md5sum",
+    ];
+    let cleaned = command.replace("2>&1", " ").replace("2>/dev/null", " ").replace(">/dev/null", " ").replace("&>/dev/null", " ");
+    if cleaned.contains('>') || cleaned.contains("$(") || cleaned.contains('`') || cleaned.trim().is_empty() {
+        return false;
+    }
+    cleaned.split(['&', ';', '|', '\n']).map(str::trim).filter(|seg| !seg.is_empty()).all(|seg| {
+        let words: Vec<&str> = seg.split_whitespace().collect();
+        let first = words[0].rsplit('/').next().unwrap_or(words[0]);
+        // `awk`/`find` can write (`-exec`, `-delete`, `system(`): only their read-only forms are a look
+        if (first == "find" && words.iter().any(|w| matches!(*w, "-exec" | "-execdir" | "-delete" | "-ok")))
+            || (first == "awk" && seg.contains("system("))
+        {
+            return false;
+        }
+        // `npm --version`, `node -v`, `python3 -V`: asking a program its version is a look
+        LOOK.contains(&first) || (words.len() == 2 && matches!(words[1], "--version" | "-v" | "-V" | "version"))
+    })
 }
 
 /// Parameters whose values are content (text to write): the one thing allowed to run long.
@@ -617,7 +668,7 @@ impl Inner {
         // No frequency penalty: markup and code repeat their own tokens (`</div>`, `class`) by nature, and a penalty on them makes a
         // long page decay into word salad. Loops are caught afterwards by `degenerate`.
         req.temperature = 0.2;
-        let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
+        let text = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?, path));
         // looping, or cut off by the limit / never finished (an unclosed tag, a half JSON object)
         let missing = missing_names(&step.description, path, &text);
         let why = if degenerate(&text) {
@@ -639,7 +690,7 @@ impl Inner {
             "content",
         );
         req.temperature = 0.4;
-        let again = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?));
+        let again = strip_tool_markup(&strip_fences(&self.generate_text(ctx, tier, req).await.ok()?, path));
         let text = if degenerate(&again) { collapse_repeats(&again) } else { again };
         (!text.trim().is_empty()).then_some(text)
     }
@@ -683,8 +734,12 @@ impl Inner {
         // A planner's sentence about a file describes it ("a landing page with `Earth` in the title"): a quoted word in it is not the file's
         // content. Content comes from a model that writes it, unless the sentence is a short, literal "write 'x' to y".
         let describes_content = meta.name == "fs_write" && step.description.split_whitespace().count() >= 12;
-        let entities_for_args: Vec<Entity> =
+        let mut entities_for_args: Vec<Entity> =
             if describes_content { entities.iter().filter(|e| e.label != "quoted").cloned().collect() } else { entities.clone() };
+        // A file step's path is the one its own sentence names (`site/app/page.tsx`), never one the request happens to contain.
+        if matches!(meta.name.as_str(), "fs_write" | "fs_edit") {
+            entities_for_args = step_paths_only(entities_for_args, &step.description);
+        }
         // ---- arguments: the planner's, then rules, then entities --------------------
         let mut args = object(&step.args);
         if feedback.is_some() {
@@ -789,12 +844,27 @@ impl Inner {
         {
             args.remove("content");
         }
-        if meta.name == "fs_write"
+        let wants_content = meta.name == "fs_write"
             && args.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty() && !p.contains("{{"))
             && args.get("content").and_then(|c| c.as_str()).is_none_or(|c| c.trim().is_empty())
-            && !self.names_an_earlier_value(ctx, step)
-            && let Some(text) = self.write_content(ctx, step, &args, deps, feedback).await
-        {
+            && !self.names_an_earlier_value(ctx, step);
+        let mut written = None;
+        if wants_content && self.models.has(self.step_tier_for_content(step)) {
+            written = self.write_content(ctx, step, &args, deps, feedback).await;
+            // A page that did not come back is written again by the content writer, told so — never squeezed into a JSON string by the
+            // argument binder, whose 3-sample vote wrote up to four whole pages inside JSON (coding plan X7: 11.4k output tokens, then
+            // "cannot determine the arguments of fs_write").
+            if written.is_none() {
+                let why = "your previous reply was empty or could not be used: reply with the complete file and nothing else";
+                let told = feedback.map(|f| format!("{f}; {why}")).unwrap_or_else(|| why.to_string());
+                written = self.write_content(ctx, step, &args, deps, Some(&told)).await;
+            }
+            if written.is_none() {
+                let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                return Err(fail(ErrorKind::Other, format!("the content of {path} could not be written: the content writer returned nothing usable twice")));
+            }
+        }
+        if let Some(text) = written {
             // a data file whose numbers come from nowhere was typed, not computed: a model cannot add up 200 rows in its head
             let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
             let goal = ctx.rec.lock().await.goal.clone();
@@ -844,7 +914,9 @@ impl Inner {
             for (rung, tier) in ladder.into_iter().enumerate() {
                 // A second self-hosted try is a vote: three samples, and the answer most of the valid ones agree on wins.
                 // Self-hosted tokens are free, and one wrong sample no longer decides the step.
-                let samples = if tier == Tier::Worker && rung == 1 { 3 } else { 1 };
+                // Never for content (`new_string`, `body`…): three samples of a page cost three pages, and a vote on prose decides nothing.
+                let content_view = meta.params.iter().any(|p| CONTENT_PARAMS.contains(&p.name.as_str()) && p.name != "text");
+                let samples = if tier == Tier::Worker && rung == 1 && !content_view { 3 } else { 1 };
                 let temperature = if samples > 1 { 0.5 } else { 0.1 };
                 let asks = (0..samples).map(|_| self.ask_for_args(ctx, tier, &meta, step, &entities, &args, deps, problem.as_deref(), rejected, temperature));
                 let mut candidates: Vec<Map<String, Value>> = Vec::new();
@@ -1054,20 +1126,56 @@ mod content_tests {
     #[test]
     fn a_file_comes_out_of_whatever_a_small_model_wraps_around_it() {
         let page = "<!doctype html>\n<html><body><h1>Earth</h1></body></html>";
-        assert_eq!(strip_fences(page), page);
-        assert_eq!(strip_fences(&format!("```html\n{page}\n```")), page);
-        assert_eq!(strip_fences(&format!("Sure! Here is the page:\n\n```html\n{page}\n```\nLet me know if you want changes.")), page);
-        assert_eq!(strip_fences(&format!("Here is the page you asked for:\n{page}")), page);
-        assert_eq!(strip_fences("```\nport = 1\n```"), "port = 1");
-        assert_eq!(strip_fences("plain text file"), "plain text file");
+        assert_eq!(strip_fences(page, "index.html"), page);
+        assert_eq!(strip_fences(&format!("```html\n{page}\n```"), "index.html"), page);
+        assert_eq!(strip_fences(&format!("Sure! Here is the page:\n\n```html\n{page}\n```\nLet me know if you want changes."), "index.html"), page);
+        assert_eq!(strip_fences(&format!("Here is the page you asked for:\n{page}"), "index.html"), page);
+        assert_eq!(strip_fences("```\nport = 1\n```", "index.html"), "port = 1");
+        assert_eq!(strip_fences("plain text file", "index.html"), "plain text file");
         // a README's own code samples are content, not a wrapper
         let readme = "# Brewster\n\nTracks coffee orders.\n\n## Usage\n\n```bash\ngit clone https://example.com/brewster.git\ncd brewster\n```\n\nThen run it.";
-        assert_eq!(strip_fences(readme), readme);
+        assert_eq!(strip_fences(readme, "index.html"), readme);
         let short = "# Brewster\nTracks orders.\n```bash\npip install brewster\n```";
-        assert_eq!(strip_fences(short), short, "a heading is content, never a preamble");
+        assert_eq!(strip_fences(short, "index.html"), short, "a heading is content, never a preamble");
         // a markdown file sent inside a fence keeps its own inner fences
-        assert_eq!(strip_fences(&format!("```markdown\n{readme}\n```")), readme);
-        assert_eq!(strip_fences(&format!("Here is README.md:\n```markdown\n{readme}\n```")), readme);
+        assert_eq!(strip_fences(&format!("```markdown\n{readme}\n```"), "index.html"), readme);
+        assert_eq!(strip_fences(&format!("Here is README.md:\n```markdown\n{readme}\n```"), "index.html"), readme);
+    }
+
+    #[test]
+    fn a_probe_is_told_from_a_command_that_changes_something() {
+        use super::probe_like;
+        for c in ["command -v node npm corepack nvm; npm --version", "ls -la site", "cat package.json | jq .dependencies", "node -v && python3 --version 2>&1", "test -d node_modules || echo missing", "ss -ltnp | grep 8000"] {
+            assert!(probe_like(c), "{c}");
+        }
+        for c in ["npm install", "npm run build", "rm -rf node_modules", "echo x > a.txt", "ls; npm test", "find . -name '*.tmp' -delete", "python3 app.py", "cat $(which x)", "pytest"] {
+            assert!(!probe_like(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn a_file_step_takes_its_own_path_not_the_requests() {
+        use dfae_core::Entity;
+        let e = |t: &str| Entity { label: "file path".into(), text: t.into(), start: None, end: None, score: 1.0, source: "rules".into() };
+        let got = super::step_paths_only(vec![e("Next.js"), e("lab/src/app/page.tsx")], "Write the landing page to lab/src/app/page.tsx");
+        assert_eq!(got.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["lab/src/app/page.tsx"]);
+        // a step that names no file keeps what the request said
+        let got = super::step_paths_only(vec![e("notes.txt")], "write hello into it");
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn a_layout_keeps_the_code_before_its_html() {
+        // task 8d665de7: `layout.jsx` lost everything before `<html` and the build failed with "Expression expected"
+        let layout = "import './globals.css'\n\nexport const metadata = { title: 'Crypto' }\n\nexport default function RootLayout({ children }) {\n  return (\n    <html lang=\"en\">\n      <body>{children}</body>\n    </html>\n  )\n}";
+        assert_eq!(strip_fences(layout, "site/app/layout.jsx"), layout);
+        assert_eq!(strip_fences(layout, "site/app/layout.tsx"), layout);
+        // even in an .html file, code before the document is not a preamble
+        let odd = "<?php $t = 'x'; ?>\n<html><body></body></html>";
+        assert_eq!(strip_fences(odd, "index.html"), odd);
+        assert_eq!(strip_fences("Here is the page:\n<!doctype html><html></html>", "page.htm"), "<!doctype html><html></html>");
+        // a fenced reply is unwrapped for any file
+        assert_eq!(strip_fences(&format!("```jsx\n{layout}\n```"), "app/layout.jsx"), layout);
     }
 
     #[test]
