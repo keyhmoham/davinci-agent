@@ -242,6 +242,6 @@ async fn a_known_server_that_only_shares_words_with_a_request_is_not_attached() 
     assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
     let attached = r.engine.backlog(&t.task_id).into_iter().any(|e| matches!(e.kind, EventKind::McpConnected { .. }));
     assert!(!attached, "the decision model said the weather server does not fit");
-    let plan_req = r.planner.requests.lock().iter().filter(|q| q.purpose == "plan").last().cloned().unwrap();
+    let plan_req = r.planner.requests.lock().iter().rfind(|q| q.purpose == "plan").cloned().unwrap();
     assert!(!plan_req.messages[0].content.contains("mcp__open_weather"), "the planner is not offered its tools");
 }
