@@ -187,6 +187,7 @@ impl Inner {
             profile: Some(ContextProfile::Minimal),
             auto_approve: auto,
             delegate: Some(false),
+            routine: None,
         };
         let mut rec = TaskRecord::new(request, spec.budget);
         rec.tainted = tainted;

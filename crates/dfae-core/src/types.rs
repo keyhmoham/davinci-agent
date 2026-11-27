@@ -117,6 +117,9 @@ pub struct TaskRequest {
     /// Subagent delegation: `None` = decided automatically, `Some(false)` = never.
     #[serde(default)]
     pub delegate: Option<bool>,
+    /// Set by the engine when a routine started this task (the API ignores it from callers).
+    #[serde(default)]
+    pub routine: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -12,6 +12,7 @@ pub mod events;
 pub mod ledger;
 pub mod memory;
 pub mod providers;
+pub mod routine;
 pub mod safety;
 pub mod team;
 pub mod text;

@@ -18,10 +18,11 @@ pub enum Tab {
     Tokens,
     Memory,
     Tools,
+    Board,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [Tab::Chat, Tab::Timeline, Tab::Plan, Tab::Team, Tab::Context, Tab::Tokens, Tab::Memory, Tab::Tools];
+    pub const ALL: [Tab; 9] = [Tab::Chat, Tab::Timeline, Tab::Plan, Tab::Team, Tab::Context, Tab::Tokens, Tab::Memory, Tab::Tools, Tab::Board];
     pub fn title(self) -> &'static str {
         match self {
             Tab::Chat => "Chat",
@@ -32,6 +33,7 @@ impl Tab {
             Tab::Tokens => "Tokens",
             Tab::Memory => "Memory",
             Tab::Tools => "Tools",
+            Tab::Board => "Board",
         }
     }
     pub fn index(self) -> usize {
@@ -43,11 +45,28 @@ impl Tab {
 pub enum Action {
     Submit(TaskRequest),
     Cancel(String),
-    Decide { task: String, approval: String, approve: bool },
+    Decide {
+        task: String,
+        approval: String,
+        approve: bool,
+    },
     MemorySearch(String),
     Remember(String),
+    /// Add a routine (`None`), change one, remove or run one: the board's commands.
+    Routine {
+        id: Option<String>,
+        op: RoutineOp,
+    },
     SelectionChanged,
     Quit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoutineOp {
+    Add { when: String, goal: String },
+    Update(Value),
+    Remove,
+    Run,
 }
 
 /// Single-line text editor.
@@ -124,6 +143,7 @@ pub struct App {
     pub auto_approve: bool,
     pub session_id: String,
     pub dispatch: Option<Value>,
+    pub board: Option<dfae_core::routine::Board>,
     pub health: Option<Value>,
     pub info: Option<Value>,
     pub stats: Option<Value>,
@@ -157,6 +177,7 @@ impl App {
             auto_approve: false,
             session_id: new_id(),
             dispatch: None,
+            board: None,
             health: None,
             info: None,
             stats: None,
@@ -198,6 +219,41 @@ impl App {
 
     pub fn total_pending_approvals(&self) -> usize {
         self.tasks.iter().map(|t| t.pending_approvals).sum()
+    }
+
+    /// `/routine add <when> | <goal>`, `/routine pause|resume|run|rm <id>`, `/routine when <id> <schedule>`, `/routine goal <id> <text>`.
+    fn routine_command(&mut self, arg: &str) -> Option<Action> {
+        let (op, rest) = arg.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((arg, ""));
+        let (id, more) = rest.split_once(' ').map(|(a, b)| (a.to_string(), b.trim().to_string())).unwrap_or((rest.to_string(), String::new()));
+        let usage = "usage: /routine add <when> | <goal> · pause|resume|run|rm <id> · when <id> <schedule> · goal <id> <text>";
+        let need_id = |id: &str| if id.is_empty() { None } else { Some(id.to_string()) };
+        let act = |id: Option<String>, op: RoutineOp| Some(Action::Routine { id, op });
+        match op {
+            "add" => match rest.split_once('|') {
+                Some((when, goal)) if !when.trim().is_empty() && !goal.trim().is_empty() => {
+                    act(None, RoutineOp::Add { when: when.trim().into(), goal: goal.trim().into() })
+                }
+                _ => {
+                    self.notify("usage: /routine add every 2h | check the build and tell me if it broke", true);
+                    None
+                }
+            },
+            "pause" | "resume" | "enable" | "disable" => {
+                let on = matches!(op, "resume" | "enable");
+                need_id(&id).and_then(|i| act(Some(i), RoutineOp::Update(serde_json::json!({"enabled": on}))))
+            }
+            "run" => need_id(&id).and_then(|i| act(Some(i), RoutineOp::Run)),
+            "rm" | "remove" | "delete" => need_id(&id).and_then(|i| act(Some(i), RoutineOp::Remove)),
+            "when" | "goal" if !id.is_empty() && !more.is_empty() => act(Some(id), RoutineOp::Update(serde_json::json!({op: more}))),
+            _ => {
+                self.notify(usage, true);
+                None
+            }
+        }
+    }
+
+    pub fn apply_board(&mut self, b: dfae_core::routine::Board) {
+        self.board = Some(b);
     }
 
     // ------------------------------------------------------ data merging ----
@@ -393,6 +449,7 @@ impl App {
             profile: None,
             auto_approve: self.auto_approve,
             delegate: self.delegate,
+            routine: None,
         }))
     }
 
@@ -462,6 +519,14 @@ impl App {
             "tools" => {
                 self.tab = Tab::Tools;
                 None
+            }
+            "board" | "routines" => {
+                self.tab = Tab::Board;
+                None
+            }
+            "routine" | "r" => {
+                self.tab = Tab::Board;
+                self.routine_command(arg)
             }
             other => {
                 self.notify(format!("unknown command /{other} — try /help"), true);
@@ -621,7 +686,7 @@ mod tests {
         app.handle_key(key(KeyCode::BackTab));
         app.handle_key(key(KeyCode::BackTab));
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Tools);
+        assert_eq!(app.tab, Tab::Board, "back from the first tab wraps to the last");
         assert_eq!(app.handle_key(ctrl('c')), Some(Action::Quit));
     }
 
@@ -668,5 +733,36 @@ mod tests {
         app.input.kill_line();
         assert_eq!(app.handle_key(key(KeyCode::Char('y'))), Some(Action::Decide { task: tid.clone(), approval: "a1".into(), approve: true }));
         assert_eq!(app.handle_key(key(KeyCode::Char('n'))), Some(Action::Decide { task: tid, approval: "a1".into(), approve: false }));
+    }
+
+    #[test]
+    fn routines_are_managed_from_the_input_line() {
+        let mut app = App::new("http://x");
+        let run = |app: &mut App, line: &str| {
+            app.input.text = line.into();
+            app.input.cursor = line.chars().count();
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        };
+        assert_eq!(
+            run(&mut app, "/routine add every 2h | check the build"),
+            Some(Action::Routine { id: None, op: RoutineOp::Add { when: "every 2h".into(), goal: "check the build".into() } })
+        );
+        assert_eq!(app.tab, Tab::Board);
+        assert_eq!(
+            run(&mut app, "/routine pause abcd1234"),
+            Some(Action::Routine { id: Some("abcd1234".into()), op: RoutineOp::Update(serde_json::json!({"enabled": false})) })
+        );
+        assert_eq!(
+            run(&mut app, "/routine resume abcd1234"),
+            Some(Action::Routine { id: Some("abcd1234".into()), op: RoutineOp::Update(serde_json::json!({"enabled": true})) })
+        );
+        assert_eq!(
+            run(&mut app, "/routine when abcd1234 weekdays 08:30"),
+            Some(Action::Routine { id: Some("abcd1234".into()), op: RoutineOp::Update(serde_json::json!({"when": "weekdays 08:30"})) })
+        );
+        assert_eq!(run(&mut app, "/routine run abcd1234"), Some(Action::Routine { id: Some("abcd1234".into()), op: RoutineOp::Run }));
+        assert_eq!(run(&mut app, "/routine rm abcd1234"), Some(Action::Routine { id: Some("abcd1234".into()), op: RoutineOp::Remove }));
+        assert_eq!(run(&mut app, "/routine add every 2h"), None, "no goal: usage");
+        assert_eq!(run(&mut app, "/routine frobnicate"), None);
     }
 }

@@ -273,6 +273,19 @@ pub struct EconomyConfig {
     pub redact_pii: bool,
 }
 
+/// Routines: background work on a schedule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutinesConfig {
+    /// `DFAE_ROUTINES=off` stops the scheduler (the book is kept).
+    pub enabled: bool,
+    /// The time zone of clock times and cron schedules that do not name one (`DFAE_TIMEZONE`, an IANA name; default UTC).
+    pub timezone: Option<String>,
+    /// Routine runs at once (`DFAE_ROUTINE_CONCURRENCY`, default 4).
+    pub concurrency: usize,
+    /// Runs started per day over all routines (`DFAE_ROUTINE_MAX_RUNS_PER_DAY`, default 200): a cap on what background work can spend.
+    pub max_runs_per_day: u32,
+}
+
 /// Team orchestration and dispatch limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamConfig {
@@ -288,6 +301,12 @@ pub struct TeamConfig {
     pub role_slots: std::collections::BTreeMap<String, usize>,
     /// Longest wait for one subagent.
     pub agent_timeout_secs: u64,
+}
+
+impl RoutinesConfig {
+    pub fn off() -> Self {
+        Self { enabled: false, timezone: None, concurrency: 4, max_runs_per_day: 200 }
+    }
 }
 
 impl TeamConfig {
@@ -325,6 +344,8 @@ pub struct Config {
     pub budget: Budget,
     pub thresholds: Thresholds,
     pub team: TeamConfig,
+    #[serde(default = "RoutinesConfig::off")]
+    pub routines: RoutinesConfig,
     pub economy: EconomyConfig,
     /// Append every decision and what became of it to this JSONL file (`DFAE_DECISION_LOG`): the training and evaluation
     /// set for the decision model (and for the thresholds around it).
@@ -466,6 +487,12 @@ impl Config {
                 max_agents: env_parse("DFAE_MAX_AGENTS", 8).max(1),
                 role_slots: parse_slots(&env_or("DFAE_ROLE_SLOTS", "researcher=4,operator=1,analyst=4,verifier=2")),
                 agent_timeout_secs: env_parse("DFAE_AGENT_TIMEOUT_SECS", 600),
+            },
+            routines: RoutinesConfig {
+                enabled: !matches!(env("DFAE_ROUTINES").as_deref(), Some("off" | "false" | "0")),
+                timezone: env("DFAE_TIMEZONE").filter(|t| t.parse::<chrono_tz::Tz>().is_ok()),
+                concurrency: env_parse("DFAE_ROUTINE_CONCURRENCY", 4usize).max(1),
+                max_runs_per_day: env_parse("DFAE_ROUTINE_MAX_RUNS_PER_DAY", 200u32),
             },
             decision_log: env("DFAE_DECISION_LOG").map(PathBuf::from),
             shadow_eval: env_parse("DFAE_SHADOW_EVAL", 0.0f32).clamp(0.0, 1.0),

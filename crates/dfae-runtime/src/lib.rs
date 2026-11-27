@@ -19,6 +19,7 @@ pub mod plandoc;
 pub mod planner;
 pub mod prompts;
 pub mod quarantine;
+pub mod routines;
 mod session;
 mod shadow;
 pub mod skills;

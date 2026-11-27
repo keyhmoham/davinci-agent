@@ -108,6 +108,25 @@ impl Api {
         Ok(())
     }
 
+    pub async fn board(&self) -> Result<dfae_core::routine::Board, String> {
+        self.send(self.rb(reqwest::Method::GET, "/v1/board")).await
+    }
+    /// Add a routine (`spec`: the fields of `RoutineSpec`), change one (`Some(id)`), remove or run one.
+    pub async fn routine_add(&self, spec: &Value) -> Result<dfae_core::routine::Routine, String> {
+        self.send(self.rb(reqwest::Method::POST, "/v1/routines").json(spec)).await
+    }
+    pub async fn routine_update(&self, id: &str, spec: &Value) -> Result<dfae_core::routine::Routine, String> {
+        self.send(self.rb(reqwest::Method::PATCH, &format!("/v1/routines/{id}")).json(spec)).await
+    }
+    pub async fn routine_remove(&self, id: &str) -> Result<(), String> {
+        let _: Value = self.send(self.rb(reqwest::Method::DELETE, &format!("/v1/routines/{id}"))).await?;
+        Ok(())
+    }
+    pub async fn routine_run(&self, id: &str) -> Result<Option<String>, String> {
+        let v: Value = self.send(self.rb(reqwest::Method::POST, &format!("/v1/routines/{id}/run"))).await?;
+        Ok(v["task_id"].as_str().map(String::from))
+    }
+
     /// Stream a task's events (backlog replay + live) until the connection drops.
     pub async fn stream_events(&self, id: &str, mut on_event: impl FnMut(Event)) -> Result<(), String> {
         let r = self.rb(reqwest::Method::GET, &format!("/v1/tasks/{id}/events")).send().await.map_err(|e| e.to_string())?;
