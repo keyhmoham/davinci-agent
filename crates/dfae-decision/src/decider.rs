@@ -291,6 +291,11 @@ impl Decider {
             action = RecoveryAction::Fail;
             record.note = Some("hard rule: policy/cancel never recovered".into());
         }
+        // an action held back for the user: the plan goes on without it (a re-plan is told why), it is never retried as it is
+        if facts.error_kind == "withheld" {
+            action = RecoveryAction::Replan;
+            record.note = Some("hard rule: a withheld action is planned around, never retried".into());
+        }
         if action == RecoveryAction::Retry && facts.attempts >= facts.max_attempts {
             action = RecoveryAction::Replan;
         }

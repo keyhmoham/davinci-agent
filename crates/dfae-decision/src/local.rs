@@ -502,6 +502,8 @@ impl LocalDecider {
                 let transient = matches!(f.error_kind.as_str(), "timeout" | "transient" | "io");
                 let (c, conf) = if f.error_kind == "policy" || f.error_kind == "cancelled" {
                     ("fail", 0.97)
+                } else if f.error_kind == "withheld" {
+                    ("replan", 0.95)
                 } else if transient && f.attempts < f.max_attempts {
                     ("retry", 0.85)
                 } else if f.optional {

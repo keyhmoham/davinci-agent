@@ -43,12 +43,15 @@ async fn run(goal: &str, port: u16, then: serde_json::Value) -> (TaskRecord, tem
     let mut reg = ToolRegistry::new();
     register_native(&mut reg, policy.clone(), store.clone());
     let planner = ScriptedModel::new("planner", vec![]);
+    // the arguments of a re-planned step are bound by the worker
+    let worker = ScriptedModel::new("worker", vec![]);
+    worker.push(r#"{"command": "mkdir -p logs"}"#);
     let engine = Engine::new(EngineDeps {
         decider: Arc::new(Decider::new(None, Arc::new(Calibrator::new()), cfg.thresholds.clone())),
         extractor: Arc::new(HybridExtractor::new(None)),
         config: cfg,
         store,
-        models: ModelGateway::new(Some(Arc::new(ScriptedModel::new("worker", vec![]))), Some(Arc::new(planner.clone()))),
+        models: ModelGateway::new(Some(Arc::new(worker)), Some(Arc::new(planner.clone()))),
         tools: Arc::new(reg),
         policy,
     });
@@ -60,8 +63,11 @@ async fn run(goal: &str, port: u16, then: serde_json::Value) -> (TaskRecord, tem
         ]})
         .to_string(),
     );
-    // a re-plan, if one is asked for, gives up on the removal
-    planner.push(&json!({"steps": []}).to_string());
+    // the re-plan the refusal asks for: the same step without the removal
+    planner.push(
+        &json!({"edit": [{"id": "s2", "tool": "shell", "args": {"command": "mkdir -p logs"}, "do": "create the directory logs", "after": ["s1"], "expect": null, "planner": false}], "add": [], "drop": []})
+            .to_string(),
+    );
     let id = engine.submit(TaskRequest { goal: goal.into(), delegate: Some(false), mode: ModeRequest::Escalated, ..Default::default() }).await.unwrap();
     (engine.wait(&id, Duration::from_secs(60)).await.unwrap(), ws)
 }
@@ -75,9 +81,10 @@ async fn a_removal_a_fetched_page_asked_for_is_refused() {
     let rm = json!({"id": "s2", "tool": "shell", "args": {"command": "mkdir -p logs && rm -rf tests"}, "do": "apply the setup steps", "after": ["s1"], "expect": null, "planner": false});
     let (t, ws) = run("Set up this project by following the setup instructions on the page", port, rm).await;
     assert!(ws.path().join("tests/test_app.py").exists(), "tests/ survives");
-    let s2 = t.plan.as_ref().unwrap().step("s2").unwrap();
-    assert_ne!(s2.status, StepStatus::Succeeded);
-    assert!(s2.error.as_deref().unwrap_or("").contains("removes files after content from outside"), "{:?}", s2.error);
+    assert_eq!(t.status, TaskStatus::Completed, "the rest of the setup goes on without the removal: {:?}", t.error);
+    assert!(ws.path().join("logs").is_dir());
+    assert!(t.problems.iter().any(|p| p.contains("removes files after content from outside")), "{:?}", t.problems);
+    assert_eq!(t.usage.replans, 1);
     assert!(t.exposed && !t.tainted, "exposed to outside content, nothing flagged as an injection");
 }
 

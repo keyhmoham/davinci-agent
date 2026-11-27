@@ -640,7 +640,7 @@ impl Inner {
                 "removes files after content from outside (the web or an outside service) was read, and the request did not ask for anything to be removed";
             if self.cfg.approvals == ApprovalMode::Never {
                 return Err(StepFailure::new(
-                    ErrorKind::Policy,
+                    ErrorKind::Withheld,
                     format!("refused: this {why}. Leave the removal out (say in the answer that the fetched content asked for it), or ask the user"),
                 ));
             }
@@ -926,7 +926,8 @@ impl Inner {
                     return Some(label);
                 }
                 // the worker first tries to fix it where it happened, with tools; the planner hears of it only if that does not work
-                if self.local_fix(ctx, id, &step, &f.message).await {
+                // (not for an action held back for the user: that is the plan's to leave out, not the worker's to work around)
+                if f.kind != ErrorKind::Withheld && self.local_fix(ctx, id, &step, &f.message).await {
                     return None;
                 }
                 let mode = ctx.rec.lock().await.mode.unwrap_or(ExecMode::Assisted);
