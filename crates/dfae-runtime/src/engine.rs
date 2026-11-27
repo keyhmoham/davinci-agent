@@ -59,6 +59,9 @@ pub(crate) struct TaskCtx {
     pub reroute: std::sync::atomic::AtomicBool,
     /// Steps the step agent has already tried to fix (one loop per step).
     pub fixed: Mutex<HashSet<String>>,
+    /// How hard the planner thinks for this task (from the request's complexity), and how many re-planning rounds it has had.
+    pub planner_effort: Mutex<Option<String>>,
+    pub planner_rounds: std::sync::atomic::AtomicU32,
 }
 
 impl TaskCtx {
@@ -81,6 +84,8 @@ impl TaskCtx {
             mcp_hidden: Mutex::new(HashSet::new()),
             reroute: std::sync::atomic::AtomicBool::new(false),
             fixed: Mutex::new(HashSet::new()),
+            planner_effort: Mutex::new(None),
+            planner_rounds: std::sync::atomic::AtomicU32::new(0),
         })
     }
 

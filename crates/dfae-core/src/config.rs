@@ -142,6 +142,12 @@ pub struct ModelConfig {
     /// retention terms and latency, and on one provider's prompt cache. Empty: the gateway chooses. `any` clears a default.
     #[serde(default)]
     pub providers: Vec<String>,
+    /// `<PREFIX>_REASONING_SIMPLE` / `_COMPLEX`: the effort for a request the decision model scores simple (complexity < 0.25) or
+    /// complex (> 0.75); `_REASONING` is the effort in between. Planner only; `PLANNER_REASONING_ADAPTIVE=off` uses `_REASONING` always.
+    #[serde(default)]
+    pub reasoning_simple: Option<String>,
+    #[serde(default)]
+    pub reasoning_complex: Option<String>,
 }
 
 /// Where hosted models are reached unless a deployment says otherwise (an OpenAI-compatible gateway).
@@ -180,6 +186,8 @@ impl ModelConfig {
                 .map(|r| r.to_ascii_lowercase())
                 .filter(|r| r != "default" && !r.is_empty()),
             prompt_cache: var("PROMPT_CACHE").map(|v| matches!(v.to_ascii_lowercase().as_str(), "on" | "true" | "1" | "yes")),
+            reasoning_simple: None,
+            reasoning_complex: None,
             providers: {
                 let model = var("MODEL").unwrap_or_else(|| default_model.into());
                 // the default list belongs to the default model: another model has other providers
@@ -349,7 +357,13 @@ impl Config {
     }
 
     pub fn from_env() -> Self {
-        let planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium", "");
+        let mut planner = ModelConfig::from_env("PLANNER", DEFAULT_PLANNER_MODEL, 4096, 4096, 180, "low", "medium", "");
+        // the planner thinks as hard as the request needs (Ares-style adaptive effort); off: one effort for every plan
+        if !matches!(env("PLANNER_REASONING_ADAPTIVE").as_deref(), Some("off" | "false" | "0")) {
+            let level = |k: &str, d: &str| Some(env(k).unwrap_or_else(|| d.into()).to_ascii_lowercase()).filter(|v| v != "default" && !v.is_empty());
+            planner.reasoning_simple = level("PLANNER_REASONING_SIMPLE", "none");
+            planner.reasoning_complex = level("PLANNER_REASONING_COMPLEX", "medium");
+        }
         // GLM-5.3-Flash always thinks (it cannot be switched off): `low` is its least effort. Its providers: unquantised weights, zero data
         // retention and no training on the data, the best tail latency (measured 2026-11-27 on the gateway's endpoint list).
         let mut worker = ModelConfig::from_env("WORKER", DEFAULT_WORKER_MODEL, 800, 16_000, 90, "low", "", "baseten,nebius,fireworks");

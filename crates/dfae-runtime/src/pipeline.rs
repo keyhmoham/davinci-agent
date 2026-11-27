@@ -697,6 +697,17 @@ impl Inner {
         let planner_plans = has_planner && !quick;
         if planner_plans {
             self.find_template(ctx, goal, entities).await;
+            // how hard the planner thinks: as hard as the request is (the decision model's complexity score)
+            let complexity = ctx.rec.lock().await.route.as_ref().map(|r| r.complexity).unwrap_or(0.5);
+            let p = &self.cfg.planner;
+            let effort = if complexity < 0.25 {
+                p.reasoning_simple.clone().or_else(|| p.reasoning.clone())
+            } else if complexity > 0.75 {
+                p.reasoning_complex.clone().or_else(|| p.reasoning.clone())
+            } else {
+                p.reasoning.clone()
+            };
+            *ctx.planner_effort.lock() = effort;
         }
         let (allowed, top_tool): (Vec<String>, Option<String>) = if planner_plans {
             (self.scoped_metas(ctx).into_iter().map(|m| m.name).collect(), None)
@@ -1002,6 +1013,13 @@ impl Inner {
         req.schema = Some(if replan.is_some() { crate::plandoc::patch_schema(&names) } else { crate::plandoc::plan_schema(&names, eco.plan_report) });
         req.schema_strict = true;
         req.cache = cached;
+        // the plan thinks as hard as the request needs; the first re-plan thinks the same (it shares the plan's cache line: effort is
+        // part of the cached prefix), a second one harder
+        let chosen = ctx.planner_effort.lock().clone();
+        if let Some(effort) = chosen {
+            let rounds = ctx.planner_rounds.load(std::sync::atomic::Ordering::Relaxed);
+            req.reasoning = if replan.is_some() && rounds >= 2 { self.cfg.planner.reasoning_hard.clone().or(Some(effort)) } else { Some(effort) };
+        }
         req
     }
 

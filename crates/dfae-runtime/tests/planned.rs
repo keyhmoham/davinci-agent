@@ -1017,3 +1017,27 @@ async fn a_result_that_misses_its_expectation_is_fixed_by_the_worker_before_the_
     assert_eq!(t.usage.replans, 0, "the expectation is met after the fix: no planning round");
     assert!(r.ws.path().join("site/index.html").exists());
 }
+
+#[tokio::test]
+async fn the_planner_thinks_as_hard_as_the_request_needs_and_a_first_replan_keeps_the_plans_effort() {
+    let r = rig(false, |c| {
+        c.planner.reasoning = Some("low".into());
+        c.planner.reasoning_simple = Some("none".into());
+        c.planner.reasoning_complex = Some("medium".into());
+        c.planner.reasoning_hard = Some("high".into());
+    });
+    std::fs::write(r.ws.path().join("a.txt"), "alpha\n").unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read a.txt", "tool": "fs_read"}]}).to_string());
+    run_as(&r, ModeRequest::Escalated, "Read a.txt").await;
+    let reqs = r.planner.requests.lock().clone();
+    let plan = reqs.iter().find(|q| q.purpose == "plan").unwrap();
+    assert_eq!(plan.reasoning.as_deref(), Some("none"), "a one-step request: no thinking");
+    // a step that fails: the first re-plan thinks as much as the plan did (same cached prefix)
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "read missing.txt", "tool": "fs_read"}]}).to_string());
+    r.planner.push(&json!({"edit": [], "add": [{"id": "r1_1", "do": "read a.txt", "tool": "fs_read", "after": [], "expect": null, "planner": false}], "drop": ["s1"]}).to_string());
+    run_as(&r, ModeRequest::Escalated, "Read missing.txt").await;
+    let reqs = r.planner.requests.lock().clone();
+    let plan2 = reqs.iter().filter(|q| q.purpose == "plan").nth(1).unwrap();
+    let replan = reqs.iter().find(|q| q.purpose == "replan").expect("a re-plan");
+    assert_eq!(replan.reasoning, plan2.reasoning, "the first re-plan keeps the plan's effort");
+}

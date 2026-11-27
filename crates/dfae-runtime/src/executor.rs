@@ -914,6 +914,7 @@ impl Inner {
                 return Ok(false);
             }
             r.usage.replans += 1;
+            ctx.planner_rounds.store(r.usage.replans, std::sync::atomic::Ordering::Relaxed);
             r.problems.push(tokens::truncate_tokens(problem, 60));
             (r.usage.replans, r.budget.clone())
         };
