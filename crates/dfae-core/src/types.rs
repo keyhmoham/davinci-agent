@@ -519,6 +519,36 @@ pub struct Budget {
     /// Subagents one task may spawn (retries included).
     #[serde(default = "default_max_children")]
     pub max_children: u32,
+    /// Tool calls the step agent may make while fixing failed steps: its own pool, so a stuck fix loop cannot spend the tool calls the
+    /// plan's remaining steps need (coding plan R3).
+    #[serde(default = "default_max_fix_tool_calls")]
+    pub max_fix_tool_calls: u32,
+    /// A task that scaffolds, installs or builds a project (a cold `npm install` + `next build` alone takes minutes) runs with at least
+    /// this much time and these many tool calls (coding plan C3). 0 keeps the ordinary budget.
+    #[serde(default = "default_project_max_seconds")]
+    pub project_max_seconds: u64,
+    #[serde(default = "default_project_max_tool_calls")]
+    pub project_max_tool_calls: u32,
+}
+
+fn default_project_max_seconds() -> u64 {
+    1500
+}
+
+fn default_project_max_tool_calls() -> u32 {
+    40
+}
+
+impl Budget {
+    /// The budget of a project task: the ordinary one, raised to the project floor (never lowered).
+    pub fn for_project(&mut self) {
+        self.max_seconds = self.max_seconds.max(self.project_max_seconds);
+        self.max_tool_calls = self.max_tool_calls.max(self.project_max_tool_calls);
+    }
+}
+
+fn default_max_fix_tool_calls() -> u32 {
+    12
 }
 
 fn default_max_children() -> u32 {
@@ -531,7 +561,18 @@ fn default_max_worker_calls() -> u32 {
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { max_steps: 30, max_model_calls: 10, max_worker_calls: 200, max_tool_calls: 25, max_replans: 2, max_seconds: 600, max_children: 8 }
+        Self {
+            max_steps: 30,
+            max_model_calls: 10,
+            max_worker_calls: 200,
+            max_tool_calls: 25,
+            max_replans: 2,
+            max_seconds: 600,
+            max_children: 8,
+            max_fix_tool_calls: 12,
+            project_max_seconds: 1500,
+            project_max_tool_calls: 40,
+        }
     }
 }
 
@@ -543,6 +584,8 @@ pub struct BudgetUsage {
     /// Self-hosted model calls.
     pub worker_calls: u32,
     pub tool_calls: u32,
+    /// Tool calls the step agent made (counted against `max_fix_tool_calls`, not `max_tool_calls`).
+    pub fix_tool_calls: u32,
     pub replans: u32,
     pub children: u32,
 }

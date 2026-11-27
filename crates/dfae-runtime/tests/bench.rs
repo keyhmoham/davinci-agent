@@ -210,6 +210,8 @@ async fn run_arm(f: Flags, rounds: usize, provider_caches: bool) -> Arm {
         let sc = &s2[c2.load(Ordering::SeqCst)];
         match req.purpose.as_str() {
             "bind" => Ok(sc.bind.to_string()),
+            // a file's content is written as plain text by the content writer, never bound inside JSON
+            "content" => sc.bind.get("content").and_then(|c| c.as_str()).map(str::to_string).ok_or_else(|| "unexpected local call: content".to_string()),
             "step" | "step_expand" => Ok(sc.reasoning.to_string()),
             "answer_local" | "answer" => Ok(sc.answer.to_string()),
             other => Err(format!("unexpected local call: {other}")),

@@ -20,6 +20,8 @@ pub fn normalize_entities(mut es: Vec<Entity>) -> Vec<Entity> {
     const NOISE: &[&str] =
         &["i", "me", "my", "mine", "you", "your", "he", "she", "it", "we", "us", "they", "them", "this", "that", "these", "those", "here", "there"];
     es.retain(|e| !e.text.is_empty() && !e.label.is_empty());
+    // whichever extractor said so, "Next.js" is a framework, not a file
+    es.retain(|e| e.label != "file path" || !crate::rules::framework_name(&e.text));
     es.retain(|e| e.label == "quoted" || (e.text.chars().count() >= 2 && !NOISE.contains(&e.text.to_lowercase().as_str())));
     let mut out: Vec<Entity> = Vec::new();
     for e in es {

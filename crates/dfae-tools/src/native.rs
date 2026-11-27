@@ -540,6 +540,9 @@ impl Tool for FsSearch {
 
 // ----------------------------------------------------------------- shell ----
 
+/// Time `run_script` has, after its own timeout, to kill the command and hand back its output.
+const SHELL_GRACE_SECS: u64 = 30;
+
 pub struct Shell {
     policy: Arc<PolicyEngine>,
 }
@@ -587,6 +590,19 @@ impl Tool for Shell {
         );
         m
     }
+    /// The shell's own timeout governs (a 600 s install must not be cut at the executor's 120 s): the timeout this command runs with,
+    /// plus a grace period in which `run_script` kills it and returns what it printed. A background start returns within a minute.
+    fn max_runtime(&self, input: &Value) -> Duration {
+        let cfg = &self.policy.config().shell;
+        if !crate::coding::sandboxed(&self.policy) {
+            return Duration::from_secs(cfg.timeout_secs + SHELL_GRACE_SECS);
+        }
+        if input.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Duration::from_secs(60);
+        }
+        let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        crate::coding::effective_timeout(&self.policy, input, cmd) + Duration::from_secs(SHELL_GRACE_SECS)
+    }
     async fn execute(&self, input: Value, ctx: ToolContext) -> Result<ToolOutput, ToolError> {
         let meta = self.metadata();
         enforce(&self.policy, &meta, &input)?;
@@ -595,24 +611,35 @@ impl Tool for Shell {
         if crate::coding::sandboxed(&self.policy) {
             let cwd = crate::coding::resolve_cwd(&self.policy, &input)?;
             if input.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
-                // a port that something already answers on is not ours to take: said before anything starts (and with the ones that are free)
-                if let Some(port) = crate::coding::port_in(cmd) {
-                    crate::coding::refuse_taken_port(port).await?;
+                // the port it names: our own old server for this project there is replaced; one somebody else holds is not ours to take,
+                // so a free one is used instead and the command rewritten (said in the output and the evidence)
+                let mut cmd = cmd.to_string();
+                let mut moved: Option<(u16, u16)> = None;
+                if let Some(port) = crate::coding::port_in(&cmd)
+                    && let Some(new) = crate::coding::choose_port(port, &cwd).await?
+                {
+                    cmd = crate::coding::rewrite_port(&cmd, port, new);
+                    moved = Some((port, new));
                 }
-                let id = crate::coding::spawn_job(&self.policy, cmd, &cwd)?;
+                let id = crate::coding::spawn_job(&self.policy, &cmd, &cwd)?;
                 let mut first = crate::coding::settle_job(id, Duration::from_millis(1500)).await?;
                 // a server that names its port must be listening on it, and still be alive, a few seconds later
-                if let Some(port) = crate::coding::port_in(cmd) {
+                if let Some(port) = crate::coding::port_in(&cmd) {
                     first.push_str(&crate::coding::await_listening(id, port, Duration::from_secs(40)).await?);
                 }
-                return Ok(ToolOutput::ok(format!(
-                    "started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it{first}"
-                )));
+                let note = moved
+                    .map(|(old, new)| {
+                        format!("\nport {old} was taken by another process, so it was started on port {new} instead: it is at http://localhost:{new}")
+                    })
+                    .unwrap_or_default();
+                let mut out =
+                    ToolOutput::ok(format!("started background job {id}: use shell_output job_id={id} to read its output, shell_kill to stop it{note}{first}"));
+                if let Some((old, new)) = moved {
+                    out.evidence.push(format!("port moved: {old} -> {new}"));
+                }
+                return Ok(out);
             }
-            let timeout = match input.get("timeout_secs").and_then(|v| v.as_u64()) {
-                Some(s) => Duration::from_secs(s.clamp(1, cfg.max_timeout_secs.max(1))),
-                None => crate::coding::default_timeout(&self.policy, cmd),
-            };
+            let timeout = crate::coding::effective_timeout(&self.policy, &input, cmd);
             return crate::coding::run_script(&self.policy, cmd, &cwd, timeout, cfg.max_output_bytes.max(65_536), &ctx).await;
         }
         let argv = shlex::split(cmd).ok_or_else(|| ToolError::args("unparseable command"))?;
@@ -767,6 +794,20 @@ mod tests {
         assert!(list.content.contains("d notes/"));
         let s = r.get("fs_search").unwrap().execute(json!({"pattern": "wor.d"}), ctx.clone()).await.unwrap();
         assert!(s.content.contains("notes/a.txt:2"), "{}", s.content);
+    }
+
+    #[test]
+    fn the_shell_says_how_long_it_may_run_so_the_executor_never_cuts_an_install_short() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = PolicyConfig::default();
+        cfg.shell.mode = crate::policy::ShellMode::Sandbox;
+        let sh = Shell { policy: Arc::new(PolicyEngine::new(cfg, d.path().to_path_buf())) };
+        let secs = |v: Value| sh.max_runtime(&v).as_secs();
+        assert_eq!(secs(json!({"command": "ls"})), 120 + SHELL_GRACE_SECS);
+        assert_eq!(secs(json!({"command": "npm install && npm run build"})), 600 + SHELL_GRACE_SECS);
+        assert_eq!(secs(json!({"command": "sleep 150", "timeout_secs": 200})), 200 + SHELL_GRACE_SECS);
+        assert_eq!(secs(json!({"command": "sleep 5000", "timeout_secs": 5000})), 900 + SHELL_GRACE_SECS, "capped at max_timeout_secs");
+        assert_eq!(secs(json!({"command": "npm start", "background": true})), 60);
     }
 
     #[tokio::test]

@@ -328,6 +328,21 @@ impl Inner {
                 }
             }
         }
+        // the shell started the server on another port than the plan said (the planned one was taken): what this step expects and what
+        // the steps after it check follow the port it is really on, so the move costs no re-plan (coding plan A9)
+        if let Ok(out) = &result
+            && let Some((old, new)) = moved_port(&out.evidence)
+        {
+            // this step too: run again (after a local fix), it must restart the server where it now is, not look for yet another port
+            move_step_port(&mut step, old, new);
+            self.emit(ctx, EventKind::Warning { message: format!("step {id}: port {old} was taken; the server is on {new}, and the plan follows") }).await;
+            let mut r = ctx.rec.lock().await;
+            if let Some(plan) = r.plan.as_mut() {
+                for s in plan.steps.iter_mut().filter(|s| s.id == id || s.status == StepStatus::Pending) {
+                    move_step_port(s, old, new);
+                }
+            }
+        }
         // the planner said what success looks like: the decision model checks the result against it. A result that
         // misses it is not thrown away (it is real information: "the workspace is empty"); it makes the planner
         // look at the plan again, now knowing what was found.
@@ -374,6 +389,10 @@ impl Inner {
                         tokens::truncate_tokens(&out.content, 150),
                         step.expect.as_deref().unwrap_or(""),
                     );
+                    let problem = match ctx.fix_notes.lock().get(id) {
+                        Some(n) => format!("{problem}\n{n}. Do not plan those again; change the approach."),
+                        None => problem,
+                    };
                     ctx.checkpoints.lock().push(problem);
                     out.evidence.push(format!("expectation not met: {why}"));
                     self.emit(ctx, EventKind::Warning { message: format!("step {id}: {why}; the plan will be revisited") }).await;
@@ -676,8 +695,11 @@ impl Inner {
         let out = match cached {
             Some(content) => ToolOutput { content, ok: true, exit_code: Some(0), evidence: vec!["served from the team's shared cache".into()] },
             None => {
-                self.take_tool_call(ctx).await.map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
-                let res = tokio::time::timeout(Duration::from_secs(120), tool.execute(args.clone(), tctx.clone())).await;
+                if step.how.as_deref() == Some("step-agent") { self.take_fix_tool_call(ctx).await } else { self.take_tool_call(ctx).await }
+                    .map_err(|e| StepFailure::new(ErrorKind::Policy, e))?;
+                // the tool's own limit governs (a 600 s install is not cut at 120 s), never past the task's remaining time
+                let limit = tool.max_runtime(&args).min(self.time_left(ctx).await);
+                let res = tokio::time::timeout(limit, tool.execute(args.clone(), tctx.clone())).await;
                 if meta.side_effects
                     && let Some(sh) = &shared
                 {
@@ -685,7 +707,12 @@ impl Inner {
                 }
                 match res {
                     Ok(r) => r.map_err(StepFailure::from)?,
-                    Err(_) => return Err(StepFailure::new(ErrorKind::Timeout, "tool timed out after 120s")),
+                    Err(_) => {
+                        return Err(StepFailure::new(
+                            ErrorKind::Timeout,
+                            format!("tool timed out after {}s (its own limit, or the task's remaining time); it was stopped", limit.as_secs()),
+                        ));
+                    }
                 }
             }
         };
@@ -696,7 +723,14 @@ impl Inner {
         {
             sh.put(k, content.clone(), generation);
         }
-        if !out.ok {
+        // a step that only looks (`command -v nvm`) and expects nothing in particular found something out: what is missing is a finding
+        let probe = !out.ok
+            && name == "shell"
+            && step.expect.is_none()
+            && args.get("background").and_then(|b| b.as_bool()) != Some(true)
+            && out.exit_code.is_some_and(|c| c > 0 && c < 128)
+            && args.get("command").and_then(|c| c.as_str()).is_some_and(crate::implement::probe_like);
+        if !out.ok && !probe {
             return Err(StepFailure::new(
                 ErrorKind::Other,
                 format!("{name} reported failure (exit {}): {}", out.exit_code.unwrap_or(-1), failure_digest(&content)),
@@ -725,6 +759,9 @@ impl Inner {
             return Err(StepFailure::new(ErrorKind::Other, format!("{path} was written but is malformed: {problem}")));
         }
         let mut evidence = out.evidence.clone();
+        if probe {
+            evidence.push(format!("a probe: exit code {} is what it found, not a failure", out.exit_code.unwrap_or(-1)));
+        }
         if let Some(v) = tool.verify(&args, &out, &tctx).await {
             match v {
                 Ok(ev) => evidence.push(format!("verified: {ev}")),
@@ -976,7 +1013,7 @@ impl Inner {
                 if tier == Tier::Planner {
                     ctx.rec.lock().await.mode = Some(ExecMode::Escalated);
                 }
-                let problem = format!(
+                let mut problem = format!(
                     "step {id} \"{}\" ({} {}) failed with {}: {}",
                     tokens::truncate_tokens(&step.description, 30),
                     step.tool.as_deref().unwrap_or("reasoning"),
@@ -984,6 +1021,9 @@ impl Inner {
                     kind_str(f.kind),
                     clip_error(&f.message, 380)
                 );
+                if let Some(n) = ctx.fix_notes.lock().get(id) {
+                    problem.push_str(&format!("\n{n}. Do not plan those again; change the approach."));
+                }
                 match self.replan(ctx, tier, &goal, &problem, Some(id)).await {
                     Ok(true) => None,
                     Ok(false) => Some(label),
@@ -1025,7 +1065,24 @@ impl Inner {
         if tier == Tier::Planner {
             // the planner sees every tool; what the plan may use is every tool of this agent's scope
             *ctx.allowed.lock() = self.scoped_metas(ctx).into_iter().map(|m| m.name).collect();
-            return self.patch_plan(ctx, goal, problem, replans, &budget).await;
+            // A gateway that is away for ~10 s ended a task with "replanning failed: error sending request" (coding plan R5): a transport error
+            // of the planner during recovery is waited out (5, 15, 30 s, within the task's time) before recovery gives up.
+            let mut waits = [5u64, 15, 30].into_iter();
+            loop {
+                match self.patch_plan(ctx, goal, problem, replans, &budget).await {
+                    Err(e) if transport_error(&e) => {
+                        let left = self.time_left(ctx).await;
+                        let Some(w) = waits.next().filter(|w| left > Duration::from_secs(w + 20)) else { return Err(e) };
+                        self.emit(
+                            ctx,
+                            EventKind::Warning { message: format!("the planner could not be reached ({}); trying again in {w} s", clip_error(&e, 30)) },
+                        )
+                        .await;
+                        tokio::select! { _ = ctx.cancel.cancelled() => return Err("cancelled".into()), _ = tokio::time::sleep(Duration::from_secs(w)) => {} }
+                    }
+                    other => return other,
+                }
+            }
         }
         // widen the tool set through the decision layer (direct/skill plans start narrow)
         let (entities, base) = {
@@ -1278,6 +1335,15 @@ impl Inner {
         let goal = ctx.rec.lock().await.goal.clone();
         self.emit(ctx, EventKind::Warning { message: format!("step {id} failed: the worker tries to fix it with tools before the plan is revised") }).await;
         let mut turns: Vec<(String, bool, String)> = Vec::new();
+        // a loop that cannot change the outcome stops (coding plan C1): the same error twice, or the same action again with nothing
+        // changed since; the re-plan is then told what was tried and what kept happening
+        let mut failures: Vec<String> = Vec::new();
+        let mut actions: Vec<(String, usize)> = Vec::new();
+        let mut last_change: Option<usize> = None;
+        let note = |turns: &[(String, bool, String)], why: &str| {
+            let tried: Vec<&str> = turns.iter().map(|(a, _, _)| a.as_str()).collect();
+            format!("THE WORKER ALREADY TRIED ({} actions): {} — {why}", tried.len(), tokens::truncate_tokens(&tried.join("; "), 120))
+        };
         for k in 1..=self.cfg.economy.step_agent_turns {
             let user = format!(
                 "GOAL: {}\nFAILED STEP {id} ({}): {}\nARGS: {}\nFAILURE: {}\n{}\nTOOLS:\n{catalog}\nDONE SO FAR:\n{}",
@@ -1295,11 +1361,14 @@ impl Inner {
             req.json = true;
             req.schema = Some(schema(&tools));
             req.schema_strict = true;
-            let Ok(v) = self.gen_json(ctx, Tier::Worker, req).await else { return false };
+            let Ok(v) = self.gen_json(ctx, Tier::Worker, req).await else { break };
             match parse(&v) {
-                None => return false,
+                None => break,
                 Some(Action::GiveUp(why)) => {
                     self.emit(ctx, EventKind::Warning { message: format!("the worker could not fix {id} ({why}): the plan is revised") }).await;
+                    if !turns.is_empty() {
+                        ctx.fix_notes.lock().insert(id.to_string(), note(&turns, &format!("it gave up: {}", tokens::truncate_tokens(&why, 40))));
+                    }
                     return false;
                 }
                 Some(Action::Done(summary)) => {
@@ -1327,14 +1396,42 @@ impl Inner {
                     {
                         args["background"] = json!(true);
                     }
+                    let key = crate::step_agent::action_key(&tool, &args);
+                    if let Some((_, at)) = actions.iter().rev().find(|(a, _)| *a == key)
+                        && last_change.is_none_or(|c| c <= *at)
+                    {
+                        let why = format!("it repeated `{}` with nothing changed since", tokens::truncate_tokens(&shown, 30));
+                        self.emit(ctx, EventKind::Warning { message: format!("step {id}: the worker {why}; the plan is revised") }).await;
+                        ctx.fix_notes.lock().insert(id.to_string(), note(&turns, &why));
+                        return false;
+                    }
+                    actions.push((key, turns.len()));
+                    let changes = self.tools.meta(&tool).is_some_and(|m| m.side_effects)
+                        && !(tool == "shell" && args.get("command").and_then(|c| c.as_str()).is_some_and(crate::implement::probe_like));
                     let mut s = Step::tool(&format!("{id}_fix{k}"), &tool, &format!("fix {id}: {why}"), args);
                     s.approval_required = self.tools.meta(&tool).map(|m| m.requires_approval).unwrap_or(false);
                     s.how = Some("step-agent".into());
+                    let started = std::time::SystemTime::now() - Duration::from_secs(1);
                     let res = self.run_tool(ctx, &s, false, &[]).await;
-                    let (ok, text) = match res {
+                    let (mut ok, mut text) = match res {
                         Ok(o) => (true, o.content),
                         Err(f) => (false, f.message),
                     };
+                    // a script that rewrote a source file went around fs_write's parse check: what it left is parsed here
+                    if tool == "shell" {
+                        let ws = self.policy.workspace();
+                        let root =
+                            s.args.get("cwd").and_then(|c| c.as_str()).and_then(|c| self.policy.guard().read_path(c).ok()).unwrap_or_else(|| ws.to_path_buf());
+                        for f in crate::syntax::changed_since(&root, started, 40) {
+                            if let Ok(src) = std::fs::read_to_string(&f)
+                                && let Some(p) = crate::syntax::problem(&f, &src).await
+                            {
+                                let rel = f.strip_prefix(ws).unwrap_or(&f).display().to_string();
+                                text.push_str(&format!("\n[the script left {rel} malformed: {p}]"));
+                                ok = false;
+                            }
+                        }
+                    }
                     // recorded in the plan; an action that failed is kept as skipped (it is history, not a failed step of the task)
                     s.status = if ok { StepStatus::Succeeded } else { StepStatus::Skipped };
                     s.summary = Some(tokens::truncate_tokens(&text, 300));
@@ -1350,9 +1447,27 @@ impl Inner {
                         }
                     }
                     self.persist(ctx).await;
-                    turns.push((shown, ok, text));
+                    if ok && changes {
+                        last_change = Some(turns.len());
+                    }
+                    let failed_fp = (!ok).then(|| crate::step_agent::fingerprint(&text));
+                    turns.push((shown, ok, text.clone()));
+                    if let Some(fp) = failed_fp {
+                        if !fp.is_empty() && failures.contains(&fp) {
+                            let line = crate::step_agent::complaint(&text);
+                            let why = format!("the same error every time: {line}");
+                            self.emit(ctx, EventKind::Warning { message: format!("step {id}: the worker's fixes keep ending in {line}; the plan is revised") })
+                                .await;
+                            ctx.fix_notes.lock().insert(id.to_string(), note(&turns, &why));
+                            return false;
+                        }
+                        failures.push(fp);
+                    }
                 }
             }
+        }
+        if !turns.is_empty() {
+            ctx.fix_notes.lock().insert(id.to_string(), note(&turns, "none of it fixed the step"));
         }
         false
     }
@@ -1390,11 +1505,65 @@ pub(crate) fn punts(reply: &str) -> bool {
     PUNT.is_match(reply)
 }
 
+/// A model call that never reached the model (the network, the gateway), as opposed to an answer that was wrong or a budget spent.
+pub(crate) fn transport_error(e: &str) -> bool {
+    let e = e.to_lowercase();
+    !e.contains("budget")
+        && [
+            "error sending request",
+            "connection refused",
+            "connection reset",
+            "connection closed",
+            "operation timed out",
+            "dns error",
+            "502",
+            "503",
+            "504",
+            "bad gateway",
+            "service unavailable",
+        ]
+        .iter()
+        .any(|m| e.contains(m))
+}
+
 /// An error text cut to a size, keeping its END: what went wrong is said last.
 fn clip_error(msg: &str, max_tokens: usize) -> String {
     let max_chars = max_tokens * 4;
     let n = msg.chars().count();
     if n <= max_chars { msg.to_string() } else { format!("…{}", msg.chars().skip(n - max_chars).collect::<String>()) }
+}
+
+/// `port moved: 8000 -> 8001` in a tool's evidence: the server is on another port than its command said.
+fn moved_port(evidence: &[String]) -> Option<(u16, u16)> {
+    evidence.iter().find_map(|e| {
+        let (a, b) = e.strip_prefix("port moved: ")?.split_once(" -> ")?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
+/// A step's sentence, expectation and text arguments, moved from one port to another.
+fn move_step_port(s: &mut Step, old: u16, new: u16) {
+    s.expect = s.expect.as_deref().map(|e| move_port_in(e, old, new));
+    s.description = move_port_in(&s.description, old, new);
+    if let Value::Object(m) = &mut s.args {
+        for (k, v) in m.iter_mut() {
+            if let Value::String(t) = v {
+                // a command line names its port bare too (`http.server 8000`): there, the number on its own is the port
+                *t = if k == "command" {
+                    let re = regex::Regex::new(&format!(r"(^|[^\d.]){old}([^\d]|$)")).expect("port pattern");
+                    re.replace_all(t, format!("${{1}}{new}${{2}}").as_str()).into_owned()
+                } else {
+                    move_port_in(t, old, new)
+                };
+            }
+        }
+    }
+}
+
+/// A port in a sentence or URL (`localhost:8000`, `port 8000`, `-p 8000`) moved to another one; other numbers are left alone.
+fn move_port_in(text: &str, old: u16, new: u16) -> String {
+    let re = regex::Regex::new(&format!(r"(:|\bport\s+|-p\s+|--port[ =]|PORT=){old}\b")).expect("port pattern");
+    re.replace_all(text, format!("${{1}}{new}").as_str()).into_owned()
 }
 
 /// What a failed command said that matters: the end of its output (where a build, a test run or an install says what went wrong), and,
@@ -1481,5 +1650,33 @@ mod digest_tests {
         run.push_str("FAILED test_main.py::test_add - sqlite3.OperationalError: table bo...\n4 failed in 1.2s");
         let d = failure_digest(&run);
         assert!(d.contains("no such table: bookmarks") && d.matches("no such table").count() == 1 && d.contains("4 failed"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod port_tests {
+    use super::{move_port_in, move_step_port, moved_port, transport_error};
+
+    #[test]
+    fn a_planner_that_could_not_be_reached_is_told_from_one_that_answered_wrong() {
+        assert!(transport_error("model request failed: error sending request for url (https://gw/v1/chat/completions)"));
+        assert!(transport_error("model request failed: HTTP 503 Service Unavailable"));
+        assert!(!transport_error("model-call budget exceeded (12 allowed)"));
+        assert!(!transport_error("the patch changes nothing"));
+    }
+    use dfae_core::Step;
+    use serde_json::json;
+
+    #[test]
+    fn a_moved_server_takes_the_plan_with_it() {
+        assert_eq!(moved_port(&["exit code 0".into(), "port moved: 8000 -> 8001".into()]), Some((8000, 8001)));
+        assert_eq!(moved_port(&["exit code 0".into()]), None);
+        assert_eq!(move_port_in("http://localhost:8000 serves the page; 18000 visitors", 8000, 8001), "http://localhost:8001 serves the page; 18000 visitors");
+        assert_eq!(move_port_in("listening on port 8000", 8000, 8002), "listening on port 8002");
+        let mut s: Step = serde_json::from_value(json!({"id": "s5", "kind": "tool", "description": "serve on port 8000", "args": {"command": "python3 -m http.server 8000 --bind 0.0.0.0", "cwd": "site"}, "expect": "http://localhost:8000 serves the page"})).unwrap();
+        move_step_port(&mut s, 8000, 8001);
+        assert_eq!(s.args["command"], "python3 -m http.server 8001 --bind 0.0.0.0");
+        assert_eq!(s.expect.as_deref(), Some("http://localhost:8001 serves the page"));
+        assert_eq!(s.description, "serve on port 8001");
     }
 }

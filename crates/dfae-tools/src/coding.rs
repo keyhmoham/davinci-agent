@@ -603,6 +603,23 @@ fn kill_group(pid: Option<u32>) {
     }
 }
 
+/// Kills a command's whole process group when it is dropped while still armed. `kill_on_drop` ends only the shell; an `npm install` it
+/// started would live on and keep writing into `node_modules` after the executor gave up on the call (coding plan X2). Disarmed once
+/// the command has exited normally.
+struct GroupGuard(Option<u32>);
+
+impl GroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.0.take());
+    }
+}
+
 /// A command that installs or builds takes minutes, not seconds.
 pub(crate) fn default_timeout(policy: &PolicyEngine, command: &str) -> Duration {
     static SLOW: LazyLock<Regex> = LazyLock::new(|| {
@@ -610,6 +627,15 @@ pub(crate) fn default_timeout(policy: &PolicyEngine, command: &str) -> Duration 
     });
     let sh = &policy.config().shell;
     Duration::from_secs(if SLOW.is_match(command) { sh.install_timeout_secs } else { sh.default_timeout_secs }.clamp(1, sh.max_timeout_secs.max(1)))
+}
+
+/// The timeout a shell command runs with: the `timeout_secs` it asks for (capped), or the default for its kind.
+pub(crate) fn effective_timeout(policy: &PolicyEngine, input: &Value, command: &str) -> Duration {
+    let sh = &policy.config().shell;
+    match input.get("timeout_secs").and_then(|v| v.as_u64()) {
+        Some(s) => Duration::from_secs(s.clamp(1, sh.max_timeout_secs.max(1))),
+        None => default_timeout(policy, command),
+    }
 }
 
 /// Run `script` with the shell in `cwd`: pipes, redirects, `&&`, globbing — the lot. stderr is merged into stdout (in the order the
@@ -636,6 +662,7 @@ pub(crate) async fn run_script(
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| ToolError::io(format!("spawn failed: {e}")))?;
     let pid = child.id();
+    let mut guard = GroupGuard(pid);
     let mut stdout = child.stdout.take().expect("piped");
     let cap = Arc::new(Mutex::new(Capture::new(max_bytes)));
     let reader = {
@@ -658,10 +685,12 @@ pub(crate) async fn run_script(
         None => {
             kill_group(pid);
             let _ = child.wait().await;
-            return Err(ToolError::new(ErrorKind::Cancelled, "cancelled"));
+            let note = if installs_node_modules(script) { format!(" {INTERRUPTED_INSTALL}") } else { String::new() };
+            return Err(ToolError::new(ErrorKind::Cancelled, format!("cancelled{note}")));
         }
         Some(Ok(Ok(status))) => {
             use std::os::unix::process::ExitStatusExt;
+            guard.disarm();
             (status.code().or(status.signal().map(|s| 128 + s)), false)
         }
         Some(Ok(Err(e))) => return Err(ToolError::io(e.to_string())),
@@ -682,6 +711,9 @@ pub(crate) async fn run_script(
             timeout.as_secs(),
             policy.config().shell.max_timeout_secs
         ));
+        if installs_node_modules(script) {
+            text.push_str(&format!("\n{INTERRUPTED_INSTALL}"));
+        }
     } else if code != 0 {
         text.push_str(&format!("\n[exit code {code}]"));
     }
@@ -693,8 +725,35 @@ pub(crate) async fn run_script(
     Ok(ToolOutput { content: text.trim().to_string(), ok: code == 0 && !timed_out, exit_code: Some(code), evidence: vec![format!("exit code {code}")] })
 }
 
+/// Said after an install that was stopped half-way: building on what it left is how a truncated native module (`ld.so` crashes in
+/// `next build`) came about (coding plan X3).
+const INTERRUPTED_INSTALL: &str = "[interrupted install: node_modules may be incomplete — rm -rf node_modules && npm install]";
+
+/// Does this command install Node packages into a project (`npm install`, `npm ci`, `yarn add`, a `create-*` scaffold)?
+pub(crate) fn installs_node_modules(script: &str) -> bool {
+    static RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(?:(?:npm|pnpm|bun)\s+(?:install|i|ci|add)\b|yarn(?:\s+(?:install|add)\b|\s*(?:$|&&|;|\|))|npx\s+(?:-y\s+|--yes\s+)?create-[\w-]+|npm\s+(?:init|create)\s+[\w@-]+)").unwrap()
+    });
+    RE.is_match(script)
+}
+
+/// A native module that cannot be loaded: almost always one an interrupted install left half-written.
+fn broken_native_module(output: &str) -> bool {
+    output.contains("Inconsistency detected by ld.so")
+        || output.contains("invalid ELF header")
+        || output.contains("ERR_DLOPEN_FAILED")
+        || output.contains("wrong ELF class")
+        || (output.contains("Bus error") && output.contains(".node"))
+}
+
 /// What a failed command usually means here, said once and plainly: the agent may install what is missing.
 fn hint(script: &str, output: &str) -> Option<String> {
+    if broken_native_module(output) {
+        return Some(
+            "a native module in node_modules is broken (usually an interrupted install), not the code: `rm -rf node_modules package-lock.json && npm install`, then run the command again."
+                .into(),
+        );
+    }
     static NOT_FOUND: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)(?:^|: )([\w.+-]+): (?:command )?not found").unwrap());
     static PY_MODULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"No module named '?([\w.-]+)").unwrap());
     static NODE_MODULE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Cannot find module '([^']+)'").unwrap());
@@ -747,6 +806,9 @@ pub(crate) fn format_exec(r: sandbox::ExecResult) -> ToolOutput {
 
 struct Job {
     command: String,
+    /// Where it runs and the port it said it listens on: a new server for the same project on that port replaces it.
+    cwd: PathBuf,
+    port: Option<u16>,
     out: Mutex<String>,
     read_to: Mutex<usize>,
     exit: Mutex<Option<i32>>,
@@ -789,6 +851,8 @@ pub(crate) fn spawn_job(policy: &PolicyEngine, script: &str, cwd: &Path) -> Resu
     let id = NEXT_JOB.fetch_add(1, Ordering::SeqCst);
     let job = Arc::new(Job {
         command: script.chars().take(80).collect(),
+        cwd: cwd.to_path_buf(),
+        port: port_in(script),
         out: Mutex::new(String::new()),
         read_to: Mutex::new(0),
         exit: Mutex::new(None),
@@ -816,8 +880,13 @@ pub(crate) fn spawn_job(policy: &PolicyEngine, script: &str, cwd: &Path) -> Resu
         }
     });
     tokio::spawn(async move {
+        // the engine shutting down drops this task: the job's whole group goes with it, not only its shell
+        let mut guard = GroupGuard(pid);
         let code = tokio::select! {
-            s = child.wait() => s.ok().and_then(|s| s.code()).unwrap_or(-1),
+            s = child.wait() => {
+                guard.disarm();
+                s.ok().and_then(|s| s.code()).unwrap_or(-1)
+            }
             _ = job.kill.notified() => {
                 // the job and whatever it started (a server's workers, a watcher's children)
                 kill_group(pid);
@@ -881,6 +950,46 @@ pub(crate) async fn refuse_taken_port(port: u16) -> Result<(), ToolError> {
             if free.is_empty() { "none".into() } else { free.join(", ") }
         ),
     ))
+}
+
+/// What to do about the port a new server names (coding plan X9). Free: start it as it is. Held by one of our own background jobs for the
+/// same directory: that is the previous version of this server, which is stopped (a redeploy). Held by anything else: the first free
+/// port of 8000–8010 is used instead, `Ok(Some(new))`, so the command is rewritten rather than the step failed.
+pub(crate) async fn choose_port(port: u16, cwd: &Path) -> Result<Option<u16>, ToolError> {
+    if !listening(port).await {
+        return Ok(None);
+    }
+    let ours: Vec<Arc<Job>> = JOBS.lock().values().filter(|j| j.port == Some(port) && j.exit.lock().is_none() && same_dir(&j.cwd, cwd)).cloned().collect();
+    if !ours.is_empty() {
+        for j in &ours {
+            j.kill.notify_one();
+        }
+        for _ in 0..40 {
+            if !listening(port).await {
+                return Ok(None);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    for p in 8000u16..=8010 {
+        if p != port && !listening(p).await {
+            return Ok(Some(p));
+        }
+    }
+    refuse_taken_port(port).await.map(|_| None)
+}
+
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let c = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    c(a) == c(b)
+}
+
+/// `command` with port `old` replaced by `new` wherever it stands as a number of its own (`--port 8000`, `-p 8000`, `:8000`, `PORT=8000`).
+pub(crate) fn rewrite_port(command: &str, old: u16, new: u16) -> String {
+    let re = Regex::new(&format!(r"(^|[^\d]){old}([^\d]|$)")).expect("port pattern");
+    // twice: two occurrences that share the separator between them (`8000:8000`) are found in two passes
+    let once = re.replace_all(command, format!("${{1}}{new}${{2}}").as_str()).into_owned();
+    re.replace_all(&once, format!("${{1}}{new}${{2}}").as_str()).into_owned()
 }
 
 /// A server that is started is checked to be *listening*, not merely not dead yet: a port already taken makes some servers print that they
@@ -1095,6 +1204,33 @@ mod job_tests {
         assert!(refuse_taken_port(port).await.is_ok());
     }
 
+    #[test]
+    fn a_port_is_rewritten_where_it_stands_on_its_own() {
+        assert_eq!(rewrite_port("npm run start -- -H 0.0.0.0 -p 8000", 8000, 8001), "npm run start -- -H 0.0.0.0 -p 8001");
+        assert_eq!(rewrite_port("PORT=8000 node s.js && curl localhost:8000/x", 8000, 8003), "PORT=8003 node s.js && curl localhost:8003/x");
+        assert_eq!(rewrite_port("python3 -m http.server 8000 --bind 0.0.0.0 # 18000", 8000, 8002), "python3 -m http.server 8002 --bind 0.0.0.0 # 18000");
+    }
+
+    #[tokio::test]
+    async fn a_port_held_by_a_stranger_is_replaced_and_one_held_by_our_old_server_is_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        // a stranger: another port is chosen
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let moved = choose_port(port, dir.path()).await.unwrap();
+        assert!(moved.is_some_and(|p| (8000..=8010).contains(&p) && p != port), "{moved:?}");
+        drop(held);
+        assert_eq!(choose_port(port, dir.path()).await.unwrap(), None, "free: kept");
+        // our own server for this directory: stopped, and the port kept
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        let id = spawn_job(&test_policy(), &format!("python3 -m http.server {port} --bind 127.0.0.1"), dir.path()).unwrap();
+        assert!(await_listening(id, port, Duration::from_secs(15)).await.is_ok());
+        assert_eq!(choose_port(port, dir.path()).await.unwrap(), None, "redeploy on the same port");
+        assert!(job(&json!({"job_id": id})).unwrap().1.exit.lock().is_some(), "the old server was stopped");
+    }
+
     #[tokio::test]
     async fn a_server_is_up_only_when_its_port_answers_and_it_stays_alive() {
         let policy = test_policy();
@@ -1199,6 +1335,55 @@ mod shell_tests {
             "{}",
             o.content
         );
+    }
+
+    #[test]
+    fn a_broken_native_module_is_named_as_such() {
+        for out in [
+            "Inconsistency detected by ld.so: ../sysdeps/x86_64/dl-machine.h: 545: elf_machine_rela_relative: Assertion failed!",
+            "Error: /w/site/node_modules/@next/swc-linux-x64-gnu/next-swc.linux-x64-gnu.node: invalid ELF header",
+            "code: 'ERR_DLOPEN_FAILED'",
+            "Error: wrong ELF class: ELFCLASS32",
+            "Bus error (core dumped) loading next-swc.linux-x64-gnu.node",
+        ] {
+            let h = hint("npm run build", out).unwrap_or_default();
+            assert!(h.contains("native module in node_modules is broken") && h.contains("rm -rf node_modules"), "{out} -> {h}");
+        }
+        assert!(hint("ls", "Bus error").is_none_or(|h| !h.contains("native module")));
+    }
+
+    #[test]
+    fn node_installs_are_recognised() {
+        for c in ["npm install", "cd site && npm i && npm run build", "npm ci", "yarn", "yarn add next", "pnpm install", "npx -y create-next-app@15 lab"] {
+            assert!(installs_node_modules(c), "{c}");
+        }
+        for c in ["npm run build", "npm start", "pip install flask", "ls node_modules"] {
+            assert!(!installs_node_modules(c), "{c}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_install_that_times_out_says_node_modules_may_be_incomplete() {
+        let o = sh("echo npm install; sleep 30 # npm install", 1).await;
+        assert!(o.content.contains("interrupted install: node_modules may be incomplete"), "{}", o.content);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_command_takes_its_whole_process_group_with_it() {
+        let (ws, policy, ctx) = rig();
+        let tag = format!("{}", 100 + std::process::id() % 800);
+        let script = format!("sleep {tag}.317 & sleep {tag}.318");
+        let fut = run_script(&policy, &script, ws.path(), Duration::from_secs(60), 4096, &ctx);
+        // the executor's backstop gives up on the call: the future is dropped while the command runs
+        let _ = tokio::time::timeout(Duration::from_millis(600), fut).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let left: Vec<String> = std::fs::read_dir("/proc")
+            .unwrap()
+            .filter_map(|e| std::fs::read(e.ok()?.path().join("cmdline")).ok())
+            .map(|c| String::from_utf8_lossy(&c).replace('\0', " "))
+            .filter(|c| c.contains(&format!("{tag}.317")) || c.contains(&format!("{tag}.318")))
+            .collect();
+        assert!(left.is_empty(), "left running: {left:?}");
     }
 
     #[test]

@@ -289,6 +289,10 @@ impl Inner {
                 max_replans: r.budget.max_replans,
                 max_seconds: remaining_secs,
                 max_children: 0,
+                max_fix_tool_calls: r.budget.max_fix_tool_calls.saturating_sub(r.usage.fix_tool_calls),
+                // a subagent's share is already cut from what is left: never raised again
+                project_max_seconds: 0,
+                project_max_tool_calls: 0,
             };
             r.usage.children += 1;
             (budget, upstream, entities, step.attempts)

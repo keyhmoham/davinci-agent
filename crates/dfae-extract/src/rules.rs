@@ -75,6 +75,20 @@ static SOFT_VER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(redis|postgres(?:ql)?|mysql|nginx|python|node(?:\.js)?|java|rust|docker|kubernetes|ubuntu|debian)\s+v?(\d+(?:\.\d+)*)\b").unwrap()
 });
 
+/// "Next.js", "Node.js", "Three.js": a framework's name, not a file (it sent a landing page to `/workspace/Next.js` — coding plan X5).
+/// Only a bare name (no directory) with a known framework stem: `src/next.js` and `App.js` stay files.
+pub(crate) fn framework_name(t: &str) -> bool {
+    const STEMS: &[&str] = &[
+        "next", "node", "vue", "nuxt", "three", "express", "nest", "react", "d3", "chart", "socket", "p5", "alpine", "ember", "backbone", "solid", "svelte",
+        "angular", "deno", "electron", "moment", "anime", "phaser", "pixi", "babylon", "leaflet", "ext", "meteor",
+    ];
+    if t.contains('/') {
+        return false;
+    }
+    let Some((stem, ext)) = t.rsplit_once('.') else { return false };
+    matches!(ext, "js" | "ts") && STEMS.contains(&stem.to_ascii_lowercase().as_str())
+}
+
 fn char_offset(s: &str, byte: usize) -> usize {
     s[..byte].chars().count()
 }
@@ -98,7 +112,7 @@ impl RuleExtractor {
                 if label == "expression" && (t.contains('-') && t.matches('-').count() == 2 && !t.contains(' ')) {
                     continue; // looks like a date 2025-01-31
                 }
-                if label == "file path" && (t.starts_with("http") || t.contains("://")) {
+                if label == "file path" && (t.starts_with("http") || t.contains("://") || framework_name(&t)) {
                     continue;
                 }
                 if label == "quoted" {
@@ -184,6 +198,23 @@ mod tests {
             assert!(l.contains(&("file path".into(), p.into())), "{p}: {l:?}");
         }
         assert!(!l.iter().any(|(k, v)| k == "file path" && v == "Python"), "{l:?}");
+    }
+
+    #[test]
+    fn framework_names_are_not_files() {
+        for text in [
+            "create a landing page in the existing Next.js app",
+            "a Node.js server with Express.js",
+            "an animated globe with Three.js and Vue.js",
+            "use next.js and build it",
+        ] {
+            let l = labels(&RuleExtractor::new().run(text));
+            assert!(!l.iter().any(|(k, _)| k == "file path"), "{text}: {l:?}");
+        }
+        let l = labels(&RuleExtractor::new().run("edit notes.js, then src/next.js and App.js"));
+        for p in ["notes.js", "src/next.js", "App.js"] {
+            assert!(l.contains(&("file path".into(), p.into())), "{p}: {l:?}");
+        }
     }
 
     #[test]

@@ -562,6 +562,79 @@ fn cases() -> Vec<Case> {
                 if ok && !out.to_lowercase().contains("error") { Ok(()) } else { Err(format!("npm run build: {out}")) }
             },
         },
+        // coding plan D1: the request that failed 4 of 4 times in real use, in a workspace that looks like real use — an old, broken
+        // project in site/, a foreign server on 8000 — not the empty workspace the case above starts from
+        Case {
+            name: "nextjs landing in a used workspace",
+            goal: "create a professional landing page about a scientific laboratory using nextjs and build and serve it",
+            then: &[],
+            between: None,
+            files: |ws| {
+                write(ws, "site/index.html", "<!doctype html><html><body><h1>Earth</h1></body></html>");
+                write(ws, "site/app/page.jsx", "export default function Page() { return <h1>Crypto</h1>; }\n");
+                write(ws, "site/app/layout.jsx", "<html lang=\"en\">\n      <body>{children}</body>\n    </html>\n  )\n}\n");
+                // a listener that is not ours holds 8000 for the whole case
+                let _ = Command::new("bash").arg("-c").arg("nohup python3 -m http.server 8000 --bind 127.0.0.1 >/dev/null 2>&1 &").current_dir(ws).status();
+                std::thread::sleep(Duration::from_millis(800));
+            },
+            check: |ws, t| {
+                let dirs: Vec<String> = std::fs::read_dir(ws)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().join("package.json").is_file())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| n != "site")
+                    .collect();
+                let dir = dirs.first().ok_or("no new Next.js project outside site/")?;
+                let pkg = std::fs::read_to_string(ws.join(dir).join("package.json")).unwrap_or_default();
+                if !pkg.contains("\"next\"") || pkg.contains("\"latest\"") {
+                    return Err(format!("{dir}/package.json is not a pinned Next.js project: {pkg}"));
+                }
+                let page = ["src/app/page.tsx", "app/page.tsx", "src/app/page.jsx", "app/page.jsx"]
+                    .iter()
+                    .find_map(|p| std::fs::read_to_string(ws.join(dir).join(p)).ok())
+                    .ok_or("no app page")?;
+                if !page.contains("export default") || !page.contains("className") {
+                    return Err("the page has no default export or does not use className".into());
+                }
+                let root_files: Vec<String> = std::fs::read_dir(ws)
+                    .unwrap()
+                    .flatten()
+                    .filter(|e| e.path().is_file())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect();
+                if !root_files.is_empty() {
+                    return Err(format!("files at the workspace root: {root_files:?}"));
+                }
+                let (ok, out) = run(&ws.join(dir), "npm run build 2>&1 | tail -15");
+                if !ok {
+                    return Err(format!("npm run build: {out}"));
+                }
+                let a = answer(t);
+                let port = a.split("localhost:").nth(1).and_then(|r| r.get(..4)).ok_or(format!("no address in the answer: {a}"))?;
+                if port == "8000" {
+                    return Err("the answer points at the foreign server on 8000".into());
+                }
+                let (_, body) = run(ws, &format!("curl -s http://127.0.0.1:{port}/"));
+                if !body.to_lowercase().contains("lab") {
+                    return Err(format!("http://localhost:{port} does not serve the lab page"));
+                }
+                if t.usage.replans > 1 {
+                    return Err(format!("{} re-plans", t.usage.replans));
+                }
+                let s = t.ledger.summary();
+                let tokens = s.planner_tokens + s.worker_tokens;
+                if tokens > 15_000 {
+                    return Err(format!("{tokens} tokens (the plan's target is 15k)"));
+                }
+                let (_, ps) = run(ws, "ps -eo args | grep -E '^(npm|node) ' | grep -v -E 'next-server|next start|grep' || true");
+                if !ps.trim().is_empty() {
+                    return Err(format!("orphaned processes: {ps}"));
+                }
+                Ok(())
+            },
+        },
     ]
 }
 
