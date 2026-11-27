@@ -62,8 +62,9 @@ pub(crate) struct TaskCtx {
     /// How hard the planner thinks for this task (from the request's complexity), and how many re-planning rounds it has had.
     pub planner_effort: Mutex<Option<String>>,
     pub planner_rounds: std::sync::atomic::AtomicU32,
-    /// How many actions were held back for the user (`ErrorKind::Withheld`).
-    pub withheld: std::sync::atomic::AtomicU32,
+    /// What was held back for the user (`ErrorKind::Withheld`), one line each: every later re-plan is told, so it neither plans it again
+    /// nor checks for it.
+    pub withheld: Mutex<Vec<String>>,
 }
 
 impl TaskCtx {
@@ -88,7 +89,7 @@ impl TaskCtx {
             fixed: Mutex::new(HashSet::new()),
             planner_effort: Mutex::new(None),
             planner_rounds: std::sync::atomic::AtomicU32::new(0),
-            withheld: std::sync::atomic::AtomicU32::new(0),
+            withheld: Mutex::new(Vec::new()),
         })
     }
 

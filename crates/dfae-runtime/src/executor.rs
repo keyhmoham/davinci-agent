@@ -874,7 +874,12 @@ impl Inner {
         let Some(step) = step else { return Some(f.message) };
         // a removal held back for the user a second time: the planner was told and planned it in again, so the step is left out
         // (measured: re-plans that re-add it until the budget is gone) and the answer says so
-        if f.kind == ErrorKind::Withheld && ctx.withheld.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1 {
+        let held_before = f.kind == ErrorKind::Withheld && {
+            let mut w = ctx.withheld.lock();
+            w.push(format!("{} ({})", tokens::truncate_tokens(&step.description, 25), clip_error(&f.message, 160)));
+            w.len() > 1
+        };
+        if held_before {
             let mut r = ctx.rec.lock().await;
             {
                 if let Some(s) = r.plan.as_mut().and_then(|p| p.step_mut(id)) {
@@ -997,6 +1002,19 @@ impl Inner {
             (r.usage.replans, r.budget.clone())
         };
         self.set_status(ctx, TaskStatus::Recovering).await;
+        // what was held back for the user stays out of the plan, and out of its checks (measured: a verify step "tests/ is absent", written
+        // from the page, failed and the planner re-added the removal)
+        let held = ctx.withheld.lock().clone();
+        let with_held;
+        let problem = if held.is_empty() {
+            problem
+        } else {
+            with_held = format!(
+                "{problem}\nHELD BACK FOR THE USER (content from outside asked for it, the request did not): {}. Do not plan these again by any means, and do not check for them; the answer says they were left out.",
+                held.join("; ")
+            );
+            &with_held
+        };
         if tier == Tier::Planner {
             // the planner sees every tool; what the plan may use is every tool of this agent's scope
             *ctx.allowed.lock() = self.scoped_metas(ctx).into_iter().map(|m| m.name).collect();
