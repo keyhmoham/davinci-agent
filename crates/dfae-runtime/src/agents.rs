@@ -176,9 +176,9 @@ impl Inner {
     }
 
     async fn spawn_child_inner(self: &Arc<Self>, parent: &Arc<TaskCtx>, spec: ChildSpec) -> (String, oneshot::Receiver<TaskRecord>) {
-        let (session, auto, tainted) = {
+        let (session, auto, tainted, exposed) = {
             let r = parent.rec.lock().await;
-            (r.session_id.clone(), r.request.auto_approve, r.tainted)
+            (r.session_id.clone(), r.request.auto_approve, r.tainted, r.exposed)
         };
         let request = TaskRequest {
             goal: spec.goal.clone(),
@@ -190,6 +190,7 @@ impl Inner {
         };
         let mut rec = TaskRecord::new(request, spec.budget);
         rec.tainted = tainted;
+        rec.exposed = exposed;
         rec.team = Some(TeamInfo {
             role: AgentRole::Researcher, // provisional; fixed once the agent has routed itself
             link: Some(TeamLink {
@@ -328,6 +329,7 @@ impl Inner {
                 e.origin = Some(child.task_id.clone());
                 r.ledger.record(e);
             }
+            r.exposed |= child.exposed;
             if child.tainted {
                 r.tainted = true; // what an agent saw may steer the join step
             }

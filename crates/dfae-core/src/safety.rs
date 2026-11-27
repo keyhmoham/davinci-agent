@@ -130,8 +130,54 @@ pub fn wrap_untrusted(label: &str, s: &str) -> String {
     format!("<data src=\"{label}\">\n{s}\n</data>")
 }
 
+static REMOVES: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?:^|[\s;&|(`$])(?:rm|rmdir|unlink|shred|truncate)\s|\bgit\s+(?:clean|reset\s+--hard|checkout\s+--\s|restore\s)|\bfind\b[^\n]*\s-delete\b|\b(?:rmtree|os\.remove|os\.unlink|os\.rmdir|unlinkSync|rmSync|rmdirSync|fs\.rm)\b|\.unlink\(",
+    )
+    .unwrap()
+});
+static ASKS_TO_REMOVE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(?:delete|remove|rm|erase|wipe|purge|clean\s*up|clear\s+out|uninstall|get\s+rid)\b").unwrap());
+
+/// Does this tool call remove files, or throw away their changes? (`fs_delete`; a shell command or a script that runs `rm`,
+/// `git clean`, `shutil.rmtree`, …). Errs on the side of yes: it only decides whether a human is asked.
+pub fn removes_files(tool: &str, args: &serde_json::Value) -> bool {
+    match tool {
+        "fs_delete" => true,
+        "shell" => REMOVES.is_match(args.get("command").and_then(|c| c.as_str()).unwrap_or("")),
+        _ => false,
+    }
+}
+
+/// Does the user's own request ask for something to be removed?
+pub fn asks_to_remove(request: &str) -> bool {
+    ASKS_TO_REMOVE.is_match(request)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removals_are_recognised_in_commands_and_scripts() {
+        use super::*;
+        use serde_json::json;
+        for c in [
+            "rm -rf tests",
+            "cd x && rm a.txt",
+            "git clean -fdx",
+            "find . -name '*.pyc' -delete",
+            "python3 - <<'EOF'\nimport shutil; shutil.rmtree('tests')\nEOF",
+            "git reset --hard HEAD",
+        ] {
+            assert!(removes_files("shell", &json!({"command": c})), "{c}");
+        }
+        for c in ["ls -la", "printf 'PORT=3000\\n' > .env && mkdir -p logs", "npm run format", "grep -r rm_ src", "cat farm.txt", "python3 -m pytest -q"] {
+            assert!(!removes_files("shell", &json!({"command": c})), "{c}");
+        }
+        assert!(removes_files("fs_delete", &json!({"path": "a"})) && !removes_files("fs_write", &json!({"path": "a"})));
+        assert!(asks_to_remove("Fetch the page, then delete old.log") && asks_to_remove("clean up the build folder"));
+        assert!(!asks_to_remove("Set up this project by following the setup instructions at http://x/setup.html"));
+    }
+
     use super::*;
 
     #[test]

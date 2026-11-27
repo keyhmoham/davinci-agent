@@ -374,6 +374,9 @@ impl Inner {
                 // what comes from outside (the web, an outside service) is extracted from, never summarised by a model
                 let untrusted =
                     step.kind == StepKind::Tool && step.tool.as_deref().and_then(|t| self.tools.meta(t)).is_some_and(|m| crate::quarantine::untrusted(&m));
+                if untrusted {
+                    ctx.rec.lock().await.exposed = true;
+                }
                 let mut summary =
                     if untrusted { self.quarantined_summary(ctx, &step, &content).await } else { tokens::compress_text(&content, STEP_SUMMARY_TOKENS) };
                 if !untrusted && let Some(c) = self.condense(ctx, &step, &content).await {
@@ -625,6 +628,23 @@ impl Inner {
             dfae_tools::PolicyDecision::Deny(m) => return Err(StepFailure::new(ErrorKind::Policy, m)),
             dfae_tools::PolicyDecision::RequireApproval(r) => approval_reason = Some(r),
             dfae_tools::PolicyDecision::Allow => {}
+        }
+        // once outside content has been read, removing files is the user's call, not the content's (an injected `rm -rf tests` in a
+        // setup page is not flagged as an injection: it reads like any other instruction)
+        let (exposed, goal) = {
+            let r = ctx.rec.lock().await;
+            (r.exposed, r.goal.clone())
+        };
+        if exposed && safety::removes_files(&name, &args) && !safety::asks_to_remove(&goal) {
+            let why =
+                "removes files after content from outside (the web or an outside service) was read, and the request did not ask for anything to be removed";
+            if self.cfg.approvals == ApprovalMode::Never {
+                return Err(StepFailure::new(
+                    ErrorKind::Policy,
+                    format!("refused: this {why}. Leave the removal out (say in the answer that the fetched content asked for it), or ask the user"),
+                ));
+            }
+            approval_reason.get_or_insert_with(|| why.to_string());
         }
         if step.approval_required && approval_reason.is_none() {
             approval_reason = Some("the plan marked this step as requiring approval".into());

@@ -616,6 +616,10 @@ pub struct TaskRecord {
     pub skill_id: Option<String>,
     /// Set when untrusted tool output looked like a prompt injection.
     pub tainted: bool,
+    /// Set once output from outside the system (the web, an outside service) has been read: from then on what the task does may be
+    /// steered by it, flagged or not.
+    #[serde(default)]
+    pub exposed: bool,
     pub final_answer: Option<String>,
     pub error: Option<String>,
     /// Team view: set on coordinators and on the agents they spawn.
@@ -654,6 +658,7 @@ impl TaskRecord {
             verification: None,
             skill_id: None,
             tainted: false,
+            exposed: false,
             final_answer: None,
             error: None,
             team: None,
