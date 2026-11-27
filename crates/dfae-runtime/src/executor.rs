@@ -334,6 +334,23 @@ impl Inner {
                     }
                     verdict = again;
                 }
+                // a tool step that missed: the worker first tries to fix it with tools (a server in the wrong directory, a test
+                // that fails), then the step runs again and is judged again; only a second miss goes to the planner
+                if let Some(why) = verdict.clone()
+                    && step.kind == StepKind::Tool
+                {
+                    let problem = format!(
+                        "the step ran, but its result does not meet what was expected: \"{}\" ({why}). The result was: {}",
+                        step.expect.as_deref().unwrap_or(""),
+                        tokens::truncate_tokens(&out.content, 300)
+                    );
+                    if self.local_fix(ctx, id, &step, &problem).await
+                        && let Ok(again) = self.run_tool(ctx, &step, tainted, &deps).await
+                    {
+                        verdict = self.judge_step(ctx, &step, &again.content).await;
+                        out = again;
+                    }
+                }
                 if let Some(why) = verdict {
                     let problem = format!(
                         "step {id} ({}) found: {} — this does not meet what was expected: \"{}\" ({why}). Adapt the remaining plan to what was actually found; do not repeat steps that are done.",

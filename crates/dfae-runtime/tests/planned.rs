@@ -1003,3 +1003,17 @@ async fn a_step_the_worker_cannot_fix_still_goes_to_the_planner() {
     let t = run_as(&r, ModeRequest::Escalated, "Read data/input.txt").await;
     assert_eq!(r.planner.requests.lock().iter().filter(|q| q.purpose.starts_with("replan")).count(), 1, "{:?}", t.error);
 }
+
+#[tokio::test]
+async fn a_result_that_misses_its_expectation_is_fixed_by_the_worker_before_the_planner_revisits() {
+    let r = rig(false, |c| c.economy.step_agent = true);
+    std::fs::create_dir_all(r.ws.path().join("site")).unwrap();
+    r.planner.push(&json!({"steps": [{"id": "s1", "do": "list the directory site", "tool": "fs_list", "after": [], "expect": "site/index.html exists", "planner": false}]}).to_string());
+    r.worker.push(&json!({"action": "tool", "tool": "fs_write", "args": {"path": "site/index.html", "content": "<html><body>hi</body></html>"}, "why": "write the missing page", "summary": null, "reason": null}).to_string());
+    r.worker.push(&json!({"action": "done", "tool": null, "args": null, "why": null, "summary": "wrote site/index.html", "reason": null}).to_string());
+    let t = run_as(&r, ModeRequest::Escalated, "List the site directory").await;
+    assert_eq!(t.status, TaskStatus::Completed, "{:?}", t.error);
+    assert!(t.plan.as_ref().unwrap().step("s1_fix1").is_some(), "the fix is in the plan");
+    assert_eq!(t.usage.replans, 0, "the expectation is met after the fix: no planning round");
+    assert!(r.ws.path().join("site/index.html").exists());
+}
