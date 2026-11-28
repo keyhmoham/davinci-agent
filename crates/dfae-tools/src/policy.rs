@@ -101,7 +101,7 @@ impl Default for FilesystemPolicy {
             read_roots: vec!["{workspace}".into()],
             write_roots: vec!["{workspace}".into()],
             write_requires_approval: true,
-            deny_names: vec![".git".into(), ".env".into(), "id_rsa".into(), "id_ed25519".into(), ".ssh".into(), ".aws".into()],
+            deny_names: vec![".git".into(), ".env".into(), "id_rsa".into(), "id_ed25519".into(), ".ssh".into(), ".aws".into(), "mcp-oauth.json".into()],
         }
     }
 }

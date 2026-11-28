@@ -61,7 +61,10 @@ async fn directory(endpoint: String) -> String {
         get(move || {
             let endpoint = endpoint.clone();
             async move {
-                Json(json!({"connectors": [{"id": "c000000001", "name": "Open Weather", "namespace": "ex.test", "slug": "open-weather", "description": "Forecasts",
+                Json(json!({"connectors": [{"id": "c000000002", "name": "Stock Quotes", "namespace": "ex.test", "slug": "stock-quotes",
+                    "description": "Share prices and forecasts", "healthy": true, "isBoosted": false, "toolCount": 1, "deprecatedAt": null, "attributes": [],
+                    "connection": {"authType": "none", "transport": "streamable_http", "url": format!("{endpoint}/stocks")},
+                    "url": "https://glama.ai/mcp/connectors/ex.test/stock-quotes"}, {"id": "c000000001", "name": "Open Weather", "namespace": "ex.test", "slug": "open-weather", "description": "Forecasts",
                     "healthy": true, "isBoosted": false, "toolCount": 1, "deprecatedAt": null, "attributes": [],
                     "connection": {"authType": "none", "transport": "streamable_http", "url": endpoint},
                     "url": "https://glama.ai/mcp/connectors/ex.test/open-weather"}]}))
@@ -87,7 +90,9 @@ impl DecisionProvider for Oracle {
         // does a known server fit the request? only a weather server fits a weather request
         for (k, q) in &req.questions {
             if let (true, Question::Noul { instructions, .. }) = (k.starts_with("server_"), q) {
-                let fits = instructions.contains("weather") && req.state.request.contains("weather");
+                // the service is the first quoted name of the question
+                let service = instructions.split('"').nth(1).unwrap_or("").to_lowercase();
+                let fits = service.contains("weather") && req.state.request.contains("weather");
                 r.answers.insert(k.clone(), Answer::noul(if fits { 0.9 } else { 0.1 }));
             }
         }
@@ -106,7 +111,7 @@ struct Rig {
 async fn rig(with_directory: bool) -> Rig {
     let ws = tempfile::tempdir().unwrap();
     let weather = Weather::default();
-    let mcp_url = serve(Router::new().route("/mcp", post(mcp)).with_state(weather.clone())).await;
+    let mcp_url = serve(Router::new().route("/mcp", post(mcp)).route("/mcp/stocks", post(mcp)).with_state(weather.clone())).await;
     let mut cfg = Config::default();
     cfg.workspace = ws.path().to_path_buf();
     cfg.approvals = ApprovalMode::Never;
@@ -167,7 +172,15 @@ async fn a_request_about_an_outside_service_finds_connects_and_uses_its_mcp_serv
     assert!(plan_req.schema.as_ref().unwrap().to_string().contains("mcp__open_weather__get_forecast"), "and may plan with it");
     // the directory was asked with the few words the worker wrote, not with the request
     let query = r.worker.requests.lock().iter().find(|q| q.purpose == "mcp_query").cloned().unwrap();
-    assert_eq!(query.max_tokens, 40);
+    assert_eq!(query.max_tokens, 160);
+    // the directory ranked a stock-quote server first; the decision model, shown what it does, said it does not fit
+    let servers: Vec<String> = r
+        .engine
+        .backlog(&t.task_id)
+        .into_iter()
+        .filter_map(|e| if let EventKind::McpConnected { server, .. } = e.kind { Some(server) } else { None })
+        .collect();
+    assert_eq!(servers, vec!["open_weather"], "a directory server that does not fit is not connected");
 }
 
 #[tokio::test]

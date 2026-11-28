@@ -14,6 +14,8 @@ pub enum TaskStatus {
     WaitingForTool,
     WaitingForApproval,
     WaitingForAgent,
+    /// Waiting for the user to do something outside the chat (sign in to an MCP provider).
+    WaitingForUser,
     Recovering,
     Verifying,
     Completed,
@@ -34,7 +36,10 @@ impl TaskStatus {
         }
         match self {
             Created => matches!(next, Running | Cancelled | Failed),
-            Running => matches!(next, WaitingForTool | WaitingForApproval | WaitingForAgent | Recovering | Verifying | Completed | Failed | Cancelled),
+            Running => {
+                matches!(next, WaitingForTool | WaitingForApproval | WaitingForAgent | WaitingForUser | Recovering | Verifying | Completed | Failed | Cancelled)
+            }
+            WaitingForUser => matches!(next, Running | Failed | Cancelled),
             WaitingForTool => matches!(next, Running | WaitingForApproval | Recovering | Verifying | Failed | Cancelled),
             WaitingForApproval => matches!(next, Running | WaitingForTool | Recovering | Failed | Cancelled),
             WaitingForAgent => matches!(next, Running | Failed | Cancelled),

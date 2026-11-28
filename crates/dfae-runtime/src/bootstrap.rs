@@ -92,6 +92,8 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
                 max_auto: mcp_cfg.max_auto,
                 keys: dfae_mcp::HubConfig::keys_from_env(),
                 state_path,
+                redirect_uri: mcp_cfg.redirect_uri(),
+                secret: std::env::var("DFAE_SECRET_KEY").ok().or_else(|| config.api_token.clone()).filter(|s| !s.trim().is_empty()),
                 ..Default::default()
             },
             glama,

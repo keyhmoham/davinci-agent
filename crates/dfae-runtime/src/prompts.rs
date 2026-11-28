@@ -155,7 +155,7 @@ pub fn bind_user(signature: &str, step: &str, entities: &str, prebound: &str, in
 }
 
 /// What to look for in a directory of MCP servers.
-pub const MCP_QUERY_SYSTEM: &str = "You turn a user's request into a short search query (2 to 5 words) for a directory of MCP servers, which are integrations with outside services and systems. Name the service or the capability, not the action: \"github issues\", \"slack messages\", \"postgres database\", \"google calendar\". Reply with the query only.";
+pub const MCP_QUERY_SYSTEM: &str = r#"You turn a user's request into searches of a directory of MCP servers (integrations with outside services and systems). Reply with JSON only: {"needs": [{"capability": "...", "queries": ["...", "..."]}]}. One entry per outside service or system the request depends on (at most 2; usually 1). "capability": one sentence describing the tool that would do it, in the words a tool's own documentation would use ("Search Wikipedia articles and return their text", "List the open issues of a GitHub repository"). "queries": 2 or 3 short directory searches of 2 to 5 words, most specific first: the service's own name when the request names one ("github issues"), then the capability in general words ("issue tracker", "code hosting"). Name the service or the capability, not the action."#;
 
 /// Where the shell runs and what the agent may do in it. Said to every model that decides what to run, because a model that is not told
 /// it may install things refuses, or asks the user to.

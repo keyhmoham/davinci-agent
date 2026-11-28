@@ -290,3 +290,163 @@ async fn a_local_server_speaking_stdio_is_a_server_like_any_other() {
     assert!(hub.add("ghost", bad, Source::Config, None, "", false).await.is_err());
     assert!(hub.server("ghost").is_some_and(|s| !s.connected && s.error.is_some()), "kept, with the reason, for the operator to see");
 }
+
+/// A directory that filters by attribute and has a detail page per connector: a general web search it ranks first, an encyclopedia
+/// whose tools are what the need describes, and an OAuth server only an unfiltered search shows.
+async fn detailed_directory(seen: Arc<std::sync::Mutex<Vec<(String, String)>>>) -> String {
+    let c = |id: &str, name: &str, slug: &str, auth: &str, desc: &str| {
+        json!({"id": id, "name": name, "namespace": "ex.test", "slug": slug, "description": desc, "healthy": true, "isBoosted": false,
+               "qualityScore": 3.0, "toolCount": 1, "deprecatedAt": null, "attributes": [format!("auth:{auth}")],
+               "connection": {"authType": auth, "transport": "streamable_http", "url": format!("https://{slug}.example/mcp")},
+               "url": format!("https://glama.ai/mcp/connectors/ex.test/{slug}")})
+    };
+    let all = vec![
+        c("d000000001", "Web Search", "web-search", "none", "Search the web"),
+        c("d000000002", "Encyclopedia", "encyclopedia", "none", "Reference lookups"),
+        c("d000000003", "Notes Cloud", "notes-cloud", "oauth2", "Your notes"),
+    ];
+    let list = {
+        let all = all.clone();
+        move |q: axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let all = all.clone();
+            let seen = seen.clone();
+            async move {
+                let attrs = q.get("attributes").cloned().unwrap_or_default();
+                seen.lock().unwrap().push((q.get("query").cloned().unwrap_or_default(), attrs.clone()));
+                let keep: Vec<Value> = all
+                    .into_iter()
+                    .filter(|c| attrs.split(',').filter(|a| !a.is_empty()).all(|a| c["attributes"].as_array().unwrap().iter().any(|x| x == a)))
+                    .collect();
+                Json(json!({"connectors": keep, "facets": [], "pageInfo": {"endCursor": null, "hasNextPage": false}}))
+            }
+        }
+    };
+    let detail = |axum::extract::Path((_ns, slug)): axum::extract::Path<(String, String)>| async move {
+        let tools = match slug.as_str() {
+            "web-search" => json!([{"name": "search", "description": "Search the web for pages", "inputSchema": {}, "annotations": {"readOnlyHint": true}}]),
+            "encyclopedia" => {
+                json!([{"name": "get_article", "title": "Wikipedia article", "description": "Search Wikipedia articles and return their text", "inputSchema": {}, "annotations": {"readOnlyHint": true}}])
+            }
+            _ => json!([]),
+        };
+        Json(json!({"tools": tools, "documentationUrl": format!("https://docs.example/{slug}")}))
+    };
+    serve(Router::new().route("/v1/connectors", get(list)).route("/v1/connectors/{ns}/{slug}", get(detail))).await
+}
+
+#[tokio::test]
+async fn a_shortlist_filters_in_the_directory_reads_each_candidate_and_ranks_it_on_its_tools() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dir = detailed_directory(seen.clone()).await;
+    let hub = hub(&ToolRegistry::new(), Some(Glama::new(&dir, "k")));
+    let need =
+        dfae_mcp::Need { capability: "Search Wikipedia articles and return their text".into(), queries: vec!["wikipedia".into(), "encyclopedia".into()] };
+    let list = hub.shortlist(&need).await.unwrap();
+    let names: Vec<&str> = list.candidates.iter().map(|c| c.connector.name.as_str()).collect();
+    assert_eq!(names, vec!["Encyclopedia", "Web Search"], "the one whose tools do what is needed comes first");
+    assert_eq!(list.candidates[0].tools[0].name, "get_article");
+    assert_eq!(list.candidates[0].documentation.as_deref(), Some("https://docs.example/encyclopedia"));
+    assert!(list.skipped.iter().any(|s| s.contains("Notes Cloud needs OAuth")), "{:?}", list.skipped);
+    let seen = seen.lock().unwrap().clone();
+    // every query is searched for open servers; the first one also unfiltered
+    for q in ["wikipedia", "encyclopedia", "Search Wikipedia articles and return their text"] {
+        assert!(seen.contains(&(q.to_string(), "auth:none".to_string())), "{seen:?}");
+    }
+    assert!(seen.contains(&("wikipedia".to_string(), String::new())));
+}
+
+/// The real directory's shortlists for a few needs, with their scores (`GLAMA_API_KEY`; `LIVE_NEEDS="capability|query|query;..."`).
+#[tokio::test]
+#[ignore = "asks the real Glama directory"]
+async fn live_shortlists() {
+    let key = std::env::var("GLAMA_API_KEY").expect("GLAMA_API_KEY");
+    let redirect_uri = std::env::var("LIVE_REDIRECT").ok();
+    let hub =
+        McpHub::new(ToolRegistry::new(), HubConfig { max_auto: 2, redirect_uri, ..Default::default() }, Some(Glama::new("https://glama.ai/api/mcp", &key)));
+    let needs = std::env::var("LIVE_NEEDS").unwrap_or_else(|_| {
+        "Get the top stories on Hacker News|Hacker News top stories|Hacker News API|news aggregator;\
+         Read the description of a GitHub repository|github repository metadata|github repository description;\
+         Search Wikipedia articles and return their text|Wikipedia search|Wikipedia articles"
+            .into()
+    });
+    for n in needs.split(';') {
+        let mut parts = n.split('|').map(|s| s.trim().to_string());
+        let capability = parts.next().unwrap();
+        let need = dfae_mcp::Need { capability, queries: parts.collect() };
+        eprintln!("\n## {}", need.capability);
+        match hub.shortlist(&need).await {
+            Ok(list) => {
+                for c in &list.candidates {
+                    let tools: Vec<&str> = c.tools.iter().take(6).map(|t| t.name.as_str()).collect();
+                    eprintln!(
+                        "  {:.3} {} {:<32} q={:?} h={:?} [{}] {}",
+                        c.score,
+                        if c.sign_in { "SIGN-IN" } else { "open   " },
+                        c.connector.name,
+                        c.connector.quality,
+                        c.connector.healthy,
+                        c.connector.description.clone().unwrap_or_default().chars().take(60).collect::<String>(),
+                        tools.join(", ")
+                    );
+                }
+                eprintln!("  skipped: {:?}", list.skipped);
+            }
+            Err(e) => eprintln!("  error: {e}"),
+        }
+    }
+}
+
+/// Listed as open, lists its tools, but every call wants a login (seen in the real directory).
+async fn login_wall(Json(m): Json<Value>) -> Response {
+    let id = m.get("id").cloned();
+    match m["method"].as_str().unwrap_or_default() {
+        "initialize" => Json(json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "W", "version": "1"}}})).into_response(),
+        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "tools/list" => Json(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [{"name": "get-forecast", "description": "Weather forecast for a city",
+            "annotations": {"readOnlyHint": true}, "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]}})).into_response(),
+        _ => (StatusCode::UNAUTHORIZED, "Authentication required").into_response(),
+    }
+}
+
+#[tokio::test]
+async fn a_directory_server_that_wants_a_login_when_called_is_not_used_again() {
+    let base = serve(Router::new().route("/mcp", post(login_wall))).await;
+    let dir = fake_directory(&format!("{base}/mcp")).await;
+    let state = tempfile::tempdir().unwrap().keep().join("mcp.json");
+    let registry = ToolRegistry::new();
+    let hub = McpHub::new(registry.clone(), HubConfig { state_path: Some(state.clone()), ..Default::default() }, Some(Glama::new(&dir, "glm_good")));
+    assert_eq!(hub.discover("weather forecast").await.unwrap()[0].server, "open_weather");
+    let e = registry.get("mcp__open_weather__get_forecast").unwrap().execute(json!({"city": "Paris"}), ctx()).await.unwrap_err();
+    assert!(e.message.contains("401"), "{}", e.message);
+    // the next request neither attaches it nor connects it again
+    assert!(hub.relevant("what is the weather forecast for Paris").await.is_empty());
+    assert!(registry.meta("mcp__open_weather__get_forecast").is_none());
+    match hub.discover("weather").await {
+        Err(DiscoverError::NoneUsable { skipped, .. }) => assert!(skipped.iter().any(|s| s.contains("asked for a login")), "{skipped:?}"),
+        other => panic!("{other:?}"),
+    }
+    // and the next run remembers it
+    let again = McpHub::new(ToolRegistry::new(), HubConfig { state_path: Some(state), ..Default::default() }, Some(Glama::new(&dir, "glm_good")));
+    again.restore();
+    assert!(again.discover("weather").await.is_err());
+}
+
+/// For real OAuth connectors in the directory: is their sign-in discoverable as the MCP spec has it (`GLAMA_API_KEY`)? Reads public
+/// metadata only: nothing is registered and nobody signs in.
+#[tokio::test]
+#[ignore = "asks the real Glama directory and real providers"]
+async fn live_sign_in_discovery() {
+    let key = std::env::var("GLAMA_API_KEY").expect("GLAMA_API_KEY");
+    let glama = Glama::new("https://glama.ai/api/mcp", &key);
+    let mut seen = std::collections::HashSet::new();
+    for q in ["notion", "linear issues", "sentry", "github", "atlassian jira", "asana", "slack"] {
+        let page = glama.search_page(q, 3, &["auth:oauth2", "oauth:hosted"], None).await.unwrap();
+        for c in page.connectors.into_iter().take(2) {
+            if !seen.insert(c.endpoint.clone()) {
+                continue;
+            }
+            let r = McpHub::probe_sign_in(&c.endpoint).await;
+            eprintln!("{:<28} {:<45} {}", c.name.chars().take(28).collect::<String>(), c.endpoint.chars().take(45).collect::<String>(), r);
+        }
+    }
+}

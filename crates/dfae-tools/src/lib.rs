@@ -18,6 +18,7 @@ mod web;
 
 pub use binder::{DirectCall, bind_direct};
 pub use calc::{evaluate as evaluate_expression, format_number};
+pub use coding::{RunningServer, job_tail, running_servers};
 pub use native::register_native;
 pub use policy::{PathGuard, PolicyConfig, PolicyDecision, PolicyEngine, ShellMode};
 pub use registry::ToolRegistry;

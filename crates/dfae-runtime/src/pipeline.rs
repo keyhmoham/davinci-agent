@@ -57,6 +57,12 @@ impl Inner {
             }
         };
         self.finalize(&ctx, outcome).await;
+        // a directory server that refused this task's calls for want of a login is forgotten now, not by the next task's search
+        if !ctx.mcp.lock().is_empty()
+            && let Some(hub) = self.mcp.get().cloned()
+        {
+            hub.forget_locked().await;
+        }
         self.live.lock().remove(&ctx.id);
         ctx.permit.lock().take(); // free the worker slot before the coordinator wakes
         let done = ctx.done.lock().take();
@@ -263,6 +269,40 @@ impl Inner {
         if self.is_cancelled(ctx).await {
             return Err("cancelled".into());
         }
+        // the code this task wrote is run and used before it is judged; what fails is repaired (a patched plan) and tested again
+        let is_chat_plan = ctx.rec.lock().await.plan.as_ref().map(|p| p.source == PlanSource::Chat).unwrap_or(false);
+        if exec_err.is_none() && !is_chat_plan {
+            let mut round = 0u32;
+            loop {
+                let findings = self.stage_validate(ctx, goal, round).await;
+                let failed: Vec<&crate::validate::Finding> = findings.iter().filter(|f| !f.ok).collect();
+                let brief = (!failed.is_empty()).then(|| crate::validate::repair_brief(&failed));
+                *ctx.validation.lock() = findings.clone();
+                let Some(brief) = brief else { break };
+                if round >= self.cfg.validate.rounds || self.is_cancelled(ctx).await {
+                    break;
+                }
+                let tier = ctx.rec.lock().await.mode.and_then(|m| self.planner_tier(m)).or_else(|| self.planner_tier(mode));
+                let Some(tier) = tier else { break };
+                round += 1;
+                // a validation repair has a round of its own: the build's recovery may have spent the re-plans, and code seen broken
+                // is the one thing most worth one more (seen: a page whose list id the script misspelt, left broken for want of budget)
+                {
+                    let mut r = ctx.rec.lock().await;
+                    r.budget.max_replans = r.budget.max_replans.max(r.usage.replans + 1);
+                }
+                match self.replan(ctx, tier, goal, &brief, None).await {
+                    Ok(true) => {
+                        self.set_status(ctx, TaskStatus::Running).await;
+                        exec_err = self.execute_plan(ctx).await.err();
+                        if exec_err.is_some() || self.is_cancelled(ctx).await {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
         self.set_status(ctx, TaskStatus::Verifying).await;
         if phased {
             self.emit(ctx, EventKind::Phase { phase: "reviewing".into(), detail: "the result is judged against the request".into() }).await;
@@ -288,6 +328,20 @@ impl Inner {
         ctx.rec.lock().await.verification = Some(verification);
         let mode = ctx.rec.lock().await.mode.unwrap_or(mode);
         self.stage_answer(ctx, mode, exec_err.as_deref()).await;
+        // what validation saw broken is said in the answer, whoever wrote it: a model that writes "everything works" from the steps that
+        // ran must not be the last word (seen: "Nothing failed" over a page whose every API call the browser refused)
+        let broken: Vec<String> = ctx
+            .validation
+            .lock()
+            .iter()
+            .filter(|f| !f.ok)
+            .map(|f| format!("{} — {}", f.what, tokens::truncate_tokens(&f.evidence, 50).replace('\n', " ")))
+            .collect();
+        if !broken.is_empty() {
+            let mut r = ctx.rec.lock().await;
+            let a = r.final_answer.get_or_insert_with(String::new);
+            a.push_str(&format!("\n\n⚠ Tested, and still not working:\n- {}", broken.join("\n- ")));
+        }
         // what was held back for the user is said in the answer, whoever wrote it (a templated answer lists only what ran)
         let held = ctx.withheld.lock().clone();
         if !held.is_empty() {
@@ -319,6 +373,12 @@ impl Inner {
             Err(_) => Err("internal error: the resumed task panicked".to_string()),
         };
         self.finalize(&ctx, outcome).await;
+        // a directory server that refused this task's calls for want of a login is forgotten now, not by the next task's search
+        if !ctx.mcp.lock().is_empty()
+            && let Some(hub) = self.mcp.get().cloned()
+        {
+            hub.forget_locked().await;
+        }
         self.live.lock().remove(&ctx.id);
     }
 

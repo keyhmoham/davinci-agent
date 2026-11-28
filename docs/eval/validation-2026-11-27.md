@@ -335,3 +335,54 @@ change (hermetic test: two skipped runs, no task, no model call).
 Regression with the new plan schema and rules (every request now carries `agent` / `each` per step and two more prompt rules): bug fix,
 two fix loops, cross-session memory, the four injection pages, the four AgentDojo-style cases, the named guide edit and the Next.js build:
 **14/14**, $0.0235 in all.
+
+## Round 10: MCP discovery that reads before it connects (real Glama directory, 2026-11-28)
+
+Discovery was one 2–5 word query, one unfiltered page of `/v1/connectors`, and the top two usable results connected unseen. Now the
+worker writes, per outside service (at most two), the capability in a tool's own words and 2–3 searches; each search asks the
+directory for usable servers only (`attributes=auth:none`, plus `auth:api_key` with keys — the attribute keys were checked against
+`/v1/connectors/attributes`), the first also unfiltered; the lists are fused by rank, the best eight read in detail
+(`/v1/connectors/{namespace}/{slug}`: tools, read-only hints, documentation), ranked again on their **best single tool** (not on
+what the server calls itself), judged by the decision model on those tools, and only those near the best are connected.
+
+* Seen in the real directory, and handled: gateways that name themselves after the search ("Hacker News MCP … by Cotlet", tools
+  `cotlet_balance`, `cotlet_browser_click`, …) — ranked 1st on the old words, 5th now; a price in the title ("$0.01/query") — now
+  paid; wallet/balance tools — ranked down unless payments are asked for; a server listed as `auth:none` whose every call answers
+  HTTP 401 — forgotten at the end of the task and never connected again (`locked` in the saved state).
+* `LIVE_MCP=1 LIVE_CASES=mcp LIVE_RUNS=2`, clean MCP state: Wikipedia 2/2, GitHub 2/2 (one server connected instead of two),
+  Hacker News 2/2 after the login fix (1/2 before it), npm registry (new case, unprompted) 2/2 — **8/8**; HN alone 3/3 after.
+* The whole compose stack (a separate project on another port), five realistic requests that never say "MCP": GitHub stars and
+  latest release, the Eiffel Tower's height from Wikipedia, PyPI and crates.io versions (two needs → one server each), the weather
+  (answered from the web: not routed as an outside service), HN top story + its Wikipedia summary — **5/5 answered correctly**.
+* Still open: a known server that fits one part of a request (Wikipedia) keeps the directory from being searched for the other part
+  (Hacker News; the web served it); the planner cannot search the directory mid-task; nothing records which server served which need.
+
+## Round 11: signing in to MCP servers, and validating the code the agent writes (2026-11-28)
+
+**Sign-in (OAuth, MCP authorization spec 2025-11-25).** A server that only fits behind a sign-in is offered in the chat as a link; the
+task waits (`waiting_for_user`) until the provider sends the browser back to `/v1/mcp/oauth/callback`, then connects the server and goes on.
+Hermetic: a fake provider (401 + `resource_metadata`, PRM, AS metadata, DCR, PKCE checked, `resource` checked) — the task shows the link,
+the "user" follows it, the task completes with the tool's answer; the short-lived token is refreshed before use; the sealed store reopens
+the server in the next run. Live: discovery from the real directory works for Linear, Sentry, Atlassian, Notion and Slack gateways
+(10/12 OAuth connectors; the two Apify ones publish no metadata). "Using the Linear MCP server, list my open Linear issues" → the official
+Linear server, a real dynamic registration, `https://mcp.linear.app/authorize?…` in the chat (HTTP 200), the task waiting — the sign-in
+itself needs a person. Found on the way: the directory reports every OAuth connector `status:unhealthy` with 0 tools (its checker cannot
+sign in), so that flag is ignored for them; such servers crowded the open ones out of the shortlist until each kind got its own room; the
+official server is recognised by its endpoint's domain (`mcp.linear.app` for "linear").
+
+**Hardening.** The agent's commands run as the engine's user: in the old build `/proc/<engine>/environ` (every API key) was readable by
+them; the engine now makes itself non-dumpable (root-owned `/proc` files: verified unreadable). Sign-ins are sealed with ChaCha20-Poly1305.
+
+**Validation of written code** (`validate.rs`): tests/build, API routes vs. the frontend's calls (static) and asked live (proxy, 5xx, CORS),
+and the served page used in headless Chrome by the worker model through agent-browser 0.45.
+* Hermetic: a page calling `/api/itemz` against a backend with `/api/items` → caught with no request made, the planner gets the brief,
+  the patched plan runs, round 2 passes; with no repair round the answer says what stays broken.
+* Live, todo app (FastAPI + page): API calls matched, GET answered, the browser test added two todos and saw them listed — 8 worker
+  calls, ~5.3k tokens, $0.0010 of a $0.0095 task.
+* Live, notes app on two servers (CORS): round 0 caught a real bug the agent's own curl checks and answer ("verified end-to-end") missed —
+  `app.js` read `#notes`, the page had `#notes-list`; a later run caught `addEventListener` on a missing element; the repair round fixed it
+  and round 1 passed in the browser → **verified**. Bugs of the validator found and fixed on the way: the page was opened as `127.0.0.1`
+  while the app's CORS allowed `localhost`; an interactive-only snapshot hid the list items a result appears in (now the compact full tree
+  and its diff); the repair shared the re-plan budget the build had spent (now it has a round of its own); an answer said "Nothing failed"
+  over a failed validation (now what stays broken is appended).
+* Regression: live MCP cases (Wikipedia, GitHub, Hacker News, npm) 4/4, $0.0071; workspace 462 tests.

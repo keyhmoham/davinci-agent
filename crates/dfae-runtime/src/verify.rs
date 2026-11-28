@@ -244,6 +244,12 @@ impl Inner {
                 }
             }
         }
+        // the code was run and used: what that found is evidence like any check (a failure makes the result failed)
+        let validated: Vec<CheckResult> = ctx.validation.lock().iter().map(|f| f.to_check()).collect();
+        if validated.iter().any(|c| c.status == CheckStatus::Passed) {
+            tool_ok += 1;
+        }
+        checks.extend(validated);
         let total = rec.plan.as_ref().map(|p| p.steps.len()).unwrap_or(0);
         let checks_passed = checks.iter().filter(|c| c.status == CheckStatus::Passed).count();
         let checks_failed = checks.iter().filter(|c| c.status == CheckStatus::Failed).count();

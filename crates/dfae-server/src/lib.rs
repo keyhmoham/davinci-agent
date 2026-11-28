@@ -32,6 +32,7 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/cost", get(cost))
         .route("/v1/mcp/servers", get(mcp_servers).post(mcp_add))
         .route("/v1/mcp/servers/{name}", axum::routing::delete(mcp_remove))
+        .route("/v1/mcp/servers/{name}/sign-in", post(mcp_sign_in))
         .route("/v1/mcp/search", get(mcp_search))
         .route("/v1/board", get(board))
         .route("/v1/agents", get(list_agents).post(define_agent))
@@ -54,6 +55,9 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
+        // where an MCP provider sends the user's browser back after signing in: a browser carries no bearer token, so this is outside
+        // the API's auth; the one-time `state` (244 random bits, matched to a sign-in this engine started) is what authenticates it
+        .route("/v1/mcp/oauth/callback", get(mcp_oauth_callback))
         .merge(api)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
@@ -149,6 +153,52 @@ async fn mcp_search(State(s): State<AppState>, Query(q): Query<McpSearchQ>) -> A
     let found = hub.search(&q.q, q.limit.unwrap_or(10).min(50)).await.map_err(|e| err(StatusCode::BAD_GATEWAY, e.to_string()))?;
     let results: Vec<Value> = found.iter().map(|c| json!({"connector": c, "usable": c.open()})).collect();
     Ok(Json(json!({"results": results, "credit": dfae_mcp::CREDIT})))
+}
+
+/// Start a sign-in to a known server that wants one: the URL for the user to open.
+async fn mcp_sign_in(State(s): State<AppState>, Path(name): Path<String>) -> ApiResult<Value> {
+    let hub = s.engine.mcp().ok_or_else(|| err(StatusCode::NOT_FOUND, "MCP is not configured"))?;
+    let sign_in = hub.begin_sign_in_server(&name).await.map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({"server": sign_in.server, "url": sign_in.url})))
+}
+
+#[derive(Deserialize)]
+struct OAuthCallback {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+async fn mcp_oauth_callback(State(s): State<AppState>, Query(q): Query<OAuthCallback>) -> Response {
+    let page = |status: StatusCode, title: &str, text: &str| {
+        let esc = |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{}</title>\
+             <style>body{{font:16px system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem;color:#222}}h1{{font-size:1.4rem}}</style></head>\
+             <body><h1>{}</h1><p>{}</p></body></html>",
+            esc(title),
+            esc(title),
+            esc(text)
+        );
+        (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], html).into_response()
+    };
+    let Some(hub) = s.engine.mcp() else { return page(StatusCode::NOT_FOUND, "Not available", "MCP is not configured on this engine.") };
+    let Some(state) = q.state.as_deref().filter(|s| !s.is_empty()) else {
+        return page(StatusCode::BAD_REQUEST, "Sign-in not recognised", "The provider sent no state back.");
+    };
+    let error = q.error.as_deref().map(|e| match q.error_description.as_deref() {
+        Some(d) => format!("{e}: {d}"),
+        None => e.to_string(),
+    });
+    match hub.finish_sign_in(state, q.code.as_deref(), error.as_deref()).await {
+        Ok(title) => page(StatusCode::OK, &format!("Signed in to {title}"), "You can close this tab and go back to the chat: the task goes on by itself."),
+        Err(e) => page(StatusCode::BAD_REQUEST, "Sign-in not completed", &e),
+    }
 }
 
 #[derive(Deserialize)]

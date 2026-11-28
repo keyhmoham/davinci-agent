@@ -899,6 +899,35 @@ pub(crate) fn spawn_job(policy: &PolicyEngine, script: &str, cwd: &Path) -> Resu
     Ok(id)
 }
 
+/// A background job that is still running and said which port it listens on: what the agent has serving.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunningServer {
+    pub job_id: u32,
+    pub command: String,
+    pub cwd: PathBuf,
+    pub port: u16,
+}
+
+/// The servers the agent started that are still running (newest last).
+pub fn running_servers() -> Vec<RunningServer> {
+    let mut v: Vec<RunningServer> = JOBS
+        .lock()
+        .iter()
+        .filter(|(_, j)| j.exit.lock().is_none())
+        .filter_map(|(id, j)| j.port.map(|port| RunningServer { job_id: *id, command: j.command.clone(), cwd: j.cwd.clone(), port }))
+        .collect();
+    v.sort_by_key(|s| s.job_id);
+    v
+}
+
+/// What a background job printed lately (its last `chars` characters): a server's own log, for a check that failed against it.
+pub fn job_tail(job_id: u32, chars: usize) -> Option<String> {
+    let job = JOBS.lock().get(&job_id).cloned()?;
+    let out = job.out.lock();
+    let start = out.char_indices().rev().nth(chars.saturating_sub(1)).map(|(i, _)| i).unwrap_or(0);
+    Some(out[start..].to_string())
+}
+
 /// A server that dies at once (port in use, missing directory, syntax error) must not be reported as started: wait briefly,
 /// and if the job has exited, say why. Otherwise it is up (what it printed so far comes with the answer).
 pub(crate) async fn settle_job(id: u32, grace: Duration) -> Result<String, ToolError> {

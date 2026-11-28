@@ -177,3 +177,17 @@ async fn routines_and_the_board_over_http() {
     let fid = forged.json::<Value>().await.unwrap()["task_id"].as_str().unwrap().to_string();
     assert!(wait_done(&c, &base, &fid).await["request"]["routine"].is_null());
 }
+
+#[tokio::test]
+async fn the_sign_in_callback_is_reached_by_a_browser_without_the_api_token() {
+    let (base, _ws) = spawn(Some("s3cret")).await;
+    let c = reqwest::Client::new();
+    // the API itself wants the token…
+    assert_eq!(c.post(format!("{base}/v1/mcp/servers/x/sign-in")).send().await.unwrap().status(), 401);
+    // …the page a provider sends the browser back to does not (its one-time state is what is checked), and it answers in HTML
+    let r = c.get(format!("{base}/v1/mcp/oauth/callback?state=nope&code=x")).send().await.unwrap();
+    assert_ne!(r.status(), 401);
+    assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/html"));
+    let body = r.text().await.unwrap();
+    assert!(body.contains("<h1>") && !body.contains("<script"), "{body}");
+}

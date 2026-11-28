@@ -364,7 +364,20 @@ What the agent starts or builds is verified by asking it, not by trusting the st
   knowing the files of its project written before it (a module's tests see the module);
 - a **failed command** reaches the planner as the end of its output plus the distinct error lines above it (a test run's real cause is in the middle),
   a **patch** cannot lose work it does not replace, and an **edit** is bound with the file's text in front of the model and checked against it;
-- the **answer** to a question a tool or an MCP server answered with data is written from it, not shown as raw JSON.
+- the **answer** to a question a tool or an MCP server answered with data is written from it, not shown as raw JSON;
+- **the code a task wrote is run and used before the task is judged** (`validating`): the project's own tests and build (`npm test`,
+  `npm run build` or `tsc --noEmit` beside a running dev server, `pytest`, `cargo test`, `go test`), unless the plan already ran them after
+  its last edit; the **API and its wiring** — backend routes (Express-style, FastAPI/Flask, Next.js route files) and the frontend's
+  `fetch`/axios calls are read from the source and matched (a call to a route that does not exist, or with the wrong method, is caught with
+  no request made), then every GET the page makes is asked through the page's own server (a missing proxy answers 404 there), backend GET
+  routes must not answer 5xx (the server's log comes with the finding), and a cross-origin call needs its CORS header; and the **UI, end to
+  end**, in headless Chrome with [agent-browser](https://github.com/vercel-labs/agent-browser): the worker model uses the page like a user
+  (fill, click, submit, check the result shows), seeing only the interactive elements (`snapshot -i -c`) and, after each action, what changed
+  (`diff snapshot`) — a few hundred tokens a turn, `DFAE_UI_TURNS` (8) turns at most — while page errors, console errors and failed requests
+  are collected by the tool, not judged by the model. What fails goes to the planner as one repair round (`DFAE_VALIDATE_ROUNDS`) and is
+  tested again; the checks join the verification, so an answer never says it works when it was seen not to. (agent-browser drives web pages;
+  its sibling [agent-desktop](https://github.com/vercel-labs/agent-desktop) is for native desktop apps and itself says to use agent-browser
+  for the web.) `DFAE_VALIDATE=off`, `DFAE_UI_CHECK=off`, or `UI_TOOLS=0` at build time (−450 MB) turn parts off.
 
 Simple phrasings of the file operations bind directly and cost no model tokens (`move a.txt to b/a.txt`, `delete notes/old.txt`,
 `replace "foo()" with "bar()" in src/lib.rs`, `find files matching **/*.rs`, ``run `cargo test` ``). The container image ships git, ripgrep, curl, jq, make, gcc, python3 and friends
@@ -378,10 +391,12 @@ in a request that has something to do counts too, and so does saying "MCP"). The
 
 1. looks at the servers it already has (the registry: connected earlier in this run, reopened from the previous one, or configured) and uses the
    ones whose tools fit the request;
-2. if none does, has the worker model write a **2–5 word search query** (the only thing the directory hears of the request), searches the
-   [Glama MCP directory](https://glama.ai/mcp/reference) for remote servers, and connects the best ones that can be used as they are —
-   streamable HTTP, no login, not deprecated, not reported down. OAuth servers are skipped; one that wants an API key is used when
-   `DFAE_MCP_KEY_<SLUG>` is set;
+2. if none does, has the worker model write, per outside service, the capability in a tool's own words and **2–3 short searches** (the only
+   thing the directory hears of the request), searches the [Glama MCP directory](https://glama.ai/mcp/reference) filtered to servers it can
+   use (`attributes=auth:none`, `auth:oauth2`, `auth:api_key` with keys), fuses the ranked lists, reads the best eight in detail (their tools),
+   ranks them on their best tool, lets the decision model judge each on those tools, and connects the best ones that need nothing from you.
+   One that wants an API key is used when `DFAE_MCP_KEY_<SLUG>` is set; when only a server behind a sign-in fits, **you are asked to sign in**
+   (below);
 3. registers their tools as `mcp__<server>__<tool>` (the JSON Schema becomes typed parameters; objects and arrays are written as JSON text and
    parsed before the call) and **attaches them to that task only** — the planner's catalogue for an unrelated request never lists them;
 4. the planner plans with them, the worker binds their arguments, and a tool call is a normal step (retried, verified, re-planned).
@@ -390,6 +405,21 @@ A dropped connection is reopened once and the call repeated; a server that is do
 is not repeated for ten. Servers from the directory ask for approval (`DFAE_APPROVALS=ask`) before any tool that is not read-only;
 the output of every MCP tool is scanned for prompt injection like any other. Servers found are remembered in
 `~/.local/share/dfae/mcp.json` (outside the workspace, so the agent cannot add servers by writing a file) and reopened at start.
+
+**Signing in (OAuth).** A server that wants you to sign in is offered in the chat as a link: `sign in  Linear needs you to sign in. Open this
+link, sign in, and the task goes on by itself`. The engine does what the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+asks: from the server's 401 (`WWW-Authenticate: Bearer resource_metadata=…`) it finds the protected resource metadata and the authorization
+server (RFC 9728, RFC 8414 / OpenID discovery, in the spec's order), registers itself once per provider (dynamic client registration,
+a public client), and writes the sign-in URL with PKCE (S256), a one-time `state` and the server as `resource` (RFC 8707). The provider sends
+your browser back to `DFAE_PUBLIC_URL/v1/mcp/oauth/callback` — the engine's API as your browser reaches it, `http://localhost:8080` by default;
+MCP allows only `localhost` or `https` there — which needs no API token (the 244-bit `state` it started is what is checked), exchanges the
+code, connects the server and wakes the task, which was `waiting_for_user` (`DFAE_MCP_SIGN_IN_WAIT_SECS`, default 10 minutes; then it goes on
+without). Access tokens are sent on every request and refreshed when they expire or are refused; a sign-in that no longer works is forgotten
+and asked for again. Sign-ins are kept **encrypted** (ChaCha20-Poly1305, key derived from `DFAE_SECRET_KEY`, else `DFAE_API_TOKEN`; without
+either they live in memory only) in `mcp-oauth.json` beside the servers file, mode 0600 — the agent's commands run as the same user, so
+the file is sealed, its name is refused to the file tools, and the engine makes itself non-dumpable so no command can read its memory or
+environment from `/proc`. Checked against the real directory: Linear, Sentry, Atlassian (Jira/Confluence), Notion and Slack gateways publish
+what the flow needs; a server that does not is reported as such. `POST /v1/mcp/servers/{name}/sign-in` starts a sign-in to a server you added.
 
 Your own servers go in a file in the usual shape (`DFAE_MCP_SERVERS=/etc/dfae/mcp.json`):
 `{"mcpServers": {"files": {"command": "npx", "args": ["-y", "…"], "env": {"TOKEN": "${TOKEN}"}}, "docs": {"url": "https://…/mcp", "headers": {"Authorization": "Bearer ${DOCS_KEY}"}, "always": true}}}`.

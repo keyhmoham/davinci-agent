@@ -37,6 +37,12 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(if ok { 0 } else { 1 });
     }
     init_tracing(cfg.log_json);
+    // The agent's commands run as this same user: without this, any of them could read this process's environment (every API key)
+    // and memory (MCP sign-ins) from /proc. A non-dumpable process's /proc files belong to root.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        tracing::warn!("could not make the engine non-dumpable: its keys are readable by commands it runs");
+    }
     std::fs::create_dir_all(&cfg.workspace)?;
     tracing::info!(
         decision = if cfg.decision.base_url.is_some() { "open-model" } else { "local" },

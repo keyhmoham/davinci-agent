@@ -29,12 +29,20 @@ No model owns control flow, permissions, or the claim that a task is done.
    code, and sent back to the planner with typed issues only when code cannot fix it; the planner sees the whole tool
    catalogue (the decision model's tool choice only serves quick tasks and the worker-plans fallback).
    **MCP.** After routing, a request about an outside service attaches MCP servers to the task (`dfae-mcp`: connected ones that fit,
-   else the best of what the Glama directory finds for a short worker-written query); their tools are registered as `mcp__<server>__<tool>`
-   and visible to that task only (`TaskCtx::in_scope`).
+   else directory servers: the worker writes, per outside service, the capability in a tool's own words and 2–3 searches; each is
+   searched filtered to servers usable as they are (`attributes=auth:none`, plus `auth:api_key` with keys), the lists fused by rank,
+   the best read in detail (their tools) and ranked again on them, judged by the decision model on those tools, and only then connected); their tools are registered as `mcp__<server>__<tool>`
+   and visible to that task only (`TaskCtx::in_scope`). A server behind a sign-in (OAuth 2.1 per the MCP authorization spec: protected
+   resource metadata, dynamic client registration, PKCE, resource indicators) is offered as a link in the chat; the task waits
+   (`waiting_for_user`) until the provider sends the browser back to `/v1/mcp/oauth/callback` (`dfae-mcp::oauth`, `McpHub::finish_sign_in`).
 7. **Execute** — each brief step is bound just before it runs: rules and the extractor first, then the worker model
    (asked only for the parameters the step needs; file content is written as plain text, not squeezed into JSON), then the
    planner model. A bound `cwd` must exist; a background command that dies within 1.5 s is a failed step with its output.
    DAG waves with bounded parallelism (`DFAE_MAX_PARALLEL`).
+7b. **Validate** (`validate.rs`) — when the plan wrote code: the project's tests and build, the API's routes matched against the
+   frontend's calls and asked on the running servers (proxy, 5xx, CORS), and a served page used in headless Chrome by the worker model
+   through `agent-browser` (compact accessibility snapshots and diffs; page errors and failed requests collected by the tool). Failures go
+   to the planner as one repair round and are validated again; the findings join the verification.
 8. **Verify** — evidence-based; one continuation round if the completion judgment is low.
 9. **Answer** — templated (no model) unless reasoning steps produced material to compose; model-written
    answers are checked for ungrounded numbers/paths/URLs.

@@ -69,6 +69,8 @@ pub(crate) struct TaskCtx {
     /// What was held back for the user (`ErrorKind::Withheld`), one line each: every later re-plan is told, so it neither plans it again
     /// nor checks for it.
     pub withheld: Mutex<Vec<String>>,
+    /// What validating the code this task wrote found (the last round): it joins the verification.
+    pub validation: Mutex<Vec<crate::validate::Finding>>,
 }
 
 impl TaskCtx {
@@ -96,6 +98,7 @@ impl TaskCtx {
             planner_effort: Mutex::new(None),
             planner_rounds: std::sync::atomic::AtomicU32::new(0),
             withheld: Mutex::new(Vec::new()),
+            validation: Mutex::new(Vec::new()),
         })
     }
 
@@ -846,6 +849,13 @@ fn audit_worthy(kind: &EventKind) -> Option<(&'static str, Value)> {
         }
         EventKind::Final { status, .. } => Some(("final", json!({"status": status}))),
         EventKind::Warning { message } => Some(("warning", json!({"message": message}))),
+        // the sign-in URL carries a one-time state: the audit keeps who and what, not the link
+        EventKind::McpSignInRequired { server, title, .. } => Some(("mcp_sign_in_required", json!({"server": server, "title": title}))),
+        EventKind::Validated { round, checks } => Some((
+            "validated",
+            json!({"round": round, "failed": checks.iter().filter(|c| c.status == CheckStatus::Failed).map(|c| &c.description).collect::<Vec<_>>(), "checks": checks.len()}),
+        )),
+        EventKind::McpSignedIn { server, ok, detail } => Some(("mcp_signed_in", json!({"server": server, "ok": ok, "detail": detail}))),
         _ => None,
     }
 }

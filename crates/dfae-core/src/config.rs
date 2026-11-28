@@ -318,6 +318,7 @@ impl TeamConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mcp: McpConfig,
+    pub validate: ValidateConfig,
     pub bind: String,
     #[serde(skip_serializing)]
     pub api_token: Option<String>,
@@ -358,6 +359,19 @@ pub struct Config {
     pub log_json: bool,
 }
 
+/// Validation of the code a task wrote: its tests and build, its API and wiring, and its UI used in a browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidateConfig {
+    /// `DFAE_VALIDATE` (default on).
+    pub enabled: bool,
+    /// `DFAE_UI_CHECK` (default on): use a served page in a headless browser (`agent-browser`), when it is installed.
+    pub ui: bool,
+    /// `DFAE_UI_TURNS` (default 8): actions the UI test may take.
+    pub ui_turns: u32,
+    /// `DFAE_VALIDATE_ROUNDS` (default 1): repair rounds after a failed validation.
+    pub rounds: u32,
+}
+
 /// MCP (Model Context Protocol) servers as tools, and the directory they are found in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -377,6 +391,20 @@ pub struct McpConfig {
     pub state_path: Option<PathBuf>,
     /// `DFAE_MCP_TIMEOUT_SECS` (default 60): one tool call.
     pub call_timeout_secs: u64,
+    /// `DFAE_MCP_SIGN_IN` (default on): offer servers that want the user to sign in (OAuth), with a link in the chat.
+    pub sign_in: bool,
+    /// `DFAE_PUBLIC_URL` (default `http://localhost:<port of DFAE_BIND>`): where the user's browser reaches this engine's API; a
+    /// provider sends it back to `<this>/v1/mcp/oauth/callback` after signing in. MCP sign-in allows only `localhost` or `https`.
+    pub public_url: String,
+    /// `DFAE_MCP_SIGN_IN_WAIT_SECS` (default 600): how long a task waits for the user to sign in before it goes on without.
+    pub sign_in_wait_secs: u64,
+}
+
+impl McpConfig {
+    /// The callback a provider sends the user back to, when signing in is on.
+    pub fn redirect_uri(&self) -> Option<String> {
+        self.sign_in.then(|| format!("{}/v1/mcp/oauth/callback", self.public_url.trim_end_matches('/')))
+    }
 }
 
 impl McpConfig {
@@ -415,6 +443,12 @@ impl Config {
             }
         }
         Self {
+            validate: ValidateConfig {
+                enabled: env_bool("DFAE_VALIDATE", true),
+                ui: env_bool("DFAE_UI_CHECK", true),
+                ui_turns: env_parse("DFAE_UI_TURNS", 8u32).clamp(1, 30),
+                rounds: env_parse("DFAE_VALIDATE_ROUNDS", 1u32).min(3),
+            },
             mcp: McpConfig {
                 glama_api_key: env("GLAMA_API_KEY"),
                 glama_base_url: env_or("GLAMA_BASE_URL", "https://glama.ai/api/mcp").trim_end_matches('/').to_string(),
@@ -423,6 +457,12 @@ impl Config {
                 servers_file: env("DFAE_MCP_SERVERS").map(PathBuf::from),
                 state_path: env("DFAE_MCP_STATE").map(PathBuf::from),
                 call_timeout_secs: env_parse("DFAE_MCP_TIMEOUT_SECS", 60u64).clamp(5, 600),
+                sign_in: env_bool("DFAE_MCP_SIGN_IN", true),
+                public_url: env("DFAE_PUBLIC_URL").unwrap_or_else(|| {
+                    let bind = env_or("DFAE_BIND", "0.0.0.0:8080");
+                    format!("http://localhost:{}", bind.rsplit(':').next().unwrap_or("8080"))
+                }),
+                sign_in_wait_secs: env_parse("DFAE_MCP_SIGN_IN_WAIT_SECS", 600u64).clamp(30, 3600),
             },
             bind: env_or("DFAE_BIND", "0.0.0.0:8080"),
             api_token: env("DFAE_API_TOKEN"),

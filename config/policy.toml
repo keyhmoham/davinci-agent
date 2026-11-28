@@ -11,7 +11,7 @@ read_roots = ["{workspace}"]
 write_roots = ["{workspace}"]
 write_requires_approval = true
 # path components that are never touched, wherever they appear
-deny_names = [".git", ".env", "id_rsa", "id_ed25519", ".ssh", ".aws"]
+deny_names = [".git", ".env", "id_rsa", "id_ed25519", ".ssh", ".aws", "mcp-oauth.json"]
 
 [shell]
 # "sandbox": the shell tool is a full bash in the workspace (pipes, redirects, &&, git, build and test

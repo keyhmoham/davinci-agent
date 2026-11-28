@@ -29,11 +29,20 @@ pub enum McpError {
     Rpc { code: i64, message: String },
     #[error("timed out after {0}s")]
     Timeout(u64),
+    /// HTTP 401 or 403: credentials are missing, expired or not enough. `challenge` is the `WWW-Authenticate` header, which says where
+    /// to sign in (MCP authorization).
+    #[error("{message}")]
+    Unauthorized { status: u16, challenge: Option<String>, message: String },
 }
 
 impl McpError {
     pub fn retryable(&self) -> bool {
         matches!(self, McpError::Transport(_))
+    }
+
+    /// The server refused the call for want of credentials (HTTP 401 or 403): it cannot be used as it is, whatever its listing says.
+    pub fn needs_login(&self) -> bool {
+        matches!(self, McpError::Unauthorized { .. })
     }
 }
 
@@ -112,8 +121,13 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn connect(spec: &Spec, timeout: Duration) -> Result<Self, McpError> {
+        Self::connect_with(spec, timeout, None).await
+    }
+
+    /// Connect with the user's sign-in: every request carries its current access token.
+    pub async fn connect_with(spec: &Spec, timeout: Duration, grant: Option<Arc<crate::oauth::Grant>>) -> Result<Self, McpError> {
         let conn: Arc<dyn Conn> = match spec {
-            Spec::Http { url, headers } => Arc::new(HttpConn::new(url, headers)?),
+            Spec::Http { url, headers } => Arc::new(HttpConn::new(url, headers, grant)?),
             Spec::Stdio { command, args, env } => Arc::new(StdioConn::spawn(command, args, env)?),
         };
         let init = conn
@@ -205,13 +219,14 @@ struct HttpConn {
     http: reqwest::Client,
     url: String,
     headers: Vec<(String, String)>,
+    grant: Option<Arc<crate::oauth::Grant>>,
     session: parking_lot::Mutex<Option<String>>,
     protocol: parking_lot::Mutex<String>,
     next: AtomicU64,
 }
 
 impl HttpConn {
-    fn new(url: &str, headers: &BTreeMap<String, String>) -> Result<Self, McpError> {
+    fn new(url: &str, headers: &BTreeMap<String, String>, grant: Option<Arc<crate::oauth::Grant>>) -> Result<Self, McpError> {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err(McpError::Transport(format!("not an HTTP(S) URL: {url}")));
         }
@@ -220,6 +235,7 @@ impl HttpConn {
             http,
             url: url.to_string(),
             headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            grant,
             session: Default::default(),
             protocol: parking_lot::Mutex::new(PROTOCOL_VERSION.into()),
             next: AtomicU64::new(1),
@@ -241,6 +257,9 @@ impl HttpConn {
         for (k, v) in &self.headers {
             rb = rb.header(k, v);
         }
+        if let Some(t) = self.grant.as_ref().and_then(|g| g.token()) {
+            rb = rb.bearer_auth(t);
+        }
         rb
     }
 
@@ -256,8 +275,12 @@ impl HttpConn {
         if status.is_success() {
             return Ok(resp);
         }
+        let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).map(String::from);
         let text: String = resp.text().await.unwrap_or_default().chars().take(300).collect();
         let msg = format!("{} answered HTTP {status}: {text}", self.url);
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(McpError::Unauthorized { status: status.as_u16(), challenge, message: msg });
+        }
         // a session the server has forgotten, a server that is restarting or busy: worth another try after reconnecting
         Err(if status.is_server_error() || status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             McpError::Transport(msg)

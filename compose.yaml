@@ -166,6 +166,11 @@ services:
       DFAE_MCP_AUTO: ${DFAE_MCP_AUTO:-}
       DFAE_MCP_MAX_AUTO: ${DFAE_MCP_MAX_AUTO:-}
       DFAE_MCP_TIMEOUT_SECS: ${DFAE_MCP_TIMEOUT_SECS:-}
+      # MCP servers that want you to sign in (OAuth) are offered with a link in the chat; the provider sends your browser back to
+      # ${DFAE_PUBLIC_URL}/v1/mcp/oauth/callback, which must be this engine's API as your browser reaches it (localhost or https)
+      DFAE_MCP_SIGN_IN: ${DFAE_MCP_SIGN_IN:-true}
+      DFAE_PUBLIC_URL: ${DFAE_PUBLIC_URL:-http://localhost:${DFAE_PORT:-8080}}
+      DFAE_MCP_SIGN_IN_WAIT_SECS: ${DFAE_MCP_SIGN_IN_WAIT_SECS:-600}
       DFAE_API_TOKEN: ${DFAE_API_TOKEN:-}
       DFAE_ALLOW_AUTO_APPROVE: ${DFAE_ALLOW_AUTO_APPROVE:-false}
       # never (default): no tool call waits for a human. ask: risky calls wait for approval in the TUI.

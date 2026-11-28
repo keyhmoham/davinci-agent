@@ -133,6 +133,20 @@ fn describe(e: &Event) -> Option<String> {
         ),
         EventKind::Model { purpose, prompt_tokens, completion_tokens, .. } => format!("model     {purpose} {prompt_tokens}→{completion_tokens} tok"),
         EventKind::Warning { message } => format!("warning   {message}"),
+        EventKind::McpSignInRequired { title, url, wait_secs, .. } => {
+            format!("sign in   {title} needs you to sign in — open this link; the task goes on by itself (waiting {} min):\n  {url}", wait_secs / 60)
+        }
+        EventKind::McpSignedIn { detail, .. } => format!("sign in   {detail}"),
+        EventKind::Validated { round, checks } => {
+            let failed: Vec<String> =
+                checks.iter().filter(|c| c.status == CheckStatus::Failed).map(|c| format!("{} — {}", c.description, c.evidence)).collect();
+            format!(
+                "validate  round {round}: {}/{} passed{}",
+                checks.len() - failed.len(),
+                checks.len(),
+                if failed.is_empty() { String::new() } else { format!("\n  ✗ {}", failed.join("\n  ✗ ")) }
+            )
+        }
         _ => return None,
     })
 }

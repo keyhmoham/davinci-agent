@@ -4,6 +4,7 @@
 use crate::engine::{Inner, TaskCtx};
 use crate::prompts;
 use dfae_core::*;
+use dfae_mcp::{Candidate, Need};
 use regex::Regex;
 use std::sync::{Arc, LazyLock};
 
@@ -12,6 +13,10 @@ static MENTIONS_MCP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bmcps?
 
 /// Tools of one MCP server a task is shown at most.
 const MAX_TOOLS_SHOWN: usize = 8;
+/// Outside services one request is searched for at most.
+const MAX_NEEDS: usize = 2;
+/// Candidates of one need the decision model judges.
+const SHORTLIST_JUDGED: usize = 6;
 
 impl Inner {
     /// Attach the MCP servers this request needs to the task. `true` when its tools are now available.
@@ -24,18 +29,46 @@ impl Inner {
         let mut listings: std::collections::HashMap<String, String> = Default::default();
         // none does: look in the directory when the request is about an outside service
         if chosen.is_empty() && hub.discovery_enabled() && (routing.external || MENTIONS_MCP.is_match(goal)) {
-            let query = self.mcp_query(ctx, goal).await;
-            self.emit(ctx, EventKind::Phase { phase: "discovering".into(), detail: format!("searching the MCP directory for \"{query}\"") }).await;
-            match hub.discover(&query).await {
-                Ok(found) => {
-                    for f in found {
-                        listings.insert(f.server.clone(), f.listing);
-                        chosen.push((f.server, if f.known { "registry" } else { "glama" }));
+            let needs = self.mcp_needs(ctx, goal).await;
+            let searched: Vec<String> = needs.iter().flat_map(|n| n.queries.iter().map(|q| format!("\"{q}\""))).collect();
+            self.emit(ctx, EventKind::Phase { phase: "discovering".into(), detail: format!("searching the MCP directory for {}", searched.join(", ")) }).await;
+            // one shortlist per need, each read in detail (its tools), all judged in one decision call, then the best connected
+            let mut lists: Vec<(usize, Candidate)> = Vec::new();
+            let mut problems: Vec<String> = Vec::new();
+            for (i, need) in needs.iter().enumerate() {
+                match hub.shortlist(need).await {
+                    Ok(list) => lists.extend(list.candidates.into_iter().take(SHORTLIST_JUDGED).map(|c| (i, c))),
+                    Err(e) => problems.push(e.to_string()),
+                }
+            }
+            let fit = self.candidates_that_fit(ctx, goal, &needs, lists).await;
+            let per_need = if needs.len() > 1 { 1 } else { hub.max_auto() };
+            for (i, _) in needs.iter().enumerate() {
+                let picks: Vec<Candidate> = fit.iter().filter(|(n, _)| *n == i).map(|(_, c)| c.clone()).collect();
+                if picks.is_empty() {
+                    continue;
+                }
+                let mut connected = 0;
+                for f in hub.connect(&picks, per_need).await {
+                    connected += 1;
+                    if chosen.iter().any(|(n, _)| *n == f.server) {
+                        continue;
                     }
+                    listings.insert(f.server.clone(), f.listing);
+                    chosen.push((f.server, if f.known { "registry" } else { "glama" }));
                 }
-                Err(e) => {
-                    self.emit(ctx, EventKind::Warning { message: format!("no MCP server could be added for this request: {e}") }).await;
+                // no server that can be used as it is fits this need, and one behind a sign-in does: the user is asked to sign in
+                if connected == 0
+                    && let Some(c) = picks.iter().find(|c| c.sign_in)
+                    && let Some(f) = self.sign_in(ctx, &hub, c).await
+                {
+                    listings.insert(f.server.clone(), f.listing);
+                    chosen.push((f.server, "glama"));
                 }
+            }
+            if chosen.is_empty() {
+                let why = if problems.is_empty() { "the servers the directory has do not fit it".to_string() } else { problems.join("; ") };
+                self.emit(ctx, EventKind::Warning { message: format!("no MCP server could be added for this request: {why}") }).await;
             }
         }
         if chosen.is_empty() {
@@ -65,6 +98,51 @@ impl Inner {
             .await;
         }
         true
+    }
+
+    /// Ask the user to sign in to a directory server, in the chat, and wait for the provider to send them back (the engine's
+    /// callback finishes the sign-in and connects the server). `None`: the sign-in could not be started, failed, or was not done in time.
+    async fn sign_in(&self, ctx: &Arc<TaskCtx>, hub: &Arc<dfae_mcp::McpHub>, c: &Candidate) -> Option<dfae_mcp::Found> {
+        let wait = std::time::Duration::from_secs(self.cfg.mcp.sign_in_wait_secs);
+        let s = match hub.begin_sign_in(c).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.emit(ctx, EventKind::Warning { message: format!("{} needs you to sign in, but signing in cannot be started: {e}", c.connector.name) })
+                    .await;
+                return None;
+            }
+        };
+        self.emit(
+            ctx,
+            EventKind::McpSignInRequired {
+                server: s.server.clone(),
+                title: s.title.clone(),
+                url: s.url.clone(),
+                listing: s.listing.clone(),
+                wait_secs: wait.as_secs(),
+            },
+        )
+        .await;
+        self.set_status(ctx, TaskStatus::WaitingForUser).await;
+        let outcome = tokio::select! {
+            r = hub.wait_sign_in(&s.state, wait) => r,
+            _ = ctx.cancel.cancelled() => Err("cancelled".into()),
+        };
+        self.set_status(ctx, TaskStatus::Running).await;
+        match outcome {
+            Ok(f) => {
+                self.emit(
+                    ctx,
+                    EventKind::McpSignedIn { server: f.server.clone(), ok: true, detail: format!("signed in to {}: {} tool(s)", s.title, f.tools.len()) },
+                )
+                .await;
+                Some(f)
+            }
+            Err(e) => {
+                self.emit(ctx, EventKind::McpSignedIn { server: s.server.clone(), ok: false, detail: e }).await;
+                None
+            }
+        }
     }
 
     /// Of the known servers whose words match the request, the ones the decision model says can do what it needs (one yes/no per
@@ -103,18 +181,113 @@ impl Inner {
         candidates.into_iter().enumerate().filter(|(i, _)| resp.noul(&format!("server_{i}")).is_none_or(|p| p >= 0.5)).map(|(_, n)| n).collect()
     }
 
-    /// A few words that name the capability the request needs: one small call, and the words are all the directory ever hears of it.
-    async fn mcp_query(&self, ctx: &Arc<TaskCtx>, goal: &str) -> String {
-        let fallback = || dfae_core::text::content_tokens(goal).into_iter().filter(|t| t.len() > 2).take(5).collect::<Vec<_>>().join(" ");
+    /// Of the directory's candidates, the ones the decision model says can do what the request needs, judged on their tools as the
+    /// directory lists them (one yes/no per candidate, all in one call). Without a decision model the ranking stands.
+    async fn candidates_that_fit(&self, ctx: &Arc<TaskCtx>, goal: &str, needs: &[Need], cands: Vec<(usize, Candidate)>) -> Vec<(usize, Candidate)> {
+        if cands.is_empty() || self.decider.provider_name() == "local" {
+            return cands;
+        }
+        let mut questions = std::collections::BTreeMap::new();
+        for (i, (n, c)) in cands.iter().enumerate() {
+            let tools: Vec<String> = c
+                .tools
+                .iter()
+                .take(10)
+                .map(|t| {
+                    let d: String = t.description.clone().unwrap_or_default().chars().take(90).collect();
+                    if d.is_empty() { t.name.clone() } else { format!("{} ({d})", t.name) }
+                })
+                .collect();
+            let tools = if tools.is_empty() { "not listed".to_string() } else { tools.join("; ") };
+            let about: String = c.connector.description.clone().unwrap_or_default().chars().take(200).collect();
+            questions.insert(
+                format!("server_{i}"),
+                Question::noul(format!(
+                    "Can the outside service \"{}\" ({about}; its tools: {tools}) do this part of the request: \"{}\"? A service about something else does not fit, whatever words it shares with the request.",
+                    c.connector.name,
+                    needs.get(*n).map(|x| x.capability.as_str()).unwrap_or(goal)
+                )),
+            );
+        }
+        let req = DecisionRequest { kind: DecisionKind::SelectTools, state: self.decision_state(goal, &[]), questions };
+        let (resp, record, entry) = self.decider.decide(req).await;
+        if let Some(e) = entry {
+            self.add_ledger(ctx, e).await;
+        }
+        ctx.rec.lock().await.decisions.push(record);
+        if resp.provider == "local-fallback" {
+            return cands;
+        }
+        cands.into_iter().enumerate().filter(|(i, _)| resp.noul(&format!("server_{i}")).is_none_or(|p| p >= 0.5)).map(|(_, c)| c).collect()
+    }
+
+    /// What the request needs from the directory: one small call writes, per outside service, the capability in a tool's own words
+    /// and two or three searches (those words are all the directory ever hears of the request).
+    async fn mcp_needs(&self, ctx: &Arc<TaskCtx>, goal: &str) -> Vec<Need> {
+        let fallback = || {
+            let q = dfae_core::text::content_tokens(goal).into_iter().filter(|t| t.len() > 2).take(5).collect::<Vec<_>>().join(" ");
+            vec![Need { capability: goal.chars().take(200).collect(), queries: vec![q] }]
+        };
         let Some(tier) = self.pick_tier(ExecMode::Assisted) else { return fallback() };
         let mut req = self.gen_request(tier, prompts::MCP_QUERY_SYSTEM, tokens::truncate_tokens(goal, 200), "mcp_query");
-        req.max_tokens = 40;
+        req.max_tokens = 160;
         match self.generate_text(ctx, tier, req).await {
             Ok(text) => {
-                let q: String = text.trim().trim_matches(['"', '`', '\'', '.']).lines().next().unwrap_or("").chars().take(60).collect();
-                if q.trim().is_empty() { fallback() } else { q.trim().to_string() }
+                let needs = parse_needs(&text, goal);
+                if needs.is_empty() { fallback() } else { needs }
             }
             Err(_) => fallback(),
         }
+    }
+}
+
+/// `{"needs": [{"capability": ..., "queries": [...]}]}`, or a bare query on one line (what a small model may answer instead).
+fn parse_needs(text: &str, goal: &str) -> Vec<Need> {
+    let clean = |q: &str| -> String { q.trim().trim_matches(['"', '`', '\'', '.']).chars().take(60).collect::<String>().trim().to_string() };
+    let json = text.find('{').and_then(|a| text.rfind('}').map(|b| &text[a..=b])).and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok());
+    if let Some(v) = json {
+        let needs: Vec<Need> = v
+            .get("needs")
+            .and_then(|n| n.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .take(MAX_NEEDS)
+            .filter_map(|n| {
+                let queries: Vec<String> = n
+                    .get("queries")
+                    .and_then(|q| q.as_array())
+                    .map(|a| a.iter().filter_map(|q| q.as_str()).map(clean).filter(|q| !q.is_empty()).take(3).collect())
+                    .unwrap_or_default();
+                let capability: String = n.get("capability").and_then(|c| c.as_str()).unwrap_or("").trim().chars().take(200).collect();
+                if queries.is_empty() && capability.is_empty() {
+                    return None;
+                }
+                Some(Need { capability: if capability.is_empty() { queries[0].clone() } else { capability }, queries })
+            })
+            .collect();
+        return needs;
+    }
+    let q = clean(text.lines().find(|l| !l.trim().is_empty()).unwrap_or(""));
+    if q.is_empty() { vec![] } else { vec![Need { capability: goal.chars().take(200).collect(), queries: vec![q] }] }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_are_read_from_json_or_from_a_bare_query() {
+        let n = parse_needs(
+            r#"Sure: {"needs": [{"capability": "Read issues of a GitHub repository", "queries": ["github issues", "issue tracker"]},
+                {"capability": "Post a message to a Slack channel", "queries": ["slack"]}, {"capability": "x", "queries": ["y"]}]}"#,
+            "goal",
+        );
+        assert_eq!(n.len(), 2, "at most two needs");
+        assert_eq!(n[0].queries, vec!["github issues", "issue tracker"]);
+        assert_eq!(n[1].capability, "Post a message to a Slack channel");
+        let bare = parse_needs("\"weather forecast\"\n", "what is the weather in Paris");
+        assert_eq!(bare, vec![Need { capability: "what is the weather in Paris".into(), queries: vec!["weather forecast".into()] }]);
+        assert!(parse_needs("  ", "g").is_empty());
     }
 }

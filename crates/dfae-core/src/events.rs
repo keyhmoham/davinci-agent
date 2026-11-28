@@ -122,6 +122,27 @@ pub enum EventKind {
         /// The server's own page in the MCP directory it was found in (the directory's licence asks for the link).
         listing: Option<String>,
     },
+    /// The code this task wrote was tested (`round` 0 first, then after each repair).
+    Validated {
+        round: u32,
+        checks: Vec<CheckResult>,
+    },
+    /// An MCP server this task needs wants the user to sign in: open `url`, sign in, and the task goes on by itself (the provider
+    /// sends the browser back to the engine's callback).
+    McpSignInRequired {
+        server: String,
+        title: String,
+        url: String,
+        listing: Option<String>,
+        /// How long the task waits, in seconds.
+        wait_secs: u64,
+    },
+    /// The user signed in (`ok`), or the sign-in failed or was not done in time.
+    McpSignedIn {
+        server: String,
+        ok: bool,
+        detail: String,
+    },
     Warning {
         message: String,
     },

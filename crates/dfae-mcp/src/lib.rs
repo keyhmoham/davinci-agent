@@ -7,9 +7,10 @@
 pub mod client;
 pub mod glama;
 pub mod hub;
+pub mod oauth;
 mod tool;
 
 pub use client::{McpClient, McpError, Spec};
-pub use glama::{AuthType, CREDIT, Connector, Glama, GlamaError};
-pub use hub::{DiscoverError, Found, HubConfig, McpHub, Server, ServerView, Source, ToolView};
+pub use glama::{AuthType, CREDIT, Connector, Detail, DirTool, Glama, GlamaError, Page};
+pub use hub::{Candidate, DiscoverError, Found, HubConfig, McpHub, Need, Server, ServerView, Shortlist, SignIn, Source, ToolView};
 pub use tool::{server_name, server_of, tool_name};

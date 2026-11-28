@@ -502,6 +502,19 @@ fn cases() -> Vec<Case> {
             },
         },
         Case {
+            name: "mcp npm registry unprompted",
+            goal: "What is the latest published version of the npm package left-pad?",
+            then: &[],
+            between: None,
+            files: |_| {},
+            check: |_, t| {
+                let a = answer(t);
+                let via = used_mcp(t).unwrap_or_else(|| "web".into());
+                eprintln!("  (served by: {via})");
+                if a.contains("1.3.0") { Ok(()) } else { Err(format!("not 1.3.0 ({via}): {a}")) }
+            },
+        },
+        Case {
             name: "fixloop python three bugs",
             goal: "Run the tests with `python3 -m pytest -q` and fix the code until they all pass. Do not change the tests.",
             then: &[],
@@ -889,7 +902,7 @@ async fn harder_tasks_end_to_end() {
             if std::env::var("LIVE_EVENTS").is_ok() {
                 for ev in e.backlog(&t.task_id) {
                     let line = serde_json::to_string(&ev.kind).unwrap_or_default();
-                    if ["Mcp", "Warning", "Repaired", "mcp", "warning", "repaired"].iter().any(|k| line.contains(k)) {
+                    if ["Mcp", "Warning", "Repaired", "mcp", "warning", "repaired", "discovering"].iter().any(|k| line.contains(k)) {
                         eprintln!("    event: {}", line.chars().take(400).collect::<String>());
                     }
                 }

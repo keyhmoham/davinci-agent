@@ -53,6 +53,19 @@ RUN if [ "$DEV_TOOLS" = "1" ]; then \
 ARG NODE_VERSION=lts
 COPY deploy/docker/install-node.sh /tmp/install-node.sh
 RUN if [ "$DEV_TOOLS" = "1" ]; then /tmp/install-node.sh "$NODE_VERSION" /usr/local; fi; rm -f /tmp/install-node.sh
+# The validator's browser: agent-browser (headless Chrome for Testing driven through its accessibility tree) uses the pages the agent
+# builds like a user would. Chrome goes to /opt/agent-browser so the unprivileged user can run it; UI_TOOLS=0 leaves it out (~450 MB).
+ARG UI_TOOLS=1
+ARG AGENT_BROWSER_VERSION=0.45.0
+RUN if [ "$DEV_TOOLS" = "1" ] && [ "$UI_TOOLS" = "1" ]; then \
+      npm install -g "agent-browser@${AGENT_BROWSER_VERSION}" --no-audit --no-fund \
+   && HOME=/opt/agent-browser agent-browser install --with-deps \
+   && chrome="$(find /opt/agent-browser -type f -name chrome -perm -u+x | head -1)" \
+   && test -n "$chrome" && ln -s "$chrome" /usr/local/bin/dfae-chrome \
+   && chmod -R a+rX /opt/agent-browser \
+   && rm -rf /var/lib/apt/lists/* /root/.npm; \
+    fi
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/local/bin/dfae-chrome
 COPY --from=build /out/dfae-server /usr/local/bin/dfae-server
 COPY config/policy.toml /etc/dfae/policy.toml
 ENV DFAE_BIND=0.0.0.0:8080 \

@@ -57,6 +57,7 @@ shlex = "2"
 libc = "0.2"
 toml = "1"
 croner = "3"
+chacha20poly1305 = "0.10"
 chrono-tz = "0.10"
 
 [profile.release]

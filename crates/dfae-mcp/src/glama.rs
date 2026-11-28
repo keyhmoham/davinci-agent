@@ -64,6 +64,68 @@ struct RawConnector {
     boosted: bool,
     #[serde(default)]
     url: Option<String>,
+    #[serde(default)]
+    attributes: Vec<String>,
+    #[serde(default)]
+    repository: Option<RawRepository>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawRepository {
+    #[serde(default)]
+    url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RawAnnotations {
+    #[serde(default, rename = "readOnlyHint")]
+    read_only: Option<bool>,
+    #[serde(default, rename = "destructiveHint")]
+    destructive: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawTool {
+    name: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    annotations: Option<RawAnnotations>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawDetail {
+    #[serde(default)]
+    tools: Vec<RawTool>,
+    #[serde(default, rename = "documentationUrl")]
+    documentation_url: Option<String>,
+}
+
+/// A tool as the directory saw it at its last health check: what a connector can do, known before it is connected.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DirTool {
+    pub name: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub read_only: Option<bool>,
+    pub destructive: Option<bool>,
+}
+
+/// What the directory says about one connector beyond its list entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct Detail {
+    pub tools: Vec<DirTool>,
+    pub documentation: Option<String>,
+}
+
+/// One page of a search.
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub connectors: Vec<Connector>,
+    /// The cursor of the next page, when there is one.
+    pub next: Option<String>,
 }
 
 /// A remote MCP server from the directory.
@@ -87,6 +149,9 @@ pub struct Connector {
     pub promoted: bool,
     /// The connector's own page on Glama.
     pub listing: String,
+    /// The directory's attribute keys (`auth:none`, `capability:tools`, ...).
+    pub attributes: Vec<String>,
+    pub repository: Option<String>,
 }
 
 impl Connector {
@@ -107,6 +172,8 @@ impl Connector {
             deprecated: r.deprecated_at.is_some(),
             promoted: r.boosted,
             listing,
+            attributes: r.attributes,
+            repository: r.repository.and_then(|r| r.url),
         }
     }
 
@@ -115,7 +182,7 @@ impl Connector {
     pub fn paid(&self) -> bool {
         static PAID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
             regex::Regex::new(
-                r"(?i)\bx402\b|\busdc\b|\bpay[- ]per\b|\bper[- ](?:query|call|request)\b|\bpaid\b|\bcredits? required\b|\bpremium\b|\bmicropayments?\b",
+                r"(?i)\bx402\b|\busdc\b|\bpay[- ]per\b|\bper[- ](?:query|call|request)\b|\bpaid\b|\bcredits? required\b|\bpremium\b|\bmicropayments?\b|\$\s?\d+(?:\.\d+)?\s*/\s*(?:query|call|request)\b",
             )
             .unwrap()
         });
@@ -136,12 +203,52 @@ impl Glama {
 
     /// Remote servers that match `query`, most relevant first.
     pub async fn search(&self, query: &str, first: u32) -> Result<Vec<Connector>, GlamaError> {
-        let rb = self.http.get(format!("{}/v1/connectors", self.base)).bearer_auth(&self.key).query(&[
-            ("query", query),
-            ("first", &first.clamp(1, 100).to_string()),
-            ("sort", "search-relevance:desc"),
-        ]);
-        let resp = rb.send().await.map_err(|e| GlamaError::Failed(e.to_string()))?;
+        Ok(self.search_page(query, first, &[], None).await?.connectors)
+    }
+
+    /// One page of remote servers that match `query` and carry every attribute in `attributes` (the directory filters them, so a
+    /// page is not spent on servers this client cannot use), most relevant first. `after` is the cursor of an earlier page.
+    pub async fn search_page(&self, query: &str, first: u32, attributes: &[&str], after: Option<&str>) -> Result<Page, GlamaError> {
+        let mut params: Vec<(&str, String)> =
+            vec![("query", query.to_string()), ("first", first.clamp(1, 100).to_string()), ("sort", "search-relevance:desc".to_string())];
+        if !attributes.is_empty() {
+            params.push(("attributes", attributes.join(",")));
+        }
+        if let Some(a) = after {
+            params.push(("after", a.to_string()));
+        }
+        let v = self.get("/v1/connectors", &params).await?;
+        let raw: Vec<RawConnector> = serde_json::from_value(v.get("connectors").cloned().unwrap_or(serde_json::json!([])))
+            .map_err(|e| GlamaError::Failed(format!("unexpected answer: {e}")))?;
+        let info = v.get("pageInfo");
+        let next = info
+            .filter(|i| i.get("hasNextPage").and_then(|h| h.as_bool()) == Some(true))
+            .and_then(|i| i.get("endCursor"))
+            .and_then(|c| c.as_str())
+            .map(String::from);
+        Ok(Page { connectors: raw.into_iter().map(Connector::from_raw).collect(), next })
+    }
+
+    /// The connector's tools (names, descriptions, read-only and destructive hints) and documentation, as the directory last saw them.
+    pub async fn detail(&self, c: &Connector) -> Result<Detail, GlamaError> {
+        let v = self.get(&format!("/v1/connectors/{}/{}", c.namespace, c.slug), &[]).await?;
+        let raw: RawDetail = serde_json::from_value(v).map_err(|e| GlamaError::Failed(format!("unexpected answer: {e}")))?;
+        Ok(Detail {
+            tools: raw
+                .tools
+                .into_iter()
+                .map(|t| {
+                    let a = t.annotations.unwrap_or_default();
+                    DirTool { name: t.name, title: t.title, description: t.description, read_only: a.read_only, destructive: a.destructive }
+                })
+                .collect(),
+            documentation: raw.documentation_url,
+        })
+    }
+
+    async fn get(&self, path: &str, params: &[(&str, String)]) -> Result<serde_json::Value, GlamaError> {
+        let resp =
+            self.http.get(format!("{}{path}", self.base)).bearer_auth(&self.key).query(params).send().await.map_err(|e| GlamaError::Failed(e.to_string()))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(GlamaError::Unauthorized(status.as_u16()));
@@ -154,10 +261,7 @@ impl Glama {
             let body: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
             return Err(GlamaError::Failed(format!("HTTP {status}: {body}")));
         }
-        let v: serde_json::Value = resp.json().await.map_err(|e| GlamaError::Failed(format!("not JSON: {e}")))?;
-        let raw: Vec<RawConnector> = serde_json::from_value(v.get("connectors").cloned().unwrap_or(serde_json::json!([])))
-            .map_err(|e| GlamaError::Failed(format!("unexpected answer: {e}")))?;
-        Ok(raw.into_iter().map(Connector::from_raw).collect())
+        resp.json().await.map_err(|e| GlamaError::Failed(format!("not JSON: {e}")))
     }
 }
 

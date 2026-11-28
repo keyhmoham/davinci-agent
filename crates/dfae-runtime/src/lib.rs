@@ -31,6 +31,7 @@ mod style;
 mod syntax;
 pub mod team;
 mod trace;
+mod validate;
 mod verify;
 mod workspace;
 

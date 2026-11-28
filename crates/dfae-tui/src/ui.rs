@@ -504,6 +504,34 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 Style::new(),
             ),
             EventKind::Warning { message } => push(badge("warn", WARN), message.clone(), Style::new().fg(WARN)),
+            EventKind::McpSignInRequired { title, url, wait_secs, .. } => {
+                push(
+                    badge("sign in", WARN),
+                    format!("{title} needs you to sign in. Open this link, sign in, and the task goes on by itself (waiting {} min):", wait_secs / 60),
+                    Style::new().fg(WARN).bold(),
+                );
+                // the whole link, unclipped, on its own line: it must be copyable
+                out.push(Line::from(Span::styled(url.clone(), Style::new().fg(ACCENT).underlined())));
+            }
+            EventKind::Validated { round, checks } => {
+                let failed: Vec<&CheckResult> = checks.iter().filter(|c| c.status == CheckStatus::Failed).collect();
+                push(
+                    badge("validate", if failed.is_empty() { OK } else { BAD }),
+                    format!(
+                        "{}{}/{} checks passed{}",
+                        if *round > 0 { format!("after repair {round}: ") } else { String::new() },
+                        checks.len() - failed.len(),
+                        checks.len(),
+                        if failed.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · failing: {}", failed.iter().map(|c| format!("{} ({})", c.description, c.evidence)).collect::<Vec<_>>().join("; "))
+                        }
+                    ),
+                    Style::new(),
+                )
+            }
+            EventKind::McpSignedIn { ok, detail, .. } => push(badge("sign in", if *ok { OK } else { BAD }), detail.clone(), Style::new()),
             EventKind::Routine { action, detail, .. } => push(badge("routine", ACCENT), format!("{action}: {detail}"), Style::new()),
         }
     }
