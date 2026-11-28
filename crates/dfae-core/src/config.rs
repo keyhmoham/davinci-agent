@@ -391,20 +391,30 @@ pub struct McpConfig {
     pub state_path: Option<PathBuf>,
     /// `DFAE_MCP_TIMEOUT_SECS` (default 60): one tool call.
     pub call_timeout_secs: u64,
-    /// `DFAE_MCP_SIGN_IN` (default on): offer servers that want the user to sign in (OAuth), with a link in the chat.
+    /// `DFAE_MCP_SIGN_IN` (default on): offer servers that want the user to sign in (OAuth, done by mcpc), with a link in the chat.
     pub sign_in: bool,
-    /// `DFAE_PUBLIC_URL` (default `http://localhost:<port of DFAE_BIND>`): where the user's browser reaches this engine's API; a
-    /// provider sends it back to `<this>/v1/mcp/oauth/callback` after signing in. MCP sign-in allows only `localhost` or `https`.
+    /// `DFAE_PUBLIC_URL` (default `http://localhost:<port of DFAE_BIND>`): where the user's browser reaches this engine's API. A
+    /// browser that cannot reach mcpc's loopback callback can bring the provider's answer to `<this>/v1/mcp/oauth/callback`.
     pub public_url: String,
     /// `DFAE_MCP_SIGN_IN_WAIT_SECS` (default 600): how long a task waits for the user to sign in before it goes on without.
     pub sign_in_wait_secs: u64,
-}
-
-impl McpConfig {
-    /// The callback a provider sends the user back to, when signing in is on.
-    pub fn redirect_uri(&self) -> Option<String> {
-        self.sign_in.then(|| format!("{}/v1/mcp/oauth/callback", self.public_url.trim_end_matches('/')))
-    }
+    /// `DFAE_MCPC` (default `auto`): who authenticates and opens remote MCP servers. `auto`: the mcpc broker at
+    /// `DFAE_MCPC_BROKER_URL` if set, else mcpc on this machine if installed, else nobody (servers that need no credentials only).
+    /// `off`: never mcpc.
+    pub mcpc: String,
+    /// `DFAE_MCPC_BIN`: the mcpc executable (default: `mcpc` on `PATH`).
+    pub mcpc_bin: Option<PathBuf>,
+    /// `DFAE_MCPC_HOME`: mcpc's state (sessions, sign-ins) when the engine runs mcpc itself (default: `dfae/mcpc` beside the servers
+    /// file, outside the workspace).
+    pub mcpc_home: Option<PathBuf>,
+    /// `DFAE_MCPC_CALLBACK_PORT`: the port of mcpc's OAuth callback (default: mcpc's own, 13316, 31613 or 16133).
+    pub mcpc_callback_port: Option<u16>,
+    /// `DFAE_MCPC_BROKER_URL`: an mcpc broker in a container of its own (`dfae-server mcpc-broker`), where the sign-ins are out of the
+    /// agent's reach.
+    pub broker_url: Option<String>,
+    /// `DFAE_MCPC_BROKER_TOKEN`: what the engine and the broker share.
+    #[serde(skip_serializing)]
+    pub broker_token: Option<String>,
 }
 
 impl McpConfig {
@@ -463,6 +473,12 @@ impl Config {
                     format!("http://localhost:{}", bind.rsplit(':').next().unwrap_or("8080"))
                 }),
                 sign_in_wait_secs: env_parse("DFAE_MCP_SIGN_IN_WAIT_SECS", 600u64).clamp(30, 3600),
+                mcpc: env_or("DFAE_MCPC", "auto").to_ascii_lowercase(),
+                mcpc_bin: env("DFAE_MCPC_BIN").map(PathBuf::from),
+                mcpc_home: env("DFAE_MCPC_HOME").map(PathBuf::from),
+                mcpc_callback_port: env("DFAE_MCPC_CALLBACK_PORT").and_then(|p| p.parse().ok()),
+                broker_url: env("DFAE_MCPC_BROKER_URL").filter(|u| !u.trim().is_empty()),
+                broker_token: env("DFAE_MCPC_BROKER_TOKEN").filter(|t| !t.trim().is_empty()),
             },
             bind: env_or("DFAE_BIND", "0.0.0.0:8080"),
             api_token: env("DFAE_API_TOKEN"),

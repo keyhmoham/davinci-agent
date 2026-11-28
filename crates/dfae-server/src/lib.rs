@@ -1,4 +1,6 @@
-//! HTTP + SSE API over the engine.
+//! HTTP + SSE API over the engine, and the mcpc broker (`dfae-server mcpc-broker`).
+
+pub mod broker;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -33,6 +35,7 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .route("/v1/mcp/servers", get(mcp_servers).post(mcp_add))
         .route("/v1/mcp/servers/{name}", axum::routing::delete(mcp_remove))
         .route("/v1/mcp/servers/{name}/sign-in", post(mcp_sign_in))
+        .route("/v1/mcp/sign-ins", post(mcp_sign_in_answer))
         .route("/v1/mcp/search", get(mcp_search))
         .route("/v1/board", get(board))
         .route("/v1/agents", get(list_agents).post(define_agent))
@@ -55,8 +58,9 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), auth));
     Router::new()
         .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
-        // where an MCP provider sends the user's browser back after signing in: a browser carries no bearer token, so this is outside
-        // the API's auth; the one-time `state` (244 random bits, matched to a sign-in this engine started) is what authenticates it
+        // a provider sends the browser back to mcpc's loopback callback; a browser that cannot reach it (the engine on another
+        // machine) can bring the same query here instead. A browser carries no bearer token, so this is outside the API's auth: the
+        // one-time `state` of a sign-in this engine started (checked again by the broker) is what authenticates it
         .route("/v1/mcp/oauth/callback", get(mcp_oauth_callback))
         .merge(api)
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -65,7 +69,7 @@ pub fn router(engine: Engine, token: Option<String>) -> Router {
 
 // ---------------------------------------------------------------- auth -----
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -162,43 +166,46 @@ async fn mcp_sign_in(State(s): State<AppState>, Path(name): Path<String>) -> Api
     Ok(Json(json!({"server": sign_in.server, "url": sign_in.url})))
 }
 
-#[derive(Deserialize)]
-struct OAuthCallback {
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
+/// A small page for the browser.
+pub(crate) fn sign_in_page(status: StatusCode, title: &str, text: &str) -> Response {
+    let esc = |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{}</title>\
+         <style>body{{font:16px system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem;color:#222}}h1{{font-size:1.4rem}}</style></head>\
+         <body><h1>{}</h1><p>{}</p></body></html>",
+        esc(title),
+        esc(title),
+        esc(text)
+    );
+    (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], html).into_response()
 }
 
-async fn mcp_oauth_callback(State(s): State<AppState>, Query(q): Query<OAuthCallback>) -> Response {
-    let page = |status: StatusCode, title: &str, text: &str| {
-        let esc = |t: &str| t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-        let html = format!(
-            "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{}</title>\
-             <style>body{{font:16px system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem;color:#222}}h1{{font-size:1.4rem}}</style></head>\
-             <body><h1>{}</h1><p>{}</p></body></html>",
-            esc(title),
-            esc(title),
-            esc(text)
-        );
-        (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], html).into_response()
+async fn mcp_oauth_callback(State(s): State<AppState>, axum::extract::RawQuery(query): axum::extract::RawQuery) -> Response {
+    let Some(hub) = s.engine.mcp() else { return sign_in_page(StatusCode::NOT_FOUND, "Not available", "MCP is not configured on this engine.") };
+    let query = query.unwrap_or_default();
+    let Some(state) = dfae_mcp::broker::callback_state(&query) else {
+        return sign_in_page(StatusCode::BAD_REQUEST, "Sign-in not recognised", "The provider sent no state back.");
     };
-    let Some(hub) = s.engine.mcp() else { return page(StatusCode::NOT_FOUND, "Not available", "MCP is not configured on this engine.") };
-    let Some(state) = q.state.as_deref().filter(|s| !s.is_empty()) else {
-        return page(StatusCode::BAD_REQUEST, "Sign-in not recognised", "The provider sent no state back.");
-    };
-    let error = q.error.as_deref().map(|e| match q.error_description.as_deref() {
-        Some(d) => format!("{e}: {d}"),
-        None => e.to_string(),
-    });
-    match hub.finish_sign_in(state, q.code.as_deref(), error.as_deref()).await {
-        Ok(title) => page(StatusCode::OK, &format!("Signed in to {title}"), "You can close this tab and go back to the chat: the task goes on by itself."),
-        Err(e) => page(StatusCode::BAD_REQUEST, "Sign-in not completed", &e),
+    match hub.finish_sign_in(&state, &query).await {
+        Ok(title) => {
+            sign_in_page(StatusCode::OK, &format!("Signed in to {title}"), "You can close this tab and go back to the chat: the task goes on by itself.")
+        }
+        Err(e) => sign_in_page(StatusCode::BAD_REQUEST, "Sign-in not completed", &e),
     }
+}
+
+#[derive(Deserialize)]
+struct SignInAnswer {
+    /// The address the browser landed on after signing in (`http://127.0.0.1:13316/callback?code=…&state=…`), or just its query.
+    url: String,
+}
+
+/// The answer to a sign-in, pasted: for a browser on another machine than mcpc, which lands on a page that does not load.
+async fn mcp_sign_in_answer(State(s): State<AppState>, Json(a): Json<SignInAnswer>) -> ApiResult<Value> {
+    let hub = s.engine.mcp().ok_or_else(|| err(StatusCode::NOT_FOUND, "MCP is not configured"))?;
+    let state = dfae_mcp::broker::callback_state(&a.url).ok_or_else(|| err(StatusCode::BAD_REQUEST, "the address has no state: paste the whole address"))?;
+    let title = hub.finish_sign_in(&state, &a.url).await.map_err(|e| err(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({"signed_in": title})))
 }
 
 #[derive(Deserialize)]

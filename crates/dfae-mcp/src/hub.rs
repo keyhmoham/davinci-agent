@@ -1,9 +1,9 @@
 //! The MCP hub: the servers the engine knows (the operator's, and those found in the directory), their tools in the engine's
 //! tool registry, and the finding of new ones on demand.
 
+use crate::broker::{Broker, BrokerError, DirectBroker};
 use crate::client::{CallResult, McpClient, McpError, Spec};
 use crate::glama::{AuthType, Connector, Detail, DirTool, Glama, GlamaError};
-use crate::oauth::{self, Grant, Store};
 use crate::tool::{McpTool, server_of, slug};
 use dfae_tools::ToolRegistry;
 use parking_lot::{Mutex, RwLock};
@@ -14,21 +14,31 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// One server's connection, opened when first needed and again after it breaks.
+/// One server's connection, opened when first needed and again after it breaks. A remote server is opened by the broker (with mcpc:
+/// its session's local proxy); a local (stdio) one is started by the engine's own client.
 pub(crate) struct Link {
     spec: Spec,
+    /// The engine's name for the server, which the broker knows its session by.
+    server: String,
+    broker: Arc<dyn Broker>,
     client: tokio::sync::Mutex<Option<Arc<McpClient>>>,
     connect_timeout: Duration,
     call_timeout: Duration,
     /// A call was refused for want of credentials.
     locked: std::sync::atomic::AtomicBool,
-    /// The user's sign-in, for a server that wants one.
-    grant: Option<Arc<Grant>>,
 }
 
 impl Link {
-    fn new(spec: Spec, connect_timeout: Duration, call_timeout: Duration, grant: Option<Arc<Grant>>) -> Arc<Self> {
-        Arc::new(Self { spec, client: tokio::sync::Mutex::new(None), connect_timeout, call_timeout, locked: Default::default(), grant })
+    fn new(server: &str, spec: Spec, broker: Arc<dyn Broker>, connect_timeout: Duration, call_timeout: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            spec,
+            server: server.to_string(),
+            broker,
+            client: tokio::sync::Mutex::new(None),
+            connect_timeout,
+            call_timeout,
+            locked: Default::default(),
+        })
     }
 
     fn locked(&self) -> bool {
@@ -40,13 +50,15 @@ impl Link {
         if let Some(c) = slot.as_ref() {
             return Ok(c.clone());
         }
-        // an access token that has expired is refreshed before it is sent
-        if let Some(g) = &self.grant
-            && g.token().is_none()
-        {
-            g.refresh().await;
-        }
-        let c = Arc::new(McpClient::connect_with(&self.spec, self.connect_timeout, self.grant.clone()).await?);
+        let spec = match &self.spec {
+            Spec::Http { url, headers } => self.broker.open(&self.server, url, headers).await.map_err(|e| match e {
+                BrokerError::NeedsLogin(m) => McpError::Unauthorized { status: 401, challenge: None, message: m },
+                BrokerError::Unsupported(m) => McpError::Protocol(m),
+                BrokerError::Failed(m) => McpError::Transport(m),
+            })?,
+            local => local.clone(),
+        };
+        let c = Arc::new(McpClient::connect(&spec, self.connect_timeout).await?);
         *slot = Some(c.clone());
         Ok(c)
     }
@@ -60,34 +72,44 @@ impl Link {
         broken.close().await;
     }
 
-    /// One tool call; a broken connection is opened again once, and a refused sign-in is refreshed once.
+    /// One tool call; a broken connection is opened again once (the broker reopens a session whose bridge died). A server that
+    /// refused what the broker holds for it (a sign-in that could not be refreshed) is marked locked.
     pub(crate) async fn call(&self, tool: &str, args: Value) -> Result<CallResult, McpError> {
         let mut last = McpError::Transport("not connected".into());
-        let mut refreshed = false;
         for _ in 0..2 {
             let client = self.client().await?;
             match client.call_tool(tool, args.clone(), self.call_timeout).await {
+                Err(e) if e.needs_login() => {
+                    self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(e);
+                }
                 Err(e) if e.retryable() => {
                     self.reset(&client).await;
                     last = e;
                 }
-                Err(e) if e.needs_login() => {
-                    if let Some(g) = &self.grant
-                        && !refreshed
-                        && g.refresh().await
-                    {
-                        refreshed = true;
-                        self.reset(&client).await;
-                        last = e;
-                        continue;
-                    }
-                    self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
-                    return Err(e);
-                }
-                other => return other,
+                Err(e) => return Err(self.why(e).await),
+                ok => return ok,
             }
         }
-        Err(last)
+        Err(self.why(last).await)
+    }
+
+    /// A failed call through the broker: was it the sign-in? (mcpc's proxy answers for a session whose sign-in no longer works.)
+    async fn why(&self, e: McpError) -> McpError {
+        if matches!(self.spec, Spec::Http { .. }) && self.broker.unauthorized(&self.server).await {
+            self.locked.store(true, std::sync::atomic::Ordering::Relaxed);
+            return McpError::Unauthorized { status: 401, challenge: None, message: format!("the server refused the sign-in: {e}") };
+        }
+        e
+    }
+
+    async fn close(&self) {
+        if let Some(c) = self.client.lock().await.take() {
+            c.close().await;
+        }
+        if matches!(self.spec, Spec::Http { .. }) {
+            self.broker.close(&self.server).await;
+        }
     }
 }
 
@@ -122,6 +144,8 @@ pub struct Server {
     spec: Spec,
     /// Part of the operator's configuration: offered to every task, not only to those it looks relevant to.
     always: bool,
+    /// Opened with the user's sign-in (the broker holds it).
+    signed_in: bool,
     link: Arc<Link>,
     tools: Mutex<Vec<String>>,
     doc: Mutex<String>,
@@ -217,13 +241,10 @@ pub struct HubConfig {
     pub max_auto: usize,
     /// Credentials for directory servers that want an API key: `DFAE_MCP_KEY_<SLUG>` in the environment, sent as a bearer token.
     pub keys: BTreeMap<String, String>,
-    /// Where servers found in the directory are remembered (and, beside it in `mcp-oauth.json`, the user's sign-ins).
+    /// Where servers found in the directory are remembered (the sign-ins themselves are the broker's: mcpc keeps them).
     pub state_path: Option<PathBuf>,
-    /// Where an MCP provider sends the user's browser back after signing in (`…/v1/mcp/oauth/callback` of this engine's API). Without
-    /// it, servers that want a sign-in are not offered.
-    pub redirect_uri: Option<String>,
-    /// What the sign-in store's key is derived from (`DFAE_SECRET_KEY`, else the API token). Without it, sign-ins live in memory only.
-    pub secret: Option<String>,
+    /// Offer servers that want the user to sign in (when the broker can sign in at all).
+    pub sign_in: bool,
 }
 
 impl Default for HubConfig {
@@ -234,8 +255,7 @@ impl Default for HubConfig {
             max_auto: 2,
             keys: BTreeMap::new(),
             state_path: None,
-            redirect_uri: None,
-            secret: None,
+            sign_in: true,
         }
     }
 }
@@ -258,7 +278,7 @@ enum SignInState {
 }
 
 struct Pending {
-    flow: oauth::Flow,
+    url: String,
     name: String,
     title: String,
     endpoint: String,
@@ -298,7 +318,7 @@ struct Saved {
     description: String,
     /// The slug a key was looked up under (`keys`), if the server needed one: the key itself is never written down.
     key: Option<String>,
-    /// The user signed in to it (the tokens are in the sign-in store, not here).
+    /// The user signed in to it (the tokens are mcpc's, not here).
     #[serde(default)]
     oauth: bool,
 }
@@ -316,16 +336,20 @@ pub struct McpHub {
     details: Mutex<std::collections::HashMap<String, (std::time::Instant, Detail)>>,
     /// Endpoints of directory servers that refused calls for want of credentials.
     locked: Mutex<HashSet<String>>,
-    /// The user's sign-ins and this engine's registrations with authorization servers.
-    oauth: Arc<Store>,
+    /// Who opens remote servers and signs the user in to them (mcpc, or nobody).
+    broker: Arc<dyn Broker>,
     /// Sign-ins waiting for the provider's answer, by `state`.
     pending: Mutex<std::collections::HashMap<String, Pending>>,
 }
 
 impl McpHub {
+    /// A hub without a broker: remote servers are connected as they are, and none that wants a sign-in is offered.
     pub fn new(registry: ToolRegistry, cfg: HubConfig, glama: Option<Glama>) -> Arc<Self> {
-        let cfg_oauth_path = cfg.state_path.as_ref().map(|p| p.with_file_name("mcp-oauth.json"));
-        let cfg_secret = cfg.secret.clone();
+        Self::with_broker(registry, cfg, glama, Arc::new(DirectBroker))
+    }
+
+    /// A hub whose remote servers are opened, and signed in to, by `broker`.
+    pub fn with_broker(registry: ToolRegistry, cfg: HubConfig, glama: Option<Glama>, broker: Arc<dyn Broker>) -> Arc<Self> {
         Arc::new(Self {
             registry,
             cfg,
@@ -335,7 +359,7 @@ impl McpHub {
             misses: Mutex::new(Default::default()),
             details: Mutex::new(Default::default()),
             locked: Mutex::new(Default::default()),
-            oauth: Store::open(cfg_oauth_path, cfg_secret.as_deref()),
+            broker,
             pending: Mutex::new(Default::default()),
         })
     }
@@ -348,33 +372,29 @@ impl McpHub {
         self.cfg.max_auto
     }
 
+    /// `mcpc`, `mcpc-remote` or `direct`.
+    pub fn broker_kind(&self) -> &'static str {
+        self.broker.kind()
+    }
+
+    /// Can the user be asked to sign in to servers?
+    pub fn signs_in(&self) -> bool {
+        self.cfg.sign_in && self.broker.signs_in()
+    }
+
     // ---------------------------------------------------------------- servers ----
 
     /// Make a server known and open it. Its tools join the tool registry (hidden from tasks until a task attaches the server).
+    /// A remote server is opened by the broker, with the user's sign-in if the broker holds one for it.
     pub async fn add(&self, name: &str, spec: Spec, source: Source, listing: Option<String>, description: &str, always: bool) -> Result<Arc<Server>, McpError> {
-        // a server the user signed in to before is opened with that sign-in
-        let grant = match &spec {
-            Spec::Http { url, headers } if !headers.contains_key("Authorization") => self.oauth.get(url).map(|s| Grant::new(s, Some(self.oauth.clone()))),
-            _ => None,
-        };
-        self.add_with(name, spec, source, listing, description, always, grant).await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn add_with(
-        &self,
-        name: &str,
-        spec: Spec,
-        source: Source,
-        listing: Option<String>,
-        description: &str,
-        always: bool,
-        grant: Option<Arc<Grant>>,
-    ) -> Result<Arc<Server>, McpError> {
         let name = slug(name);
         if name.is_empty() {
             return Err(McpError::Protocol("a server needs a name".into()));
         }
+        let signed_in = match &spec {
+            Spec::Http { url, headers } if !headers.keys().any(|k| k.eq_ignore_ascii_case("authorization")) => self.broker.signed_in(url).await,
+            _ => false,
+        };
         let existing = self.servers.read().get(&name).cloned();
         let server = match existing {
             Some(s) if s.spec == spec => s,
@@ -385,9 +405,10 @@ impl McpHub {
                     source,
                     listing,
                     description: description.to_string(),
-                    link: Link::new(spec.clone(), self.cfg.connect_timeout, self.cfg.call_timeout, grant),
+                    link: Link::new(&name, spec.clone(), self.broker.clone(), self.cfg.connect_timeout, self.cfg.call_timeout),
                     spec,
                     always,
+                    signed_in,
                     tools: Mutex::new(vec![]),
                     doc: Mutex::new(String::new()),
                     error: Mutex::new(None),
@@ -451,9 +472,7 @@ impl McpHub {
     pub async fn remove(&self, name: &str) -> bool {
         let Some(s) = self.servers.write().remove(name) else { return false };
         self.registry.unregister_prefix(&format!("mcp__{}__", s.name));
-        if let Ok(c) = s.link.client().await {
-            c.close().await;
-        }
+        s.link.close().await;
         self.save();
         true
     }
@@ -521,11 +540,11 @@ impl McpHub {
     /// offered for a new sign-in the next time it is needed.
     pub async fn forget_locked(&self) {
         let locked: Vec<Arc<Server>> =
-            self.servers.read().values().filter(|s| s.link.locked() && (s.source == Source::Glama || s.link.grant.is_some())).cloned().collect();
+            self.servers.read().values().filter(|s| s.link.locked() && (s.source == Source::Glama || s.signed_in)).cloned().collect();
         for s in locked {
-            if let Some(g) = &s.link.grant {
+            if let (true, Spec::Http { url, .. }) = (s.signed_in, &s.spec) {
                 tracing::info!(server = %s.name, "the sign-in to an MCP server no longer works: the user is asked again next time");
-                self.oauth.forget(&g.resource());
+                self.broker.logout(url).await;
             } else {
                 if let Spec::Http { url, .. } = &s.spec {
                     self.locked.lock().insert(url.clone());
@@ -584,8 +603,8 @@ impl McpHub {
         if !self.cfg.keys.is_empty() {
             filters.push(&["auth:api_key"]);
         }
-        // with a callback to send the user back to, servers that want a sign-in are offered too
-        if self.cfg.redirect_uri.is_some() {
+        // with a broker that signs the user in, servers that want a sign-in are offered too
+        if self.signs_in() {
             filters.push(&["auth:oauth2"]);
         }
         let mut searches: Vec<(&str, &[&str])> = vec![(queries[0].as_str(), &[])];
@@ -633,7 +652,7 @@ impl McpHub {
             // the directory's health check cannot sign in: every server behind one reads "unhealthy" with no tools (seen: the official
             // Linear), so for those it says nothing; whether it answers is asked when the sign-in starts
             let reachable_signed = !c.deprecated && c.transport == "streamable_http" && !c.paid();
-            let ok = c.open() || (matches!(c.auth, AuthType::ApiKey) && key.is_some() && reachable) || (self.signs_in(&c) && reachable_signed);
+            let ok = c.open() || (matches!(c.auth, AuthType::ApiKey) && key.is_some() && reachable) || (self.can_sign_in(&c) && reachable_signed);
             if ok {
                 usable.push((score, c, key));
             } else if skipped.len() < 4 {
@@ -659,7 +678,7 @@ impl McpHub {
         let mut candidates: Vec<Candidate> = Vec::new();
         for ((fusion, c, key), detail) in usable.into_iter().zip(details) {
             let detail = detail.unwrap_or_default();
-            let sign_in = c.auth == AuthType::Oauth2 && self.oauth.get(&c.endpoint).is_none();
+            let sign_in = c.auth == AuthType::Oauth2 && !self.broker.signed_in(&c.endpoint).await;
             // a server the directory saw with no tools has nothing to offer (one behind a sign-in shows none until signed in)
             if detail.tools.is_empty() && c.tool_count == 0 && c.healthy == Some(true) && c.auth != AuthType::Oauth2 {
                 continue;
@@ -799,14 +818,13 @@ impl McpHub {
     // ---------------------------------------------------------------- sign-in ----
 
     /// Can the user be asked to sign in to this directory server?
-    fn signs_in(&self, c: &Connector) -> bool {
-        c.auth == AuthType::Oauth2 && self.cfg.redirect_uri.is_some() && !c.attributes.iter().any(|a| a == "oauth:unavailable")
+    fn can_sign_in(&self, c: &Connector) -> bool {
+        c.auth == AuthType::Oauth2 && self.signs_in() && !c.attributes.iter().any(|a| a == "oauth:unavailable")
     }
 
-    /// Ask the user to sign in to a directory server: find its authorization server from its 401, register this engine with it
-    /// (once), and return the URL to open. The provider sends the browser back to [`HubConfig::redirect_uri`], whose handler calls
-    /// [`McpHub::finish_sign_in`].
-    pub async fn begin_sign_in(&self, c: &Candidate) -> Result<SignIn, String> {
+    /// Ask the user to sign in to a directory server: the broker (mcpc) finds its authorization server, registers with it and writes
+    /// the URL to open. Once the user has signed in, the server is connected by itself; [`McpHub::wait_sign_in`] waits for that.
+    pub async fn begin_sign_in(self: &Arc<Self>, c: &Candidate) -> Result<SignIn, String> {
         let mut name = slug(&c.connector.slug);
         if self.servers.read().get(&name).is_some_and(|s| !matches!(&s.spec, Spec::Http { url, .. } if *url == c.connector.endpoint)) {
             name = slug(&format!("{}_{}", c.connector.namespace, c.connector.slug));
@@ -822,126 +840,125 @@ impl McpHub {
         .await
     }
 
-    /// What signing in to `endpoint` would take, read from its public metadata only (a diagnostic: nothing is registered).
-    pub async fn probe_sign_in(endpoint: &str) -> String {
-        let challenge = match probe(endpoint, Duration::from_secs(20)).await {
-            Ok(c) => c,
-            Err(e) => return format!("unreachable: {}", e.chars().take(80).collect::<String>()),
-        };
-        match oauth::discover(endpoint, &challenge).await {
-            Ok(a) => format!(
-                "ok: issuer {} · {} · scopes [{}]",
-                a.issuer,
-                if a.registration_endpoint.is_some() { "self-registration" } else { "NO self-registration" },
-                a.scopes.join(" ")
-            ),
-            Err(e) => format!("no: {e}"),
-        }
-    }
-
     /// Ask the user to sign in to a server that is already known (the operator's, or one added through the API) and refused for want
     /// of it.
-    pub async fn begin_sign_in_server(&self, name: &str) -> Result<SignIn, String> {
+    pub async fn begin_sign_in_server(self: &Arc<Self>, name: &str) -> Result<SignIn, String> {
         let s = self.servers.read().get(name).cloned().ok_or_else(|| format!("no MCP server '{name}'"))?;
         let Spec::Http { url, .. } = &s.spec else { return Err("a local (stdio) server takes its credentials from its environment".into()) };
         self.begin(&s.name, &s.name, url, s.listing.clone(), &s.description, s.source).await
     }
 
-    async fn begin(&self, name: &str, title: &str, endpoint: &str, listing: Option<String>, description: &str, source: Source) -> Result<SignIn, String> {
-        let redirect = self.cfg.redirect_uri.clone().ok_or("signing in to MCP servers is not configured (no callback URL)")?;
+    async fn begin(
+        self: &Arc<Self>,
+        name: &str,
+        title: &str,
+        endpoint: &str,
+        listing: Option<String>,
+        description: &str,
+        source: Source,
+    ) -> Result<SignIn, String> {
+        if !self.signs_in() {
+            return Err("signing in to MCP servers needs mcpc (install @apify/mcpc, or set DFAE_MCPC_BROKER_URL)".into());
+        }
         // one link per server at a time: a second task that needs it waits for the same sign-in
         let existing = {
             let pending = self.pending.lock();
             pending.iter().find(|(_, p)| p.endpoint == endpoint && p.started.elapsed() < SIGN_IN_TTL && matches!(*p.status.borrow(), SignInState::Waiting)).map(
-                |(state, p)| SignIn {
-                    state: state.clone(),
-                    url: p.flow.url.clone(),
-                    server: p.name.clone(),
-                    title: p.title.clone(),
-                    listing: p.listing.clone(),
-                },
+                |(state, p)| SignIn { state: state.clone(), url: p.url.clone(), server: p.name.clone(), title: p.title.clone(), listing: p.listing.clone() },
             )
         };
         if let Some(s) = existing {
             return Ok(s);
         }
-        let challenge = probe(endpoint, self.cfg.connect_timeout).await?;
-        let server = oauth::discover(endpoint, &challenge).await.map_err(|e| e.to_string())?;
-        let client = match self.oauth.client(&server.issuer, &redirect) {
-            Some(c) => c,
-            None => {
-                let c = oauth::register(&server, &redirect).await.map_err(|e| e.to_string())?;
-                self.oauth.put_client(&server.issuer, c.clone());
-                c
-            }
-        };
-        let flow = oauth::Flow::start(server, client).map_err(|e| e.to_string())?;
-        let sign_in = SignIn { state: flow.state.clone(), url: flow.url.clone(), server: slug(name), title: title.to_string(), listing: listing.clone() };
+        let start = self.broker.begin_login(endpoint).await.map_err(|e| e.to_string())?;
+        let sign_in = SignIn { state: start.state.clone(), url: start.url.clone(), server: slug(name), title: title.to_string(), listing: listing.clone() };
         let (status, _) = tokio::sync::watch::channel(SignInState::Waiting);
-        let mut pending = self.pending.lock();
-        pending.retain(|_, p| p.started.elapsed() < SIGN_IN_TTL);
-        pending.insert(
-            flow.state.clone(),
-            Pending {
-                flow,
-                name: slug(name),
-                title: title.to_string(),
-                endpoint: endpoint.to_string(),
-                listing,
-                description: description.to_string(),
-                source,
-                started: std::time::Instant::now(),
-                status,
-            },
-        );
+        {
+            let mut pending = self.pending.lock();
+            pending.retain(|_, p| p.started.elapsed() < SIGN_IN_TTL && matches!(*p.status.borrow(), SignInState::Waiting));
+            pending.insert(
+                start.state.clone(),
+                Pending {
+                    url: start.url,
+                    name: slug(name),
+                    title: title.to_string(),
+                    endpoint: endpoint.to_string(),
+                    listing,
+                    description: description.to_string(),
+                    source,
+                    started: std::time::Instant::now(),
+                    status,
+                },
+            );
+        }
+        // the sign-in ends where the browser is sent back: at mcpc's own callback (the engine on the user's machine), or through
+        // `finish_sign_in` (the answer handed on). Either way, what happens next happens here.
+        let hub = self.clone();
+        let state = start.state;
+        tokio::spawn(async move {
+            let outcome = match hub.broker.wait_login(&state, SIGN_IN_TTL).await {
+                Ok(()) => hub.open_signed_in(&state).await,
+                Err(e) => Err(e.to_string()),
+            };
+            let status = hub.pending.lock().remove(&state).map(|p| p.status);
+            if let Some(status) = status {
+                let _ = status.send(match outcome {
+                    Ok(f) => SignInState::Done(f),
+                    Err(e) => SignInState::Failed(e),
+                });
+            }
+        });
         Ok(sign_in)
     }
 
-    /// The provider sent the user back with a code (or an error): exchange it for tokens, keep them, connect the server and tell
-    /// whoever waits. Returns the server's title, for the page the user sees.
-    pub async fn finish_sign_in(&self, state: &str, code: Option<&str>, error: Option<&str>) -> Result<String, String> {
-        let (flow, name, title, endpoint, listing, description, source, status) = {
+    /// The user signed in: open the server with the sign-in.
+    async fn open_signed_in(&self, state: &str) -> Result<Found, String> {
+        let (name, title, endpoint, listing, description, source) = {
+            let pending = self.pending.lock();
+            let p = pending.get(state).ok_or("the sign-in was abandoned")?;
+            (p.name.clone(), p.title.clone(), p.endpoint.clone(), p.listing.clone(), p.description.clone(), p.source)
+        };
+        // a server known without the sign-in (it refused) is opened again with it
+        if self.servers.read().get(&name).is_some_and(|s| !s.signed_in) {
+            self.remove(&name).await;
+        }
+        let spec = Spec::Http { url: endpoint, headers: BTreeMap::new() };
+        let server = self
+            .add(&name, spec, source, listing.clone(), &description, false)
+            .await
+            .map_err(|e| format!("signed in, but {title} could not be opened: {e}"))?;
+        self.save();
+        Ok(Found { server: server.name.clone(), title, listing: listing.unwrap_or_default(), tools: self.tools_of(&server.name), known: false })
+    }
+
+    /// The provider sent the user's browser back with `query` (`code`, `state`, `iss`, or `error`) to somewhere other than mcpc's
+    /// own callback: hand it to the sign-in, and wait for the server to be open. Returns the server's title, for the page the user sees.
+    pub async fn finish_sign_in(&self, state: &str, query: &str) -> Result<String, String> {
+        let (title, mut rx) = {
             let pending = self.pending.lock();
             let p = pending.get(state).ok_or("this sign-in link is unknown or has expired: ask the agent again")?;
-            if p.started.elapsed() > SIGN_IN_TTL {
-                return Err("this sign-in link has expired: ask the agent again".into());
-            }
-            (p.flow.clone(), p.name.clone(), p.title.clone(), p.endpoint.clone(), p.listing.clone(), p.description.clone(), p.source, p.status.clone())
+            (p.title.clone(), p.status.subscribe())
         };
-        let outcome: Result<Found, String> = async {
-            if let Some(e) = error {
-                return Err(format!("the sign-in to {title} was not completed ({e})"));
+        self.broker.deliver(state, query).await.map_err(|e| e.to_string())?;
+        let done = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match &*rx.borrow_and_update() {
+                    SignInState::Done(_) => return Ok(()),
+                    SignInState::Failed(e) => return Err(e.clone()),
+                    SignInState::Waiting => {}
+                }
+                if rx.changed().await.is_err() {
+                    return match &*rx.borrow() {
+                        SignInState::Done(_) => Ok(()),
+                        SignInState::Failed(e) => Err(e.clone()),
+                        SignInState::Waiting => Err("the sign-in was abandoned".into()),
+                    };
+                }
             }
-            let code = code.ok_or("the provider sent no code back")?;
-            let tokens = flow.finish(code).await.map_err(|e| e.to_string())?;
-            let saved = oauth::Saved { server: flow.server.clone(), client: flow.client.clone(), tokens };
-            self.oauth.put(saved.clone());
-            // a server known without the sign-in (it refused) is opened again with it
-            if self.servers.read().get(&name).is_some_and(|s| s.link.grant.is_none()) {
-                self.remove(&name).await;
-            }
-            let grant = Grant::new(saved, Some(self.oauth.clone()));
-            let spec = Spec::Http { url: endpoint.clone(), headers: BTreeMap::new() };
-            let server = self
-                .add_with(&name, spec, source, listing.clone(), &description, false, Some(grant))
-                .await
-                .map_err(|e| format!("signed in, but {title} could not be opened: {e}"))?;
-            self.save();
-            Ok(Found {
-                server: server.name.clone(),
-                title: title.clone(),
-                listing: listing.clone().unwrap_or_default(),
-                tools: self.tools_of(&server.name),
-                known: false,
-            })
-        }
-        .await;
-        self.pending.lock().remove(state);
-        let _ = status.send(match &outcome {
-            Ok(f) => SignInState::Done(f.clone()),
-            Err(e) => SignInState::Failed(e.clone()),
-        });
-        outcome.map(|_| title)
+        })
+        .await
+        .unwrap_or_else(|_| Err(format!("signing in to {title} is taking long: the task goes on by itself once it is done")));
+        done.map(|_| title)
     }
 
     /// Wait until the user has signed in (the server is connected), the sign-in failed, or `timeout` passed.
@@ -982,7 +999,7 @@ impl McpHub {
                     listing: s.listing.clone().unwrap_or_default(),
                     description: s.description.clone(),
                     key: (!headers.is_empty()).then(|| s.name.clone()),
-                    oauth: s.link.grant.is_some(),
+                    oauth: s.signed_in,
                 }),
                 _ => None,
             })
@@ -1008,7 +1025,7 @@ impl McpHub {
             tokio::spawn(async move {
                 let mut headers = BTreeMap::new();
                 // a sign-in that is gone (refused, forgotten) leaves the server to be offered again when it is needed
-                if saved.oauth && hub.oauth.get(&saved.url).is_none() {
+                if saved.oauth && !hub.broker.signed_in(&saved.url).await {
                     return;
                 }
                 if saved.key.is_some() {
@@ -1062,18 +1079,6 @@ fn official(c: &Connector, queries: &[String]) -> bool {
     let name = c.name.to_ascii_lowercase();
     site.len() > 3
         && queries.iter().flat_map(|q| q.split(|ch: char| !ch.is_alphanumeric())).map(|w| w.to_ascii_lowercase()).any(|w| w == *site && name.contains(&w))
-}
-
-/// Ask a server without credentials what it wants: its 401 and `WWW-Authenticate` challenge.
-async fn probe(endpoint: &str, timeout: Duration) -> Result<oauth::Challenge, String> {
-    match McpClient::connect(&Spec::Http { url: endpoint.to_string(), headers: BTreeMap::new() }, timeout).await {
-        Err(McpError::Unauthorized { challenge, .. }) => Ok(challenge.map(|c| oauth::Challenge::parse(&c)).unwrap_or_default()),
-        Err(e) => Err(format!("{endpoint} could not be reached: {e}")),
-        Ok(c) => {
-            c.close().await;
-            Ok(oauth::Challenge::default())
-        }
-    }
 }
 
 /// The words a tool is ranked on: its name, title and description.

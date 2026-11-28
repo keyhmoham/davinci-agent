@@ -11,6 +11,10 @@ use dfae_core::*;
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
+
+/// Under a sign-in link: what to do when the page the browser lands on afterwards does not load (mcpc's callback is on the
+/// engine's machine, not this one).
+pub(crate) const SIGN_IN_HINT: &str = "If the page you land on after signing in does not load (127.0.0.1…/callback), paste its address here.";
 use tokio::sync::{mpsc, watch};
 
 enum Msg {
@@ -134,7 +138,10 @@ fn describe(e: &Event) -> Option<String> {
         EventKind::Model { purpose, prompt_tokens, completion_tokens, .. } => format!("model     {purpose} {prompt_tokens}→{completion_tokens} tok"),
         EventKind::Warning { message } => format!("warning   {message}"),
         EventKind::McpSignInRequired { title, url, wait_secs, .. } => {
-            format!("sign in   {title} needs you to sign in — open this link; the task goes on by itself (waiting {} min):\n  {url}", wait_secs / 60)
+            format!(
+                "sign in   {title} needs you to sign in — open this link; the task goes on by itself (waiting {} min):\n  {url}\n  {SIGN_IN_HINT}",
+                wait_secs / 60
+            )
         }
         EventKind::McpSignedIn { detail, .. } => format!("sign in   {detail}"),
         EventKind::Validated { round, checks } => {
@@ -435,6 +442,16 @@ async fn tui_loop(terminal: &mut ratatui::DefaultTerminal, api: Api, url: String
                                         let _ = tx.send(Msg::Notice(format!("memory: {e}"), true));
                                     }
                                 }
+                            });
+                        }
+                        Action::SignIn(url) => {
+                            let (api, tx) = (api.clone(), tx.clone());
+                            tokio::spawn(async move {
+                                let m = match api.sign_in(&url).await {
+                                    Ok(title) => (format!("signed in to {title}"), false),
+                                    Err(e) => (format!("sign in: {e}"), true),
+                                };
+                                let _ = tx.send(Msg::Notice(m.0, m.1));
                             });
                         }
                         Action::Remember(t) => {

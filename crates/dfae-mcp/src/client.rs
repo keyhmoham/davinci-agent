@@ -49,7 +49,7 @@ impl McpError {
 /// How to reach a server.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Spec {
-    /// A remote server speaking Streamable HTTP; `headers` carry credentials (`Authorization: Bearer …`).
+    /// A remote server speaking Streamable HTTP (or the local proxy of its mcpc session); `headers` carry credentials (`Authorization: Bearer …`).
     Http { url: String, headers: BTreeMap<String, String> },
     /// A local command speaking JSON-RPC lines on stdin/stdout. Only ever built from the operator's own configuration.
     Stdio { command: String, args: Vec<String>, env: BTreeMap<String, String> },
@@ -121,13 +121,8 @@ pub struct McpClient {
 
 impl McpClient {
     pub async fn connect(spec: &Spec, timeout: Duration) -> Result<Self, McpError> {
-        Self::connect_with(spec, timeout, None).await
-    }
-
-    /// Connect with the user's sign-in: every request carries its current access token.
-    pub async fn connect_with(spec: &Spec, timeout: Duration, grant: Option<Arc<crate::oauth::Grant>>) -> Result<Self, McpError> {
         let conn: Arc<dyn Conn> = match spec {
-            Spec::Http { url, headers } => Arc::new(HttpConn::new(url, headers, grant)?),
+            Spec::Http { url, headers } => Arc::new(HttpConn::new(url, headers)?),
             Spec::Stdio { command, args, env } => Arc::new(StdioConn::spawn(command, args, env)?),
         };
         let init = conn
@@ -219,14 +214,13 @@ struct HttpConn {
     http: reqwest::Client,
     url: String,
     headers: Vec<(String, String)>,
-    grant: Option<Arc<crate::oauth::Grant>>,
     session: parking_lot::Mutex<Option<String>>,
     protocol: parking_lot::Mutex<String>,
     next: AtomicU64,
 }
 
 impl HttpConn {
-    fn new(url: &str, headers: &BTreeMap<String, String>, grant: Option<Arc<crate::oauth::Grant>>) -> Result<Self, McpError> {
+    fn new(url: &str, headers: &BTreeMap<String, String>) -> Result<Self, McpError> {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err(McpError::Transport(format!("not an HTTP(S) URL: {url}")));
         }
@@ -235,7 +229,6 @@ impl HttpConn {
             http,
             url: url.to_string(),
             headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            grant,
             session: Default::default(),
             protocol: parking_lot::Mutex::new(PROTOCOL_VERSION.into()),
             next: AtomicU64::new(1),
@@ -256,9 +249,6 @@ impl HttpConn {
         }
         for (k, v) in &self.headers {
             rb = rb.header(k, v);
-        }
-        if let Some(t) = self.grant.as_ref().and_then(|g| g.token()) {
-            rb = rb.bearer_auth(t);
         }
         rb
     }

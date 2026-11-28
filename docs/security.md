@@ -95,6 +95,15 @@ routing, so a mis-classified state-changing request fails closed (its write tool
   sent to be embedded. `DFAE_EMBEDDINGS=hash` keeps it local.
 - **MCP directory** (with `GLAMA_API_KEY`): a few words describing what a request needs are sent to Glama's search; the servers found
   receive the tool calls made to them.
+- **MCP sign-ins** are mcpc's. With no keyring (any container) mcpc keeps OAuth tokens in plain files under its home, mode 0600, and
+  its bridges inherit its environment. So in compose it runs in the `mcpc` container as its own user with its own volume: the agent's
+  commands (the engine's user, in the engine's container) cannot read them. The engine reaches the broker's API with
+  `DFAE_MCPC_BROKER_TOKEN` and each session's proxy with a bearer token it makes up and keeps in memory; mcpc's environment is a
+  minimal one (no engine keys), API keys for directory servers reach mcpc in a config entry it reads once (never on a command line).
+  The browser's answer to a sign-in is handed on only to a sign-in the engine started and only with that sign-in's `state` (mcpc
+  0.8.0 does not check `state` on a pasted answer itself); PKCE (S256) means a code issued for another login cannot be redeemed.
+  Run directly with mcpc installed, the engine runs mcpc as its own user: then the agent's commands *can* read the sign-ins, so do
+  that only on a machine where the agent is trusted, or set `DFAE_MCPC_BROKER_URL`.
 - **GLiNER / GLiNER-PII / Postgres** are local services in the compose network.
 - `http_get` contacts the domains the policy allows; with `open_web = true` any public host (never private ranges). `web_search` calls fixed third-party backends (SearXNG/Brave if configured, DuckDuckGo, Wikipedia) through the same private-address and size/time guards. What you search for, and any URL you fetch, leaves the machine.
 

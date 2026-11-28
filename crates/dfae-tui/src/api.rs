@@ -103,6 +103,12 @@ impl Api {
     pub async fn memory_search(&self, q: &str) -> Result<Vec<Value>, String> {
         self.send(self.rb(reqwest::Method::GET, "/v1/memory/search").query(&[("q", q), ("limit", "8")])).await
     }
+    /// Hand the address the browser landed on after a sign-in to the engine. Returns the server's title.
+    pub async fn sign_in(&self, url: &str) -> Result<String, String> {
+        let v: Value = self.send(self.rb(reqwest::Method::POST, "/v1/mcp/sign-ins").json(&json!({"url": url}))).await?;
+        Ok(v["signed_in"].as_str().unwrap_or("the server").to_string())
+    }
+
     pub async fn remember(&self, text: &str) -> Result<(), String> {
         let _: Value = self.send(self.rb(reqwest::Method::POST, "/v1/memory").json(&json!({"text": text}))).await?;
         Ok(())

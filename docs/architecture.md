@@ -32,9 +32,17 @@ No model owns control flow, permissions, or the claim that a task is done.
    else directory servers: the worker writes, per outside service, the capability in a tool's own words and 2–3 searches; each is
    searched filtered to servers usable as they are (`attributes=auth:none`, plus `auth:api_key` with keys), the lists fused by rank,
    the best read in detail (their tools) and ranked again on them, judged by the decision model on those tools, and only then connected); their tools are registered as `mcp__<server>__<tool>`
-   and visible to that task only (`TaskCtx::in_scope`). A server behind a sign-in (OAuth 2.1 per the MCP authorization spec: protected
-   resource metadata, dynamic client registration, PKCE, resource indicators) is offered as a link in the chat; the task waits
-   (`waiting_for_user`) until the provider sends the browser back to `/v1/mcp/oauth/callback` (`dfae-mcp::oauth`, `McpHub::finish_sign_in`).
+   and visible to that task only (`TaskCtx::in_scope`). Every remote server is opened by a **broker** (`dfae-mcp::broker`): with
+   [mcpc](https://github.com/apify/mcpc) each is an mcpc session `@dfae-<server>`, and the engine's client calls it through the
+   session's local proxy (`mcpc connect … --proxy`, a bearer token per session that only the engine holds), so authentication,
+   token refresh, keepalive and reconnects are mcpc's. In compose mcpc runs as its own broker container (`dfae-server mcpc-broker`,
+   `RemoteBroker`); run directly, the engine runs mcpc itself (`McpcBroker`); without mcpc (`DirectBroker`) only servers that need no
+   sign-in are used. A server behind a sign-in is offered as a link in the chat (`mcpc login`: protected resource and authorization
+   server metadata, CIMD or dynamic client registration, PKCE, resource indicators); the task waits (`waiting_for_user`) until mcpc
+   has the tokens. The provider sends the browser to mcpc's loopback callback; where that is in another container or machine, the
+   broker's relay (the callback ports published to it), `/v1/mcp/oauth/callback` or a pasted address hands the answer on, checked
+   against the sign-in's `state` (`McpHub::finish_sign_in`). Local (stdio) servers from `DFAE_MCP_SERVERS` are started by the engine
+   itself: MCP authorization is for HTTP; a stdio server takes its credentials from its environment.
 7. **Execute** — each brief step is bound just before it runs: rules and the extractor first, then the worker model
    (asked only for the parameters the step needs; file content is written as plain text, not squeezed into JSON), then the
    planner model. A bound `cwd` must exist; a background command that dies within 1.5 s is a failed step with its output.

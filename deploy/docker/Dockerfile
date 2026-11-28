@@ -1,5 +1,5 @@
 #
-# Targets:  server (the engine + HTTP API)   tui (the terminal client)
+# Targets:  server (the engine + HTTP API)   tui (the terminal client)   mcpc (the MCP sign-in broker: mcpc, as its own user)
 #
 # Build cache mounts keep incremental image builds fast.
 
@@ -76,6 +76,33 @@ WORKDIR /workspace
 EXPOSE 8080
 HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 CMD ["dfae-server", "healthcheck"]
 ENTRYPOINT ["/usr/bin/tini", "--", "dfae-server"]
+
+# --- MCP sign-in broker -------------------------------------------------------------
+# mcpc (https://github.com/apify/mcpc) authenticates and holds the engine's remote MCP sessions. It runs here, not in the engine's
+# container: without a keyring it keeps sign-ins in files, and the agent's commands run as the engine's user there. The engine
+# reaches it with DFAE_MCPC_BROKER_TOKEN; each session's proxy wants a bearer token only the engine holds.
+FROM runtime-base AS mcpc
+ARG NODE_VERSION=lts
+# the mcpc release the engine is tested with (dfae_mcp::mcpc::MCPC_VERSION)
+ARG MCPC_VERSION=0.8.0
+COPY deploy/docker/install-node.sh /tmp/install-node.sh
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl jq xz-utils \
+ && /tmp/install-node.sh "$NODE_VERSION" /usr/local \
+ && npm install -g "@apify/mcpc@${MCPC_VERSION}" --no-audit --no-fund \
+ && apt-get purge -y curl jq xz-utils && apt-get autoremove -y \
+ && rm -rf /var/lib/apt/lists/* /root/.npm /tmp/install-node.sh \
+ && useradd --uid 10002 --create-home --shell /usr/sbin/nologin mcpc \
+ && mkdir -p /var/lib/mcpc && chown mcpc:mcpc /var/lib/mcpc && chmod 0700 /var/lib/mcpc
+COPY --from=build /out/dfae-server /usr/local/bin/dfae-server
+ENV DFAE_MCPC_HOME=/var/lib/mcpc \
+    DFAE_MCPC_BROKER_BIND=0.0.0.0:8091 \
+    DFAE_MCPC_RELAY_BIND=0.0.0.0:8092 \
+    DFAE_BIND=127.0.0.1:8091
+USER mcpc
+EXPOSE 8091 8092
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=12 CMD ["dfae-server", "healthcheck"]
+ENTRYPOINT ["/usr/bin/tini", "--", "dfae-server", "mcpc-broker"]
 
 # --- terminal client -------------------------------------------------------------
 FROM runtime-base AS tui

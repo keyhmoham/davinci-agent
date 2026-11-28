@@ -100,8 +100,8 @@ impl Inner {
         true
     }
 
-    /// Ask the user to sign in to a directory server, in the chat, and wait for the provider to send them back (the engine's
-    /// callback finishes the sign-in and connects the server). `None`: the sign-in could not be started, failed, or was not done in time.
+    /// Ask the user to sign in to a directory server, in the chat, and wait until they have (mcpc signs them in; the hub connects the
+    /// server once it has the tokens). `None`: the sign-in could not be started, failed, or was not done in time.
     async fn sign_in(&self, ctx: &Arc<TaskCtx>, hub: &Arc<dfae_mcp::McpHub>, c: &Candidate) -> Option<dfae_mcp::Found> {
         let wait = std::time::Duration::from_secs(self.cfg.mcp.sign_in_wait_secs);
         let s = match hub.begin_sign_in(c).await {
