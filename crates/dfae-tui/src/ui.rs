@@ -512,6 +512,7 @@ pub fn timeline_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 );
                 // the whole link, unclipped, on its own line: it must be copyable
                 out.push(Line::from(Span::styled(url.clone(), Style::new().fg(ACCENT).underlined())));
+                out.push(Line::from(Span::styled(crate::SIGN_IN_HINT, Style::new().fg(DIM))));
             }
             EventKind::Validated { round, checks } => {
                 let failed: Vec<&CheckResult> = checks.iter().filter(|c| c.status == CheckStatus::Failed).collect();
@@ -1570,6 +1571,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         k("/team <m>", "auto | on | off — subagent delegation (auto by default)"),
         k("/memory <q>", "search long-term memory"),
         k("/remember <fact>", "store a fact"),
+        k("/signin <address>", "finish an MCP sign-in whose page did not load"),
         k("/new", "start a new session (fresh conversational context)"),
         k("/autoapprove on", "skip approvals (benchmarks only; server must allow)"),
         k("/tools  /cancel  /quit", ""),

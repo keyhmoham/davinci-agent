@@ -52,6 +52,8 @@ pub enum Action {
     },
     MemorySearch(String),
     Remember(String),
+    /// The address the browser landed on after signing in to an MCP server, for the sign-in it belongs to.
+    SignIn(String),
     /// Add a routine (`None`), change one, remove or run one: the board's commands.
     Routine {
         id: Option<String>,
@@ -67,6 +69,15 @@ pub enum RoutineOp {
     Update(Value),
     Remove,
     Run,
+}
+
+/// `http://127.0.0.1:13316/callback?code=…&state=…`: where an MCP provider sends the browser back to mcpc after a sign-in.
+pub fn is_sign_in_answer(line: &str) -> bool {
+    let l = line.trim();
+    !l.contains(char::is_whitespace)
+        && (l.starts_with("http://127.0.0.1:") || l.starts_with("http://localhost:"))
+        && l.contains("/callback?")
+        && l.contains("state=")
 }
 
 /// Single-line text editor.
@@ -441,6 +452,10 @@ impl App {
         if let Some(cmd) = line.strip_prefix('/') {
             return self.run_command(cmd);
         }
+        // the page mcpc's sign-in callback did not load (the engine is not on this machine): its address, pasted, finishes it
+        if is_sign_in_answer(line) {
+            return Some(Action::SignIn(line.trim().to_string()));
+        }
         self.scroll = 0;
         Some(Action::Submit(TaskRequest {
             goal: line.to_string(),
@@ -506,6 +521,14 @@ impl App {
                     self.tab = Tab::Memory;
                     self.memory_query = arg.to_string();
                     Some(Action::MemorySearch(arg.to_string()))
+                }
+            }
+            "signin" => {
+                if is_sign_in_answer(arg) {
+                    Some(Action::SignIn(arg.to_string()))
+                } else {
+                    self.notify("usage: /signin <the address your browser landed on after signing in>", true);
+                    None
                 }
             }
             "remember" => {
@@ -764,5 +787,17 @@ mod tests {
         assert_eq!(run(&mut app, "/routine rm abcd1234"), Some(Action::Routine { id: Some("abcd1234".into()), op: RoutineOp::Remove }));
         assert_eq!(run(&mut app, "/routine add every 2h"), None, "no goal: usage");
         assert_eq!(run(&mut app, "/routine frobnicate"), None);
+    }
+
+    #[test]
+    fn a_pasted_sign_in_answer_finishes_the_sign_in_instead_of_starting_a_task() {
+        let mut app = App::new("http://x");
+        let url = "http://127.0.0.1:13316/callback?code=abc&state=s1";
+        for c in url.chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Some(Action::SignIn(url.into())));
+        assert!(!is_sign_in_answer("what is at http://127.0.0.1:13316/callback?state=x"), "a sentence is a task");
+        assert!(!is_sign_in_answer("https://evil.example/callback?state=x"));
     }
 }

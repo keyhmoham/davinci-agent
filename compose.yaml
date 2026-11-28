@@ -91,6 +91,42 @@ services:
       - |
         if [ "$$DECISION_PROVIDER" != "local" ]; then ollama pull "$$DECISION_MODEL"; fi
 
+  # MCP sign-in broker: mcpc (https://github.com/apify/mcpc) authenticates the engine's remote MCP servers (OAuth: CIMD/DCR, PKCE,
+  # token refresh) and holds their sessions, as its own user with its own volume, out of the agent's reach.
+  mcpc:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile
+      target: mcpc
+      args:
+        NODE_VERSION: ${NODE_VERSION:-lts}
+        MCPC_VERSION: ${MCPC_VERSION:-0.8.0}
+    restart: unless-stopped
+    environment:
+      # shared with the engine; ./dfae writes one to .env (or: openssl rand -hex 32)
+      DFAE_MCPC_BROKER_TOKEN: ${DFAE_MCPC_BROKER_TOKEN:-}
+      # how the engine reaches the sessions' proxies
+      DFAE_MCPC_PROXY_HOST: mcpc
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+      RUST_LOG: ${RUST_LOG:-info,tower_http=warn}
+    volumes:
+      - mcpc-state:/var/lib/mcpc
+    # After you sign in, the provider sends your browser to mcpc's callback, http://127.0.0.1:<one of these>/callback: on the host's
+    # loopback they lead to the broker's relay, which hands the answer to the sign-in it belongs to (matched by its state).
+    ports:
+      - "127.0.0.1:13316:8092"
+      - "127.0.0.1:31613:8092"
+      - "127.0.0.1:16133:8092"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${DFAE_MCPC_MEM_LIMIT:-512m}
+    pids_limit: 256
+
   # The engine: runtime + HTTP/SSE API.
   dfae:
     build:
@@ -104,6 +140,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      mcpc:
+        condition: service_started
     environment:
       DATABASE_URL: postgres://dfae:${POSTGRES_PASSWORD:-dfae}@postgres:5432/dfae
       GLINER_URL: ${GLINER_URL:-}
@@ -166,8 +204,11 @@ services:
       DFAE_MCP_AUTO: ${DFAE_MCP_AUTO:-}
       DFAE_MCP_MAX_AUTO: ${DFAE_MCP_MAX_AUTO:-}
       DFAE_MCP_TIMEOUT_SECS: ${DFAE_MCP_TIMEOUT_SECS:-}
-      # MCP servers that want you to sign in (OAuth) are offered with a link in the chat; the provider sends your browser back to
-      # ${DFAE_PUBLIC_URL}/v1/mcp/oauth/callback, which must be this engine's API as your browser reaches it (localhost or https)
+      # MCP servers are authenticated and opened by mcpc, in the mcpc service. Servers that want you to sign in (OAuth) are offered
+      # with a link in the chat; afterwards the provider sends your browser to mcpc's callback (published above). A browser on
+      # another machine can paste the address it lands on into the chat, or bring its query to ${DFAE_PUBLIC_URL}/v1/mcp/oauth/callback.
+      DFAE_MCPC_BROKER_URL: ${DFAE_MCPC_BROKER_URL:-http://mcpc:8091}
+      DFAE_MCPC_BROKER_TOKEN: ${DFAE_MCPC_BROKER_TOKEN:-}
       DFAE_MCP_SIGN_IN: ${DFAE_MCP_SIGN_IN:-true}
       DFAE_PUBLIC_URL: ${DFAE_PUBLIC_URL:-http://localhost:${DFAE_PORT:-8080}}
       DFAE_MCP_SIGN_IN_WAIT_SECS: ${DFAE_MCP_SIGN_IN_WAIT_SECS:-600}
@@ -234,6 +275,7 @@ services:
     tty: true
 
 volumes:
+  mcpc-state:
   pgdata:
   ollama:
   hf-models:

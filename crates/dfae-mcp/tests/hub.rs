@@ -360,9 +360,13 @@ async fn a_shortlist_filters_in_the_directory_reads_each_candidate_and_ranks_it_
 #[ignore = "asks the real Glama directory"]
 async fn live_shortlists() {
     let key = std::env::var("GLAMA_API_KEY").expect("GLAMA_API_KEY");
-    let redirect_uri = std::env::var("LIVE_REDIRECT").ok();
-    let hub =
-        McpHub::new(ToolRegistry::new(), HubConfig { max_auto: 2, redirect_uri, ..Default::default() }, Some(Glama::new("https://glama.ai/api/mcp", &key)));
+    // with mcpc installed, servers behind a sign-in are candidates too
+    let glama = Some(Glama::new("https://glama.ai/api/mcp", &key));
+    let cfg = HubConfig { max_auto: 2, ..Default::default() };
+    let hub = match mcpc_broker() {
+        Some(b) => McpHub::with_broker(ToolRegistry::new(), cfg, glama, b),
+        None => McpHub::new(ToolRegistry::new(), cfg, glama),
+    };
     let needs = std::env::var("LIVE_NEEDS").unwrap_or_else(|_| {
         "Get the top stories on Hacker News|Hacker News top stories|Hacker News API|news aggregator;\
          Read the description of a GitHub repository|github repository metadata|github repository description;\
@@ -431,12 +435,20 @@ async fn a_directory_server_that_wants_a_login_when_called_is_not_used_again() {
     assert!(again.discover("weather").await.is_err());
 }
 
-/// For real OAuth connectors in the directory: is their sign-in discoverable as the MCP spec has it (`GLAMA_API_KEY`)? Reads public
-/// metadata only: nothing is registered and nobody signs in.
+/// mcpc, when it is installed (`DFAE_MCPC_BIN`, else `mcpc` on `PATH`), with a home of its own.
+fn mcpc_broker() -> Option<Arc<dyn dfae_mcp::Broker>> {
+    let (bin, _) = dfae_mcp::find_mcpc(std::env::var_os("DFAE_MCPC_BIN").map(std::path::PathBuf::from).as_deref())?;
+    let home = tempfile::tempdir().unwrap().keep().join("mcpc");
+    Some(dfae_mcp::McpcBroker::new(dfae_mcp::McpcConfig::new(bin, home)) as Arc<dyn dfae_mcp::Broker>)
+}
+
+/// For real OAuth connectors in the directory: does mcpc get as far as the sign-in link with them (`GLAMA_API_KEY`, mcpc
+/// installed)? Discovery and client registration happen; nobody signs in.
 #[tokio::test]
 #[ignore = "asks the real Glama directory and real providers"]
 async fn live_sign_in_discovery() {
     let key = std::env::var("GLAMA_API_KEY").expect("GLAMA_API_KEY");
+    let broker = mcpc_broker().expect("mcpc is not installed");
     let glama = Glama::new("https://glama.ai/api/mcp", &key);
     let mut seen = std::collections::HashSet::new();
     for q in ["notion", "linear issues", "sentry", "github", "atlassian jira", "asana", "slack"] {
@@ -445,7 +457,10 @@ async fn live_sign_in_discovery() {
             if !seen.insert(c.endpoint.clone()) {
                 continue;
             }
-            let r = McpHub::probe_sign_in(&c.endpoint).await;
+            let r = match broker.begin_login(&c.endpoint).await {
+                Ok(s) => format!("ok: {}", s.url.split('?').next().unwrap_or("")),
+                Err(e) => format!("no: {}", e.to_string().lines().next().unwrap_or("")),
+            };
             eprintln!("{:<28} {:<45} {}", c.name.chars().take(28).collect::<String>(), c.endpoint.chars().take(45).collect::<String>(), r);
         }
     }

@@ -127,8 +127,8 @@ pub enum EventKind {
         round: u32,
         checks: Vec<CheckResult>,
     },
-    /// An MCP server this task needs wants the user to sign in: open `url`, sign in, and the task goes on by itself (the provider
-    /// sends the browser back to the engine's callback).
+    /// An MCP server this task needs wants the user to sign in: open `url` (mcpc's sign-in), sign in, and the task goes on by
+    /// itself once mcpc has the tokens.
     McpSignInRequired {
         server: String,
         title: String,

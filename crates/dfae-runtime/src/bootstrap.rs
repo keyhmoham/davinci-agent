@@ -85,18 +85,19 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     let hub = (mcp_cfg.servers_file.is_some() || mcp_cfg.discovery()).then(|| {
         let glama = mcp_cfg.glama_api_key.as_deref().map(|k| dfae_mcp::Glama::new(&mcp_cfg.glama_base_url, k));
         let state_path = mcp_cfg.state_path.clone().or_else(|| default_mcp_state(&workspace));
-        dfae_mcp::McpHub::new(
+        let broker = mcp_broker(&mcp_cfg, state_path.as_deref());
+        dfae_mcp::McpHub::with_broker(
             (*registry).clone(),
             dfae_mcp::HubConfig {
                 call_timeout: std::time::Duration::from_secs(mcp_cfg.call_timeout_secs),
                 max_auto: mcp_cfg.max_auto,
                 keys: dfae_mcp::HubConfig::keys_from_env(),
                 state_path,
-                redirect_uri: mcp_cfg.redirect_uri(),
-                secret: std::env::var("DFAE_SECRET_KEY").ok().or_else(|| config.api_token.clone()).filter(|s| !s.trim().is_empty()),
+                sign_in: mcp_cfg.sign_in,
                 ..Default::default()
             },
             glama,
+            broker,
         )
     });
     let pii_ner = config.pii_ner_url.as_deref().map(|u| Arc::new(GlinerClient::new(u)) as Arc<dyn EntityExtractor>);
@@ -118,6 +119,43 @@ pub async fn build_engine(config: Config) -> Result<Engine, String> {
     }
     engine.restore().await;
     Ok(engine)
+}
+
+/// Who authenticates and opens remote MCP servers: the mcpc broker in its own container, else mcpc on this machine, else nobody (the
+/// engine connects to servers that need no credentials itself, and offers none that wants a sign-in).
+fn mcp_broker(cfg: &dfae_core::config::McpConfig, state_path: Option<&std::path::Path>) -> std::sync::Arc<dyn dfae_mcp::Broker> {
+    use std::sync::Arc;
+    let direct = |why: &str| {
+        tracing::info!("MCP: no mcpc ({why}): servers that need no credentials or take an API key work, none that wants a sign-in is offered");
+        Arc::new(dfae_mcp::DirectBroker) as Arc<dyn dfae_mcp::Broker>
+    };
+    if cfg.mcpc == "off" {
+        return direct("DFAE_MCPC=off");
+    }
+    if let Some(url) = &cfg.broker_url {
+        let Some(token) = &cfg.broker_token else {
+            tracing::warn!("DFAE_MCPC_BROKER_URL is set without DFAE_MCPC_BROKER_TOKEN: the mcpc broker is not used");
+            return direct("no broker token");
+        };
+        tracing::info!(broker = %url, "MCP: servers are authenticated and opened by the mcpc broker");
+        return Arc::new(dfae_mcp::RemoteBroker::new(url, token));
+    }
+    let Some((bin, version)) = dfae_mcp::find_mcpc(cfg.mcpc_bin.as_deref()) else {
+        return direct(if cfg.mcpc_bin.is_some() { "DFAE_MCPC_BIN does not run" } else { "not installed: npm install -g @apify/mcpc" });
+    };
+    if version != dfae_mcp::mcpc::MCPC_VERSION {
+        tracing::warn!(%version, tested = dfae_mcp::mcpc::MCPC_VERSION, "this mcpc release is not the one the engine is tested with");
+    }
+    let home = cfg.mcpc_home.clone().or_else(|| state_path.and_then(|p| p.parent()).map(|d| d.join("mcpc")));
+    let Some(home) = home else { return direct("no place for its state (set DFAE_MCPC_HOME)") };
+    let mut mc = dfae_mcp::McpcConfig::new(bin.clone(), home.clone());
+    mc.callback_port = cfg.mcpc_callback_port;
+    tracing::info!(mcpc = %bin.display(), %version, home = %home.display(), "MCP: servers are authenticated and opened by mcpc");
+    tracing::warn!(
+        "mcpc runs as the engine's user: on a host without a keyring its sign-ins are files the agent's commands could read. \
+         In a container, run it as its own broker (DFAE_MCPC_BROKER_URL; compose does)"
+    );
+    dfae_mcp::McpcBroker::new(mc)
 }
 
 /// Servers found in the directory are remembered outside the workspace (the agent works in it, and must not be able to add servers

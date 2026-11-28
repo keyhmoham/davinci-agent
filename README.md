@@ -232,7 +232,7 @@ Agents (and you) schedule work that runs later in the background, once or again 
 | `dfae-models` | OpenAI-compatible and Anthropic providers, tier gateway, JSON extraction + one repair retry |
 | `dfae-memory` | hash and hosted semantic embedders (both kept per item) · Postgres (+pgvector) and in-memory stores · ranking · context packing · hash-chained audit |
 | `dfae-tools` | registry · **policy engine** · 11 native tools · direct binder · calculator |
-| `dfae-mcp` | MCP client (Streamable HTTP and stdio) · the hub that turns servers' tools into engine tools · **Glama directory** search and on-demand connection |
+| `dfae-mcp` | MCP client (Streamable HTTP and stdio) · the hub that turns servers' tools into engine tools · **Glama directory** search and on-demand connection · the **mcpc** broker that authenticates and opens remote servers |
 | `dfae-runtime` | pipeline, planner/validator, DAG executor, approvals, recovery/replan, verification, skills, resume · **team: decomposer, roles, dispatcher, subagent supervision** |
 | `dfae-server` | REST + SSE API, bearer auth, Prometheus metrics |
 | `dfae-tui` | the `dfae` terminal client (also `dfae --ask "…"`) |
@@ -406,20 +406,29 @@ is not repeated for ten. Servers from the directory ask for approval (`DFAE_APPR
 the output of every MCP tool is scanned for prompt injection like any other. Servers found are remembered in
 `~/.local/share/dfae/mcp.json` (outside the workspace, so the agent cannot add servers by writing a file) and reopened at start.
 
-**Signing in (OAuth).** A server that wants you to sign in is offered in the chat as a link: `sign in  Linear needs you to sign in. Open this
-link, sign in, and the task goes on by itself`. The engine does what the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
-asks: from the server's 401 (`WWW-Authenticate: Bearer resource_metadata=…`) it finds the protected resource metadata and the authorization
-server (RFC 9728, RFC 8414 / OpenID discovery, in the spec's order), registers itself once per provider (dynamic client registration,
-a public client), and writes the sign-in URL with PKCE (S256), a one-time `state` and the server as `resource` (RFC 8707). The provider sends
-your browser back to `DFAE_PUBLIC_URL/v1/mcp/oauth/callback` — the engine's API as your browser reaches it, `http://localhost:8080` by default;
-MCP allows only `localhost` or `https` there — which needs no API token (the 244-bit `state` it started is what is checked), exchanges the
-code, connects the server and wakes the task, which was `waiting_for_user` (`DFAE_MCP_SIGN_IN_WAIT_SECS`, default 10 minutes; then it goes on
-without). Access tokens are sent on every request and refreshed when they expire or are refused; a sign-in that no longer works is forgotten
-and asked for again. Sign-ins are kept **encrypted** (ChaCha20-Poly1305, key derived from `DFAE_SECRET_KEY`, else `DFAE_API_TOKEN`; without
-either they live in memory only) in `mcp-oauth.json` beside the servers file, mode 0600 — the agent's commands run as the same user, so
-the file is sealed, its name is refused to the file tools, and the engine makes itself non-dumpable so no command can read its memory or
-environment from `/proc`. Checked against the real directory: Linear, Sentry, Atlassian (Jira/Confluence), Notion and Slack gateways publish
-what the flow needs; a server that does not is reported as such. `POST /v1/mcp/servers/{name}/sign-in` starts a sign-in to a server you added.
+**Authenticating and adding servers: mcpc.** Finding a server is the engine's (Glama, above); authenticating it and keeping it open
+is [mcpc](https://github.com/apify/mcpc)'s. Every remote server the engine uses is an mcpc session (`@dfae-<server>`) with a local proxy
+(`mcpc connect <url> --proxy`): the engine's client calls the server through that proxy with a bearer token it makes up per session,
+so the server's credentials never reach the engine, and token refresh, keepalive and reconnecting (a session that died is opened again
+on the next call) are mcpc's. In compose mcpc runs in its own container, the **`mcpc` service** (`dfae-server mcpc-broker`, mcpc
+`0.8.0`, its own user and volume): without a keyring mcpc keeps tokens in files, and the agent's commands run as the engine's user, so
+they must not be in the engine's container. `./dfae` makes the token the two share (`DFAE_MCPC_BROKER_TOKEN` in `.env`). Run the engine
+directly and it runs mcpc itself if installed (`npm install -g @apify/mcpc@0.8.0`; its state in `~/.local/share/dfae/mcpc`), which is
+fine on your own machine but lets the agent's commands read the sign-ins; without mcpc, only servers that need no sign-in are used.
+
+**Signing in (OAuth).** A server that wants you to sign in is offered in the chat as a link: `sign in  Linear needs you to sign in. Open
+this link, sign in, and the task goes on by itself`. The link is `mcpc login`'s: mcpc does what the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+asks — protected resource metadata (RFC 9728) and authorization server metadata (RFC 8414 / OpenID), its hosted Client ID Metadata
+Document or else dynamic client registration (RFC 7591), PKCE (S256) and resource indicators (RFC 8707). The provider then sends your
+browser to mcpc's callback, `http://127.0.0.1:13316/callback` (or 31613, 16133): compose publishes those ports on the host's loopback to
+the broker's relay, which hands the answer to the sign-in it belongs to — only one the engine started, only with its `state`. When your
+browser is on another machine than the engine, the page it lands on does not load: paste its address into the chat (the TUI knows it;
+`/signin <address>`; `POST /v1/mcp/sign-ins {"url"}`), or bring its query to `DFAE_PUBLIC_URL/v1/mcp/oauth/callback`, or forward the
+port (`ssh -L 13316:127.0.0.1:13316 host`). The task waits (`waiting_for_user`, `DFAE_MCP_SIGN_IN_WAIT_SECS`, default 10 minutes; then it
+goes on without) and goes on by itself once mcpc has the tokens. A sign-in that no longer works (mcpc's session `unauthorized`) is
+forgotten (`mcpc logout`) and asked for again. Checked against the real directory: Linear's server gives mcpc a sign-in link (its CIMD
+client). Some providers accept only clients they approved and refuse self-registration (mcpc says so; its own docs name Figma's
+server); they cannot be signed in to without a client id they issued. `POST /v1/mcp/servers/{name}/sign-in` starts a sign-in to a server you added.
 
 Your own servers go in a file in the usual shape (`DFAE_MCP_SERVERS=/etc/dfae/mcp.json`):
 `{"mcpServers": {"files": {"command": "npx", "args": ["-y", "…"], "env": {"TOKEN": "${TOKEN}"}}, "docs": {"url": "https://…/mcp", "headers": {"Authorization": "Bearer ${DOCS_KEY}"}, "always": true}}}`.
@@ -468,6 +477,7 @@ Copy [`.env.example`](.env.example) to `.env`. The ones that matter:
 | `WORKER_PROVIDERS` | gateway providers allowed to serve the worker (default `baseten,nebius,fireworks`: unquantised, zero data retention; `any`: the gateway chooses) |
 | `PLANNER_MAX_TOKENS` / `WORKER_MAX_TOKENS` / `WORKER_CONTENT_MAX_TOKENS` | output limits: a plan; ordinary worker work (800); a file's content (16000) |
 | `GLAMA_API_KEY` | turns on MCP discovery (see *MCP servers*); `DFAE_MCP_AUTO=off`, `DFAE_MCP_MAX_AUTO`, `DFAE_MCP_TIMEOUT_SECS`, `DFAE_MCP_STATE`, `DFAE_MCP_KEY_<SLUG>`, `DFAE_MCP_SERVERS` tune it |
+| `DFAE_MCPC_BROKER_TOKEN` | shared by the engine and the `mcpc` broker that authenticates and opens MCP servers (`./dfae` makes one); `DFAE_MCPC_BROKER_URL`, `DFAE_MCPC=auto\|off`, `DFAE_MCPC_BIN`, `DFAE_MCPC_HOME`, `DFAE_MCPC_CALLBACK_PORT` tune it |
 | `PLANNER_REASONING` / `WORKER_REASONING` | thinking effort of a hosted model: `off`, `low`, `medium`, `high` (both default `low`; GLM-5.3-Flash cannot turn thinking off). `PLANNER_REASONING_HARD` (default `medium`) applies from the second re-plan; `PLANNER_REASONING_ADAPTIVE=on` sets effort from the request's complexity instead (measured worse, off by default) |
 | `*_TIMEOUT_SECS`, `PLANNER_PROMPT_CACHE` | request timeouts; whether an endpoint caches repeated prompt prefixes (known: Anthropic, `api.openai.com`, Vercel AI Gateway; `on` declares another; three misses turn the cacheable prefix off) |
 | `DFAE_EMBEDDINGS` | semantic memory embeddings (default `voyage/voyage-4-lite` through the gateway; `hash` turns them off). `DFAE_FACTS=off` stops durable facts being extracted from verified tasks |
